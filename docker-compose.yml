@@ -1,0 +1,10 @@
+# KNGTOP — copy .env.example to .env, set POLY_DRY_RUN=false for live $1 FAK buys
+services:
+  kngtop:
+    build: .
+    image: kngtop:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
