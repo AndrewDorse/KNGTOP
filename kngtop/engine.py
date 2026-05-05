@@ -70,15 +70,18 @@ def _execute_buy(
     cfg: KngtopConfig,
     token,
     label: str,
+    *,
+    pair_key: str,
 ) -> None:
-    _event("DEAL_START", label=label, notional=f"{cfg.notional_usd:.2f}", token=token.token_id[:16])
+    usdc = cfg.notional_for_pair(pair_key)
+    _event("DEAL_START", label=label, pair=pair_key, notional=str(usdc), token=token.token_id[:16])
     if cfg.dry_run:
         return
     assert clob is not None
     attempts = 1 + int(cfg.order_retry_on_error)
     for attempt in range(1, attempts + 1):
         try:
-            _ = clob.market_buy_usdc(token, cfg.notional_usd)
+            _ = clob.market_buy_usdc(token, usdc)
             return
         except Exception as exc:  # noqa: BLE001
             _event("DEAL_FAIL", label=label, attempt=attempt, error=str(exc))
@@ -119,7 +122,7 @@ def _tick_runner(
                 continue
             tok = _pick_token(runner.contract, rule.side)
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
-            _execute_buy(clob, cfg, tok, label)
+            _execute_buy(clob, cfg, tok, label, pair_key=runner.pair_key)
             runner.traded = True
             break
 
@@ -215,7 +218,9 @@ def main() -> None:
         dry_run=str(cfg.dry_run).lower(),
         heartbeat_sec=str(cfg.poll_interval_sec),
         debounce_sec=str(cfg.eval_debounce_sec),
-        notional_usd=str(cfg.notional_usd),
+        notional_btc_usd=str(cfg.notional_usd),
+        notional_eth_usd=str(cfg.notional_eth_usd),
+        notional_xrp_usd=str(cfg.notional_xrp_usd),
         retry_on_error=str(cfg.order_retry_on_error),
     )
 
