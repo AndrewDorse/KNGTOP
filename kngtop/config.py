@@ -5,12 +5,47 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+_ALLOWED_PAIR_KEYS = frozenset({"BTC", "ETH", "XRP"})
+
 
 def _env_bool(key: str, default: bool) -> bool:
     raw = (os.environ.get(key) or "").strip().lower()
     if not raw:
         return default
     return raw in ("1", "true", "yes", "y", "on")
+
+
+def parse_trading_pairs(raw: str | None) -> tuple[tuple[str, str], ...]:
+    """``GAMMA_KEY:BINANCE_SYMBOL`` comma list, e.g. ``BTC:BTCUSDT,ETH:ETHUSDT``."""
+    s = (raw or "").strip()
+    if not s:
+        s = "BTC:BTCUSDT,ETH:ETHUSDT,XRP:XRPUSDT"
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise RuntimeError(
+                f"Invalid KNGTOP_PAIRS segment {part!r}; expected ASSET:SYMBOL e.g. BTC:BTCUSDT"
+            )
+        a, b = part.split(":", 1)
+        key = a.strip().upper()
+        sym = b.strip().upper().replace("/", "")
+        if not key or not sym:
+            raise RuntimeError(f"Invalid KNGTOP_PAIRS segment {part!r}")
+        if key in seen:
+            raise RuntimeError(f"Duplicate asset {key} in KNGTOP_PAIRS")
+        if key not in _ALLOWED_PAIR_KEYS:
+            raise RuntimeError(
+                f"Unsupported asset {key!r} in KNGTOP_PAIRS (allowed: {', '.join(sorted(_ALLOWED_PAIR_KEYS))})"
+            )
+        seen.add(key)
+        out.append((key, sym))
+    if not out:
+        raise RuntimeError("KNGTOP_PAIRS resolved to empty")
+    return tuple(out)
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,13 +58,16 @@ class KngtopConfig:
     relayer_passphrase: str
     dry_run: bool
     poll_interval_sec: float
+    eval_debounce_sec: float
     request_timeout_sec: float
     notional_usd: float
-    btc_symbol: str
-    market_symbol: str
+    trading_pairs: tuple[tuple[str, str], ...]
     log_level: str
     order_cutoff_remaining_sec: float
     order_retry_on_error: int
+    market_buy_price_slip: float
+    binance_max_age_sec: float
+    poly_mid_max_age_sec: float
 
     @staticmethod
     def from_env() -> "KngtopConfig":
@@ -37,6 +75,7 @@ class KngtopConfig:
         funder = (os.environ.get("POLY_FUNDER") or "").strip()
         if not pk or not funder:
             raise RuntimeError("POLY_PRIVATE_KEY and POLY_FUNDER are required")
+        pairs = parse_trading_pairs(os.environ.get("KNGTOP_PAIRS"))
         return KngtopConfig(
             private_key=pk,
             funder=funder,
@@ -45,12 +84,15 @@ class KngtopConfig:
             relayer_secret=(os.environ.get("RELAYER_SECRET") or "").strip(),
             relayer_passphrase=(os.environ.get("RELAYER_PASSPHRASE") or "").strip(),
             dry_run=_env_bool("POLY_DRY_RUN", True),
-            poll_interval_sec=float(os.environ.get("KNGTOP_POLL_INTERVAL_SECONDS") or "0.35"),
+            poll_interval_sec=float(os.environ.get("KNGTOP_POLL_INTERVAL_SECONDS") or "0.2"),
+            eval_debounce_sec=float(os.environ.get("KNGTOP_EVAL_DEBOUNCE_SECONDS") or "0.025"),
             request_timeout_sec=float(os.environ.get("KNGTOP_REQUEST_TIMEOUT_SECONDS") or "12.0"),
             notional_usd=float(os.environ.get("KNGTOP_NOTIONAL_USD") or "1.0"),
-            btc_symbol=(os.environ.get("KNGTOP_BTC_FEED_SYMBOL") or "BTCUSDT").strip().upper(),
-            market_symbol=(os.environ.get("KNGTOP_MARKET_SYMBOL") or "BTC").strip().upper(),
+            trading_pairs=pairs,
             log_level=(os.environ.get("KNGTOP_LOG_LEVEL") or "INFO").strip().upper(),
             order_cutoff_remaining_sec=float(os.environ.get("KNGTOP_ORDER_CUTOFF_REMAINING_SEC") or "20.0"),
             order_retry_on_error=max(0, int(os.environ.get("KNGTOP_ORDER_RETRY_ON_ERROR") or "2")),
+            market_buy_price_slip=float(os.environ.get("KNGTOP_MARKET_BUY_PRICE_SLIP") or "0.10"),
+            binance_max_age_sec=float(os.environ.get("KNGTOP_BINANCE_MAX_AGE_SEC") or "6.0"),
+            poly_mid_max_age_sec=float(os.environ.get("KNGTOP_POLY_MID_MAX_AGE_SEC") or "5.0"),
         )

@@ -44,9 +44,11 @@ class KngtopClob:
         relayer_api_key: str,
         relayer_secret: str,
         relayer_passphrase: str,
+        market_buy_price_slip: float = 0.10,
     ) -> None:
         self._signature_type = int(signature_type)
         self._buy = Side.BUY
+        self._market_buy_price_slip = float(market_buy_price_slip)
         self._taker_lock = threading.Lock()
         self.client = ClobClient(
             HOST,
@@ -114,11 +116,25 @@ class KngtopClob:
         if u <= 0:
             raise ValueError("usdc must be > 0")
         opts = self._book_opts(token)
+        slip = self._market_buy_price_slip
+        price_cap = 0.0
+        if slip > 0.0:
+            base_px = self.client.calculate_market_price(
+                token.token_id, self._buy, u, OrderType.FAK
+            )
+            tick_raw = (
+                _norm_tick(self.client.get_tick_size(token.token_id))
+                if opts is None or opts.tick_size is None
+                else _norm_tick(opts.tick_size)
+            )
+            tick_f = float(tick_raw or "0.01")
+            hi = 1.0 - tick_f
+            price_cap = min(max(base_px + slip, tick_f), hi)
         margs = MarketOrderArgs(
             token_id=token.token_id,
             amount=u,
             side=self._buy,
-            price=0.0,
+            price=price_cap,
             order_type=OrderType.FAK,
         )
         with self._taker_lock:

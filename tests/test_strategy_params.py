@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from kngtop.strategy_params import RULES_5M, MispriceRule, rule_fires
+from kngtop.strategy_params import (
+    RULES_5M,
+    MispriceRule,
+    effective_gap_px,
+    rule_fires,
+)
 
 
 def test_rule_fires_under_up() -> None:
@@ -20,3 +25,32 @@ def test_rule_fires_fade_dn_s() -> None:
 
 def test_rules_5m_count() -> None:
     assert len(RULES_5M) == 4
+
+
+def test_effective_gap_pct_overrides_usd() -> None:
+    r = MispriceRule(
+        "x",
+        gap_usd=999.0,
+        cheap_max=0.35,
+        rich_strong=None,
+        side="UP",
+        kind="under_up",
+        gap_pct_of_start=0.1,
+    )
+    assert abs(effective_gap_px(r, 10_000.0) - 10.0) < 1e-9
+
+
+def test_rule_eth_style_pct_fires_under_up() -> None:
+    r = MispriceRule(
+        "u_up",
+        gap_usd=0.0,
+        cheap_max=0.35,
+        rich_strong=None,
+        side="UP",
+        kind="under_up",
+        gap_pct_of_start=0.15,
+    )
+    # 3000 ETH * 0.15% = $4.5 gap
+    start = 3000.0
+    spot = start + 5.0
+    assert rule_fires(r, btc=spot, start_btc=start, mid_up=0.33, mid_dn=0.67)

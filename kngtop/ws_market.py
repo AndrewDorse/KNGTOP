@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 LOGGER = logging.getLogger("kngtop")
@@ -24,13 +25,18 @@ DEFAULT_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 class MarketWsFeed:
     """Background thread: latest bid/ask per asset_id from the market channel."""
 
-    def __init__(self, url: str = DEFAULT_WS_URL) -> None:
+    def __init__(
+        self,
+        url: str = DEFAULT_WS_URL,
+        on_quote_update: Callable[[], None] | None = None,
+    ) -> None:
         if websocket is None:
             raise RuntimeError(
                 "websocket-client is required for MarketWsFeed "
                 f"(pip install websocket-client): {_IMPORT_ERR}"
             )
         self._url = url
+        self._on_quote_update = on_quote_update
         self._lock = threading.Lock()
         self._quotes: dict[str, dict[str, float]] = {}
         self._subscribed: tuple[str, ...] = ()
@@ -38,6 +44,7 @@ class MarketWsFeed:
         self._thread: threading.Thread | None = None
         self._ws_app: Any = None
         self._ping_stop = threading.Event()
+        self._reconnect_sleep_sec = 1.5
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -61,7 +68,7 @@ class MarketWsFeed:
             if t == self._subscribed:
                 return
             self._subscribed = t
-        LOGGER.info("WS market: asset set changed (%d ids); reconnect", len(t))
+        LOGGER.debug("WS market: asset set changed (%d ids); reconnect", len(t))
         self._close_ws()
 
     def mid_for(self, asset_id: str, max_age_sec: float = 4.0) -> float | None:
@@ -101,6 +108,12 @@ class MarketWsFeed:
                 "mid": (bid + ask) / 2.0,
                 "ts": time.time(),
             }
+        cb = self._on_quote_update
+        if cb is not None:
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("on_quote_update failed", exc_info=True)
 
     def _on_message(self, _ws: Any, message: str) -> None:
         try:
@@ -145,21 +158,21 @@ class MarketWsFeed:
             assets = list(self._subscribed)
             if len(assets) < 1:
                 time.sleep(0.3)
+                self._reconnect_sleep_sec = 1.5
                 continue
-            try:
-                self._connect_session(assets)
-            except Exception as exc:
-                LOGGER.warning("WS market session error: %s", exc)
-                time.sleep(1.5)
+            self._connect_session(assets)
+            time.sleep(self._reconnect_sleep_sec)
+            self._reconnect_sleep_sec = min(self._reconnect_sleep_sec * 2.0, 45.0)
 
     def _connect_session(self, assets: list[str]) -> None:
         ready = threading.Event()
 
         def on_open(ws: Any) -> None:
+            self._reconnect_sleep_sec = 1.5
             sub = {"assets_ids": assets, "type": "market", "custom_feature_enabled": True}
             ws.send(json.dumps(sub))
             ready.set()
-            LOGGER.info("WS market: connected + subscribed")
+            LOGGER.debug("WS market: connected + subscribed")
 
         self._ws_app = websocket.WebSocketApp(
             self._url,

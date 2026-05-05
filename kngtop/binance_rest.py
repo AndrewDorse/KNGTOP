@@ -20,7 +20,7 @@ def _interval_for_window(window_minutes: int) -> str:
     return "15m"
 
 
-def fetch_binance_window_open_btc(
+def fetch_binance_window_open_px(
     *,
     symbol: str,
     window_start_sec: int,
@@ -49,3 +49,7 @@ def fetch_binance_window_open_btc(
     except (requests.RequestException, IndexError, KeyError, ValueError, TypeError) as exc:
         LOGGER.debug("Binance kline open: %s", exc)
         return None
+
+
+# Back-compat name
+fetch_binance_window_open_btc = fetch_binance_window_open_px

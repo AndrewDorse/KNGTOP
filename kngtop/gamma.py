@@ -1,4 +1,4 @@
-"""Gamma discovery for BTC Up/Down (5m / 15m). Adapted from KNG4 ``prst1/gamma_market.py``."""
+"""Gamma discovery for crypto Up/Down (5m / 15m) slugs ``{asset}-updown-{tf}``. From KNG4 ``prst1/gamma_market.py``."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ class ActiveContract:
     down: TokenMarket
 
 
-def discover_active_btc_window(
+def discover_active_updown_window(
     *,
     market_symbol: str,
     window_minutes: int,
@@ -126,3 +126,7 @@ def discover_active_btc_window(
         up=up,
         down=down,
     )
+
+
+# Back-compat alias
+discover_active_btc_window = discover_active_updown_window

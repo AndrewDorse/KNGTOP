@@ -25,11 +25,14 @@ class _FakePoly:
         return None
 
 
-class _FakeBinance:
-    def __init__(self, px: float) -> None:
+class _FakeBinanceCombo:
+    def __init__(self, px: float, symbol: str = "BTCUSDT") -> None:
         self._px = px
+        self._sym = symbol
 
-    def last_price(self, max_age_sec: float = 6.0) -> float | None:
+    def last_price(self, symbol: str, max_age_sec: float = 6.0) -> float | None:
+        if symbol.strip().upper() != self._sym:
+            return None
         return self._px
 
 
@@ -51,11 +54,17 @@ def test_tick_fires_under_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = KngtopConfig.from_env()
 
     c = _contract()
-    runner = WindowRunner(c, 5, RULES_5M)
-    runner.start_btc = 100_000.0
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=c,
+        window_minutes=5,
+        rules=RULES_5M,
+    )
+    runner.start_px = 100_000.0
     runner.traded = False
     poly = _FakePoly(mid_up=0.30, mid_dn=0.70)
-    bn = _FakeBinance(100_020.0)
+    bn = _FakeBinanceCombo(100_020.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
     assert runner.traded
 
@@ -66,9 +75,15 @@ def test_tick_no_fire_when_below_gap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_DRY_RUN", "true")
     cfg = KngtopConfig.from_env()
     c = _contract()
-    runner = WindowRunner(c, 5, RULES_5M)
-    runner.start_btc = 100_000.0
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=c,
+        window_minutes=5,
+        rules=RULES_5M,
+    )
+    runner.start_px = 100_000.0
     poly = _FakePoly(mid_up=0.30, mid_dn=0.70)
-    bn = _FakeBinance(100_002.0)
+    bn = _FakeBinanceCombo(100_002.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
     assert not runner.traded
