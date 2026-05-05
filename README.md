@@ -37,6 +37,16 @@ cp .env.example .env
 docker compose --env-file .env up --build -d
 ```
 
+## Runtime Logging And Retry
+
+- Log stream is intentionally minimal for live ops:
+  - `INIT`
+  - `DEAL_START`
+  - `DEAL_SUCCESS` / `DEAL_FAIL`
+  - `ERROR`
+- Configure retry-on-error for `$1` market order with `KNGTOP_ORDER_RETRY_ON_ERROR`:
+  - `2` means first attempt + 2 retries = **3 total attempts**
+
 ## Layout
 
 - **`Dockerfile` / `docker-compose.yml`**: modeled on **`KNG4`** (slim Python, `python -m` entry).

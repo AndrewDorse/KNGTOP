@@ -29,6 +29,7 @@ class KngtopConfig:
     market_symbol: str
     log_level: str
     order_cutoff_remaining_sec: float
+    order_retry_on_error: int
 
     @staticmethod
     def from_env() -> "KngtopConfig":
@@ -51,4 +52,5 @@ class KngtopConfig:
             market_symbol=(os.environ.get("KNGTOP_MARKET_SYMBOL") or "BTC").strip().upper(),
             log_level=(os.environ.get("KNGTOP_LOG_LEVEL") or "INFO").strip().upper(),
             order_cutoff_remaining_sec=float(os.environ.get("KNGTOP_ORDER_CUTOFF_REMAINING_SEC") or "20.0"),
+            order_retry_on_error=max(0, int(os.environ.get("KNGTOP_ORDER_RETRY_ON_ERROR") or "2")),
         )
