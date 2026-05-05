@@ -203,7 +203,7 @@ def main() -> None:
             relayer_api_key=cfg.relayer_api_key,
             relayer_secret=cfg.relayer_secret,
             relayer_passphrase=cfg.relayer_passphrase,
-            market_buy_price_slip=cfg.market_buy_price_slip,
+            market_buy_max_price=cfg.market_buy_max_price,
         )
 
     runners: dict[tuple[str, int], WindowRunner | None] = {}

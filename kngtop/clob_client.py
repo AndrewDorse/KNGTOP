@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from kngtop.gamma import TokenMarket
@@ -44,11 +43,11 @@ class KngtopClob:
         relayer_api_key: str,
         relayer_secret: str,
         relayer_passphrase: str,
-        market_buy_price_slip: float = 0.10,
+        market_buy_max_price: float = 0.99,
     ) -> None:
         self._signature_type = int(signature_type)
         self._buy = Side.BUY
-        self._market_buy_price_slip = float(market_buy_price_slip)
+        self._market_buy_max_price = float(market_buy_max_price)
         self._taker_lock = threading.Lock()
         self.client = ClobClient(
             HOST,
@@ -62,7 +61,7 @@ class KngtopClob:
                 ApiCreds(
                     api_key=relayer_api_key,
                     api_secret=relayer_secret or "",
-                    api_passphrase=relayer_passphrase or "",
+                    api_passphrase=relayer_passphrase,
                 )
             )
         else:
@@ -116,20 +115,15 @@ class KngtopClob:
         if u <= 0:
             raise ValueError("usdc must be > 0")
         opts = self._book_opts(token)
-        slip = self._market_buy_price_slip
-        price_cap = 0.0
-        if slip > 0.0:
-            base_px = self.client.calculate_market_price(
-                token.token_id, self._buy, u, OrderType.FAK
-            )
-            tick_raw = (
-                _norm_tick(self.client.get_tick_size(token.token_id))
-                if opts is None or opts.tick_size is None
-                else _norm_tick(opts.tick_size)
-            )
-            tick_f = float(tick_raw or "0.01")
-            hi = 1.0 - tick_f
-            price_cap = min(max(base_px + slip, tick_f), hi)
+        tick_raw = (
+            _norm_tick(self.client.get_tick_size(token.token_id))
+            if opts is None or opts.tick_size is None
+            else _norm_tick(opts.tick_size)
+        )
+        tick_f = float(tick_raw or "0.01")
+        hi = 1.0 - tick_f
+        # High per-share ceiling so FAK walks the book; clamp to valid (tick, 1-tick).
+        price_cap = min(max(self._market_buy_max_price, tick_f), hi)
         margs = MarketOrderArgs(
             token_id=token.token_id,
             amount=u,
