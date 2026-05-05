@@ -48,9 +48,9 @@ def test_rule_eth_style_pct_fires_under_up() -> None:
         rich_strong=None,
         side="UP",
         kind="under_up",
-        gap_pct_of_start=0.15,
+        gap_pct_of_start=2.0,
     )
-    # 3000 ETH * 0.15% = $4.5 gap
+    # 3000 ETH * (2 percentage points of open) ~= USD 60 gap
     start = 3000.0
-    spot = start + 5.0
+    spot = start + 70.0
     assert rule_fires(r, btc=spot, start_btc=start, mid_up=0.33, mid_dn=0.67)
