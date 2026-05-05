@@ -40,17 +40,9 @@ def test_effective_gap_pct_overrides_usd() -> None:
     assert abs(effective_gap_px(r, 10_000.0) - 10.0) < 1e-9
 
 
-def test_rule_eth_style_pct_fires_under_up() -> None:
-    r = MispriceRule(
-        "u_up",
-        gap_usd=0.0,
-        cheap_max=0.35,
-        rich_strong=None,
-        side="UP",
-        kind="under_up",
-        gap_pct_of_start=2.0,
-    )
-    # 3000 ETH * (2 percentage points of open) ~= USD 60 gap
+def test_rule_eth_signal_gap_usd_fires_under_up() -> None:
+    r = MispriceRule("u_up", gap_usd=0.05, cheap_max=0.35, rich_strong=None, side="UP", kind="under_up")
     start = 3000.0
-    spot = start + 70.0
+    spot = start + 0.06
     assert rule_fires(r, btc=spot, start_btc=start, mid_up=0.33, mid_dn=0.67)
+    assert not rule_fires(r, btc=start + 0.04, start_btc=start, mid_up=0.33, mid_dn=0.67)

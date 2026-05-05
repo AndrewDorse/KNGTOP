@@ -61,8 +61,6 @@ class KngtopConfig:
     eval_debounce_sec: float
     request_timeout_sec: float
     notional_usd: float
-    notional_eth_usd: float
-    notional_xrp_usd: float
     trading_pairs: tuple[tuple[str, str], ...]
     log_level: str
     order_cutoff_remaining_sec: float
@@ -90,8 +88,6 @@ class KngtopConfig:
             eval_debounce_sec=float(os.environ.get("KNGTOP_EVAL_DEBOUNCE_SECONDS") or "0.025"),
             request_timeout_sec=float(os.environ.get("KNGTOP_REQUEST_TIMEOUT_SECONDS") or "12.0"),
             notional_usd=float(os.environ.get("KNGTOP_NOTIONAL_USD") or "1.0"),
-            notional_eth_usd=float(os.environ.get("KNGTOP_NOTIONAL_ETH_USD") or "0.05"),
-            notional_xrp_usd=float(os.environ.get("KNGTOP_NOTIONAL_XRP_USD") or "0.0005"),
             trading_pairs=pairs,
             log_level=(os.environ.get("KNGTOP_LOG_LEVEL") or "INFO").strip().upper(),
             order_cutoff_remaining_sec=float(os.environ.get("KNGTOP_ORDER_CUTOFF_REMAINING_SEC") or "20.0"),
@@ -100,12 +96,3 @@ class KngtopConfig:
             binance_max_age_sec=float(os.environ.get("KNGTOP_BINANCE_MAX_AGE_SEC") or "6.0"),
             poly_mid_max_age_sec=float(os.environ.get("KNGTOP_POLY_MID_MAX_AGE_SEC") or "5.0"),
         )
-
-    def notional_for_pair(self, pair_key: str) -> float:
-        """USDC amount per market buy; BTC uses ``notional_usd``."""
-        p = (pair_key or "").strip().upper()
-        if p == "ETH":
-            return float(self.notional_eth_usd)
-        if p == "XRP":
-            return float(self.notional_xrp_usd)
-        return float(self.notional_usd)

@@ -70,11 +70,9 @@ def _execute_buy(
     cfg: KngtopConfig,
     token,
     label: str,
-    *,
-    pair_key: str,
 ) -> None:
-    usdc = cfg.notional_for_pair(pair_key)
-    _event("DEAL_START", label=label, pair=pair_key, notional=str(usdc), token=token.token_id[:16])
+    usdc = float(cfg.notional_usd)
+    _event("DEAL_START", label=label, notional=str(usdc), token=token.token_id[:16])
     if cfg.dry_run:
         return
     assert clob is not None
@@ -122,7 +120,7 @@ def _tick_runner(
                 continue
             tok = _pick_token(runner.contract, rule.side)
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
-            _execute_buy(clob, cfg, tok, label, pair_key=runner.pair_key)
+            _execute_buy(clob, cfg, tok, label)
             runner.traded = True
             break
 
@@ -218,9 +216,7 @@ def main() -> None:
         dry_run=str(cfg.dry_run).lower(),
         heartbeat_sec=str(cfg.poll_interval_sec),
         debounce_sec=str(cfg.eval_debounce_sec),
-        notional_btc_usd=str(cfg.notional_usd),
-        notional_eth_usd=str(cfg.notional_eth_usd),
-        notional_xrp_usd=str(cfg.notional_xrp_usd),
+        notional_usd=str(cfg.notional_usd),
         retry_on_error=str(cfg.order_retry_on_error),
     )
 
