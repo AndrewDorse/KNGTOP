@@ -16,6 +16,7 @@ from kngtop.config import KngtopConfig
 from kngtop.eval_coordinator import EvalCoordinator
 from kngtop.gamma import ActiveContract, discover_active_btc_window, window_start_ts_from_slug
 from kngtop.strategy_params import MispriceRule, rule_fires, rules_for_asset
+from kngtop.rest_poll import run_ws_rest_fallback_loop
 from kngtop.ws_market import MarketWsFeed
 
 LOGGER = logging.getLogger("kngtop")
@@ -59,6 +60,10 @@ def _setup_logging(level: str) -> None:
 def _event(kind: str, **fields: object) -> None:
     parts = [f"{k}={v}" for k, v in fields.items()]
     print(f"{kind} " + " ".join(parts), flush=True)
+
+
+def _ws_reconnected_event(feed: str, downtime_sec: float) -> None:
+    _event("WS_RECONNECTED", feed=feed, downtime_sec=f"{downtime_sec:.3f}")
 
 
 def _pick_token(c: ActiveContract, side: str):
@@ -190,10 +195,26 @@ def main() -> None:
 
     bin_syms_sorted = sorted({s for _, s in cfg.trading_pairs})
 
-    poly = MarketWsFeed(on_quote_update=coord.notify)
-    binance = BinanceCombinedTradeFeed(bin_syms_sorted, on_trade=lambda _sym: coord.notify())
+    poly = MarketWsFeed(
+        on_quote_update=coord.notify,
+        on_ws_reconnect=lambda dt: _ws_reconnected_event("polymarket", dt),
+    )
+    binance = BinanceCombinedTradeFeed(
+        bin_syms_sorted,
+        on_trade=lambda _sym: coord.notify(),
+        on_ws_reconnect=lambda dt: _ws_reconnected_event("binance", dt),
+    )
     poly.start()
     binance.start()
+
+    rest_poll_stop = threading.Event()
+    if cfg.ws_rest_poll_enabled:
+        threading.Thread(
+            target=run_ws_rest_fallback_loop,
+            args=(rest_poll_stop, cfg, binance, poly),
+            name="ws-rest-fallback",
+            daemon=True,
+        ).start()
 
     clob: KngtopClob | None = None
     if not cfg.dry_run:
@@ -218,6 +239,8 @@ def main() -> None:
         debounce_sec=str(cfg.eval_debounce_sec),
         notional_usd=str(cfg.notional_usd),
         retry_on_error=str(cfg.order_retry_on_error),
+        ws_rest_poll=str(cfg.ws_rest_poll_enabled).lower(),
+        ws_rest_poll_interval_sec=str(cfg.ws_rest_poll_interval_sec),
     )
 
     while True:

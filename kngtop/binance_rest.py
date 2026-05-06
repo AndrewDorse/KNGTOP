@@ -9,6 +9,7 @@ import requests
 LOGGER = logging.getLogger("kngtop")
 
 _BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+_BINANCE_TICKER_PRICE = "https://api.binance.com/api/v3/ticker/price"
 
 
 def _interval_for_window(window_minutes: int) -> str:
@@ -48,6 +49,25 @@ def fetch_binance_window_open_px(
         return o if o > 0 else None
     except (requests.RequestException, IndexError, KeyError, ValueError, TypeError) as exc:
         LOGGER.debug("Binance kline open: %s", exc)
+        return None
+
+
+def fetch_binance_spot_price(*, symbol: str, timeout: float) -> float | None:
+    """Last traded price from Binance REST (fallback when WS cache is stale)."""
+    sym = symbol.strip().upper().replace("/", "")
+    if not sym:
+        return None
+    try:
+        r = requests.get(_BINANCE_TICKER_PRICE, params={"symbol": sym}, timeout=timeout)
+        r.raise_for_status()
+        j = r.json()
+        raw = j.get("price")
+        if raw is None:
+            return None
+        px = float(raw)
+        return px if px > 0 else None
+    except (requests.RequestException, KeyError, ValueError, TypeError) as exc:
+        LOGGER.debug("Binance ticker price %s: %s", sym, exc)
         return None
 
 

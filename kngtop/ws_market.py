@@ -29,6 +29,7 @@ class MarketWsFeed:
         self,
         url: str = DEFAULT_WS_URL,
         on_quote_update: Callable[[], None] | None = None,
+        on_ws_reconnect: Callable[[float], None] | None = None,
     ) -> None:
         if websocket is None:
             raise RuntimeError(
@@ -37,6 +38,9 @@ class MarketWsFeed:
             )
         self._url = url
         self._on_quote_update = on_quote_update
+        self._on_ws_reconnect = on_ws_reconnect
+        self._disconnect_at: float | None = None
+        self._skip_next_disconnect_mark = False
         self._lock = threading.Lock()
         self._quotes: dict[str, dict[str, float]] = {}
         self._subscribed: tuple[str, ...] = ()
@@ -69,7 +73,15 @@ class MarketWsFeed:
                 return
             self._subscribed = t
         LOGGER.debug("WS market: asset set changed (%d ids); reconnect", len(t))
-        self._close_ws()
+        self._close_ws(record_disconnect=False)
+
+    def subscribed_asset_ids(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._subscribed)
+
+    def apply_quote(self, asset_id: str, bid: float, ask: float) -> None:
+        """Seed or refresh from REST (same as a WS book event)."""
+        self._set_quote(asset_id, bid, ask)
 
     def mid_for(self, asset_id: str, max_age_sec: float = 4.0) -> float | None:
         with self._lock:
@@ -89,7 +101,9 @@ class MarketWsFeed:
                 return None
             return float(q["bid"]), float(q["ask"])
 
-    def _close_ws(self) -> None:
+    def _close_ws(self, *, record_disconnect: bool = True) -> None:
+        if not record_disconnect:
+            self._skip_next_disconnect_mark = True
         app = self._ws_app
         self._ws_app = None
         if app is not None:
@@ -172,14 +186,32 @@ class MarketWsFeed:
             sub = {"assets_ids": assets, "type": "market", "custom_feature_enabled": True}
             ws.send(json.dumps(sub))
             ready.set()
+            now = time.time()
+            downtime: float | None = None
+            if self._disconnect_at is not None:
+                downtime = now - self._disconnect_at
+                self._disconnect_at = None
             LOGGER.debug("WS market: connected + subscribed")
+            if downtime is not None and self._on_ws_reconnect is not None:
+                try:
+                    self._on_ws_reconnect(float(downtime))
+                except Exception:  # noqa: BLE001
+                    LOGGER.debug("on_ws_reconnect failed", exc_info=True)
+
+        def on_close(*_a: Any) -> None:
+            if self._skip_next_disconnect_mark:
+                self._skip_next_disconnect_mark = False
+                LOGGER.debug("WS market closed (resubscribe)")
+                return
+            self._disconnect_at = time.time()
+            LOGGER.debug("WS market closed")
 
         self._ws_app = websocket.WebSocketApp(
             self._url,
             on_open=on_open,
             on_message=self._on_message,
             on_error=lambda _ws, e: LOGGER.debug("WS error: %s", e),
-            on_close=lambda *_a: LOGGER.debug("WS market closed"),
+            on_close=on_close,
         )
 
         def ping_worker() -> None:

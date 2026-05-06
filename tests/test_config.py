@@ -39,3 +39,13 @@ def test_pairs_rejects_unknown_asset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KNGTOP_PAIRS", "DOGE:DOGEUSDT")
     with pytest.raises(RuntimeError, match="Unsupported asset"):
         KngtopConfig.from_env()
+
+
+def test_ws_rest_poll_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
+    monkeypatch.delenv("KNGTOP_WS_REST_POLL_ENABLE", raising=False)
+    monkeypatch.delenv("KNGTOP_WS_REST_POLL_INTERVAL_SECONDS", raising=False)
+    cfg = KngtopConfig.from_env()
+    assert cfg.ws_rest_poll_enabled is True
+    assert cfg.ws_rest_poll_interval_sec == 1.0

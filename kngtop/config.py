@@ -68,6 +68,8 @@ class KngtopConfig:
     market_buy_max_price: float
     binance_max_age_sec: float
     poly_mid_max_age_sec: float
+    ws_rest_poll_enabled: bool
+    ws_rest_poll_interval_sec: float
 
     @staticmethod
     def from_env() -> "KngtopConfig":
@@ -95,4 +97,12 @@ class KngtopConfig:
             market_buy_max_price=float(os.environ.get("KNGTOP_MARKET_BUY_MAX_PRICE") or "0.99"),
             binance_max_age_sec=float(os.environ.get("KNGTOP_BINANCE_MAX_AGE_SEC") or "6.0"),
             poly_mid_max_age_sec=float(os.environ.get("KNGTOP_POLY_MID_MAX_AGE_SEC") or "5.0"),
+            ws_rest_poll_enabled=_env_bool("KNGTOP_WS_REST_POLL_ENABLE", True),
+            ws_rest_poll_interval_sec=max(
+                0.2,
+                min(
+                    float(os.environ.get("KNGTOP_WS_REST_POLL_INTERVAL_SECONDS") or "1.0"),
+                    120.0,
+                ),
+            ),
         )

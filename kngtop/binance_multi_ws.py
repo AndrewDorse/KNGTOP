@@ -28,6 +28,7 @@ class BinanceCombinedTradeFeed:
         symbols: list[str],
         *,
         on_trade: Callable[[str], None] | None = None,
+        on_ws_reconnect: Callable[[float], None] | None = None,
     ) -> None:
         if websocket is None:
             raise RuntimeError(f"websocket-client required: {_IMPORT_ERR}")
@@ -40,6 +41,8 @@ class BinanceCombinedTradeFeed:
         streams = "/".join(f"{s.lower()}@trade" for s in self._symbols_norm)
         self._url = f"wss://stream.binance.com:9443/stream?streams={streams}"
         self._on_trade = on_trade
+        self._on_ws_reconnect = on_ws_reconnect
+        self._disconnect_at: float | None = None
         self._lock = threading.Lock()
         self._px: dict[str, tuple[float, float]] = {}  # SYMBOL -> (price, wall_ts)
         self._stop = threading.Event()
@@ -64,6 +67,15 @@ class BinanceCombinedTradeFeed:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+
+    @property
+    def symbols(self) -> tuple[str, ...]:
+        return tuple(self._symbols_norm)
+
+    def apply_trade_price(self, symbol: str, price: float) -> None:
+        """Update cache (e.g. from REST fallback). Same path as WS trades."""
+        sym_u = symbol.strip().upper().replace("/", "")
+        self._bump(sym_u, float(price))
 
     def last_price(self, symbol: str, *, max_age_sec: float = 6.0) -> float | None:
         sym = symbol.strip().upper().replace("/", "")
@@ -117,6 +129,26 @@ class BinanceCombinedTradeFeed:
                 continue
             self._bump(sym_u, p)
 
+    def _on_ws_open(self, _ws: Any) -> None:
+        now = time.time()
+        downtime: float | None = None
+        if self._disconnect_at is not None:
+            downtime = now - self._disconnect_at
+            self._disconnect_at = None
+        LOGGER.debug(
+            "Binance combo WS connected (%d streams)",
+            len(self._symbols_norm),
+        )
+        if downtime is not None and self._on_ws_reconnect is not None:
+            try:
+                self._on_ws_reconnect(float(downtime))
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("on_ws_reconnect failed", exc_info=True)
+
+    def _on_ws_close(self, *_a: Any) -> None:
+        self._disconnect_at = time.time()
+        LOGGER.debug("Binance combo WS closed")
+
     def _run_loop(self) -> None:
         backoff = 1.5
         while not self._stop.is_set():
@@ -125,10 +157,8 @@ class BinanceCombinedTradeFeed:
                     self._url,
                     on_message=lambda _ws, msg: self._dispatch_message(msg),
                     on_error=lambda _w, e: LOGGER.warning("Binance combo WS error: %s", e),
-                    on_close=lambda *_a: LOGGER.debug("Binance combo WS closed"),
-                    on_open=lambda _ws: LOGGER.debug(
-                        "Binance combo WS connected (%d streams)", len(self._symbols_norm)
-                    ),
+                    on_close=self._on_ws_close,
+                    on_open=self._on_ws_open,
                 )
                 self._ws_app.run_forever(ping_interval=20, ping_timeout=10)
                 backoff = 1.5
