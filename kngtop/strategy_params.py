@@ -1,4 +1,4 @@
-"""Inverted side presets for KNGTOP live trading."""
+"""Cheap-side presets for KNGTOP live trading."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-CHEAP_PRICE_MAX = 0.30
+CHEAP_PRICE_MAX = 0.15
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,13 +23,13 @@ _CHEAP_RULES: tuple[MispriceRule, ...] = (
     MispriceRule(
         "cheap_buy_up",
         cheap_max=CHEAP_PRICE_MAX,
-        side="DOWN",
+        side="UP",
         kind="cheap_up",
     ),
     MispriceRule(
         "cheap_buy_down",
         cheap_max=CHEAP_PRICE_MAX,
-        side="UP",
+        side="DOWN",
         kind="cheap_dn",
     ),
 )
@@ -45,7 +45,7 @@ SOL_RULES_15M: tuple[MispriceRule, ...] = _CHEAP_RULES
 
 
 def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
-    """Return the inverted-side rules for a Gamma asset key and timeframe."""
+    """Return the cheap-side rules for a Gamma asset key and timeframe."""
     p = (pair or "").strip().upper()
     if p not in {"BTC", "ETH", "XRP", "SOL"}:
         raise ValueError(f"unsupported asset pair {pair!r} (expected BTC, ETH, XRP, or SOL)")

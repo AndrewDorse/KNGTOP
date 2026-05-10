@@ -63,7 +63,7 @@ def test_tick_fires_cheap_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     runner.start_px = 100_000.0
     runner.traded = False
-    poly = _FakePoly(mid_up=0.19, mid_dn=0.81)
+    poly = _FakePoly(mid_up=0.15, mid_dn=0.85)
     bn = _FakeBinanceCombo(100_020.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
     assert runner.traded
@@ -83,7 +83,7 @@ def test_tick_no_fire_when_price_not_cheap(monkeypatch: pytest.MonkeyPatch) -> N
         rules=RULES_5M,
     )
     runner.start_px = 100_000.0
-    poly = _FakePoly(mid_up=0.31, mid_dn=0.80)
+    poly = _FakePoly(mid_up=0.16, mid_dn=0.80)
     bn = _FakeBinanceCombo(100_002.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
     assert not runner.traded
@@ -104,7 +104,7 @@ def test_tick_fires_cheap_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
         rules=RULES_5M,
     )
     runner.start_px = 100_000.0
-    poly = _FakePoly(mid_up=0.81, mid_dn=0.19)
+    poly = _FakePoly(mid_up=0.85, mid_dn=0.15)
     bn = _FakeBinanceCombo(99_980.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
     assert runner.traded
