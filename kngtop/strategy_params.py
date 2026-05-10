@@ -1,6 +1,11 @@
-"""Preset thresholds from sweep: best total PnL (5m min 6 trades, 15m min 30 trades).
+"""Misprice preset thresholds for KNGTOP live + ``kng_bot3`` PALADIN parity.
 
-See ``kng_bot3`` exports ``SWEEP_FOUR_MISPRICE_PARAMS.csv`` / ``PALADIN/sweep_four_misprice_params.py``.
+BTC gaps are **operator-tuned** (uniform per horizon) and match
+``kng_bot3/PALADIN/sim_pm_btc_fulltape_misprice_strategies.py`` —
+``misprice_kngtop_preset_defs_5m`` / ``misprice_kngtop_preset_defs_15m``.
+
+ETH / XRP / SOL gaps are documented inline. Older sweep references:
+``SWEEP_FOUR_MISPRICE_PARAMS.csv`` / ``PALADIN/sweep_four_misprice_params.py``.
 """
 
 from __future__ import annotations
@@ -23,112 +28,305 @@ class MispriceRule:
     gap_pct_of_start: float | None = None
 
 
-# 5m pool — best total PnL rows (cheap_max / rich_strong inert dims noted in README)
+# BTC: Binance spot vs window open — same USD gap for all four rules per horizon
+# (PALADIN exclusive KNGTOP preset sim).
+_BTC_SIGNAL_GAP_5M_USD = 5.0
+_BTC_SIGNAL_GAP_15M_USD = 10.0
+
 RULES_5M: tuple[MispriceRule, ...] = (
-    MispriceRule("u_up_cheap", gap_usd=6.0, cheap_max=0.35, rich_strong=None, side="UP", kind="under_up"),
-    MispriceRule("u_dn_cheap", gap_usd=6.0, cheap_max=0.35, rich_strong=None, side="DOWN", kind="under_dn"),
-    MispriceRule("o_fade_up_s", gap_usd=6.0, cheap_max=None, rich_strong=0.68, side="DOWN", kind="fade_up_s"),
-    MispriceRule("o_fade_dn_s", gap_usd=9.0, cheap_max=None, rich_strong=0.68, side="UP", kind="fade_dn_s"),
+    MispriceRule(
+        "u_up_cheap",
+        gap_usd=_BTC_SIGNAL_GAP_5M_USD,
+        cheap_max=0.35,
+        rich_strong=None,
+        side="UP",
+        kind="under_up",
+    ),
+    MispriceRule(
+        "u_dn_cheap",
+        gap_usd=_BTC_SIGNAL_GAP_5M_USD,
+        cheap_max=0.35,
+        rich_strong=None,
+        side="DOWN",
+        kind="under_dn",
+    ),
+    MispriceRule(
+        "o_fade_up_s",
+        gap_usd=_BTC_SIGNAL_GAP_5M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="DOWN",
+        kind="fade_up_s",
+    ),
+    MispriceRule(
+        "o_fade_dn_s",
+        gap_usd=_BTC_SIGNAL_GAP_5M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="UP",
+        kind="fade_dn_s",
+    ),
 )
 
-# 15m pool
 RULES_15M: tuple[MispriceRule, ...] = (
-    MispriceRule("u_up_cheap", gap_usd=6.0, cheap_max=0.38, rich_strong=None, side="UP", kind="under_up"),
-    MispriceRule("u_dn_cheap", gap_usd=6.0, cheap_max=0.38, rich_strong=None, side="DOWN", kind="under_dn"),
-    MispriceRule("o_fade_up_s", gap_usd=6.0, cheap_max=None, rich_strong=0.72, side="DOWN", kind="fade_up_s"),
-    MispriceRule("o_fade_dn_s", gap_usd=9.0, cheap_max=None, rich_strong=0.68, side="UP", kind="fade_dn_s"),
+    MispriceRule(
+        "u_up_cheap",
+        gap_usd=_BTC_SIGNAL_GAP_15M_USD,
+        cheap_max=0.38,
+        rich_strong=None,
+        side="UP",
+        kind="under_up",
+    ),
+    MispriceRule(
+        "u_dn_cheap",
+        gap_usd=_BTC_SIGNAL_GAP_15M_USD,
+        cheap_max=0.38,
+        rich_strong=None,
+        side="DOWN",
+        kind="under_dn",
+    ),
+    MispriceRule(
+        "o_fade_up_s",
+        gap_usd=_BTC_SIGNAL_GAP_15M_USD,
+        cheap_max=None,
+        rich_strong=0.72,
+        side="DOWN",
+        kind="fade_up_s",
+    ),
+    MispriceRule(
+        "o_fade_dn_s",
+        gap_usd=_BTC_SIGNAL_GAP_15M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="UP",
+        kind="fade_dn_s",
+    ),
 )
 
 # ETH / XRP — Binance spot vs window open: fixed USD gap for all four rules (5m and 15m).
 # Market buy notional stays $1 for every asset (see ``KngtopConfig.notional_usd``).
-_ETH_SIGNAL_GAP_USD = 0.05
-_XRP_SIGNAL_GAP_USD = 0.0003
-_SOL_SIGNAL_GAP_USD = 0.005
+# ETH gaps tuned from PALADIN sweep on exclusive-first-hit windows:
+# - 5m: best PnL cluster at gap~=0.02–0.04 with cheap_max=0.35, rich_strong=0.64
+# - 15m: best PnL cluster at gap~=0.06 with cheap_max=0.38, rich_strong=0.72
+_ETH_SIGNAL_GAP_5M_USD = 0.03
+_ETH_SIGNAL_GAP_15M_USD = 0.06
+# XRP: operator set **0** — no USD offset vs window open; signals are PM price gates
+# (cheap ~0.35 / rich bands) with spot strictly above/below open only (> start / < start).
+_XRP_SIGNAL_GAP_5M_USD = 0.0
+_XRP_SIGNAL_GAP_15M_USD = 0.0
+# SOL: PALADIN ``SWEEP_SOL_EXCLUSIVE_MISPRICE.csv`` — with live cheap/rich (5m 0.35/0.68,
+# 15m 0.38/0.68), PnL/entries were **identical** for gaps 0.001–0.008; kept **0.005** (prior single gap).
+_SOL_SIGNAL_GAP_5M_USD = 0.005
+_SOL_SIGNAL_GAP_15M_USD = 0.005
 
 ETH_RULES_5M: tuple[MispriceRule, ...] = (
-    MispriceRule("u_up_cheap", gap_usd=_ETH_SIGNAL_GAP_USD, cheap_max=0.35, rich_strong=None, side="UP", kind="under_up"),
     MispriceRule(
-        "u_dn_cheap", gap_usd=_ETH_SIGNAL_GAP_USD, cheap_max=0.35, rich_strong=None, side="DOWN", kind="under_dn"
+        "u_up_cheap",
+        gap_usd=_ETH_SIGNAL_GAP_5M_USD,
+        cheap_max=0.35,
+        rich_strong=None,
+        side="UP",
+        kind="under_up",
     ),
     MispriceRule(
-        "o_fade_up_s", gap_usd=_ETH_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.68, side="DOWN", kind="fade_up_s"
+        "u_dn_cheap",
+        gap_usd=_ETH_SIGNAL_GAP_5M_USD,
+        cheap_max=0.35,
+        rich_strong=None,
+        side="DOWN",
+        kind="under_dn",
     ),
     MispriceRule(
-        "o_fade_dn_s", gap_usd=_ETH_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.68, side="UP", kind="fade_dn_s"
+        "o_fade_up_s",
+        gap_usd=_ETH_SIGNAL_GAP_5M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="DOWN",
+        kind="fade_up_s",
+    ),
+    MispriceRule(
+        "o_fade_dn_s",
+        gap_usd=_ETH_SIGNAL_GAP_5M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="UP",
+        kind="fade_dn_s",
     ),
 )
 
 ETH_RULES_15M: tuple[MispriceRule, ...] = (
-    MispriceRule("u_up_cheap", gap_usd=_ETH_SIGNAL_GAP_USD, cheap_max=0.38, rich_strong=None, side="UP", kind="under_up"),
     MispriceRule(
-        "u_dn_cheap", gap_usd=_ETH_SIGNAL_GAP_USD, cheap_max=0.38, rich_strong=None, side="DOWN", kind="under_dn"
+        "u_up_cheap",
+        gap_usd=_ETH_SIGNAL_GAP_15M_USD,
+        cheap_max=0.38,
+        rich_strong=None,
+        side="UP",
+        kind="under_up",
     ),
     MispriceRule(
-        "o_fade_up_s", gap_usd=_ETH_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.72, side="DOWN", kind="fade_up_s"
+        "u_dn_cheap",
+        gap_usd=_ETH_SIGNAL_GAP_15M_USD,
+        cheap_max=0.38,
+        rich_strong=None,
+        side="DOWN",
+        kind="under_dn",
     ),
     MispriceRule(
-        "o_fade_dn_s", gap_usd=_ETH_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.68, side="UP", kind="fade_dn_s"
+        "o_fade_up_s",
+        gap_usd=_ETH_SIGNAL_GAP_15M_USD,
+        cheap_max=None,
+        rich_strong=0.72,
+        side="DOWN",
+        kind="fade_up_s",
+    ),
+    MispriceRule(
+        "o_fade_dn_s",
+        gap_usd=_ETH_SIGNAL_GAP_15M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="UP",
+        kind="fade_dn_s",
     ),
 )
 
 XRP_RULES_5M: tuple[MispriceRule, ...] = (
     MispriceRule(
-        "u_up_cheap", gap_usd=_XRP_SIGNAL_GAP_USD, cheap_max=0.35, rich_strong=None, side="UP", kind="under_up"
+        "u_up_cheap",
+        gap_usd=_XRP_SIGNAL_GAP_5M_USD,
+        cheap_max=0.35,
+        rich_strong=None,
+        side="UP",
+        kind="under_up",
     ),
     MispriceRule(
-        "u_dn_cheap", gap_usd=_XRP_SIGNAL_GAP_USD, cheap_max=0.35, rich_strong=None, side="DOWN", kind="under_dn"
+        "u_dn_cheap",
+        gap_usd=_XRP_SIGNAL_GAP_5M_USD,
+        cheap_max=0.35,
+        rich_strong=None,
+        side="DOWN",
+        kind="under_dn",
     ),
     MispriceRule(
-        "o_fade_up_s", gap_usd=_XRP_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.68, side="DOWN", kind="fade_up_s"
+        "o_fade_up_s",
+        gap_usd=_XRP_SIGNAL_GAP_5M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="DOWN",
+        kind="fade_up_s",
     ),
     MispriceRule(
-        "o_fade_dn_s", gap_usd=_XRP_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.68, side="UP", kind="fade_dn_s"
+        "o_fade_dn_s",
+        gap_usd=_XRP_SIGNAL_GAP_5M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="UP",
+        kind="fade_dn_s",
     ),
 )
 
 XRP_RULES_15M: tuple[MispriceRule, ...] = (
     MispriceRule(
-        "u_up_cheap", gap_usd=_XRP_SIGNAL_GAP_USD, cheap_max=0.38, rich_strong=None, side="UP", kind="under_up"
+        "u_up_cheap",
+        gap_usd=_XRP_SIGNAL_GAP_15M_USD,
+        cheap_max=0.38,
+        rich_strong=None,
+        side="UP",
+        kind="under_up",
     ),
     MispriceRule(
-        "u_dn_cheap", gap_usd=_XRP_SIGNAL_GAP_USD, cheap_max=0.38, rich_strong=None, side="DOWN", kind="under_dn"
+        "u_dn_cheap",
+        gap_usd=_XRP_SIGNAL_GAP_15M_USD,
+        cheap_max=0.38,
+        rich_strong=None,
+        side="DOWN",
+        kind="under_dn",
     ),
     MispriceRule(
-        "o_fade_up_s", gap_usd=_XRP_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.72, side="DOWN", kind="fade_up_s"
+        "o_fade_up_s",
+        gap_usd=_XRP_SIGNAL_GAP_15M_USD,
+        cheap_max=None,
+        rich_strong=0.72,
+        side="DOWN",
+        kind="fade_up_s",
     ),
     MispriceRule(
-        "o_fade_dn_s", gap_usd=_XRP_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.68, side="UP", kind="fade_dn_s"
+        "o_fade_dn_s",
+        gap_usd=_XRP_SIGNAL_GAP_15M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="UP",
+        kind="fade_dn_s",
     ),
 )
 
 
 SOL_RULES_5M: tuple[MispriceRule, ...] = (
     MispriceRule(
-        "u_up_cheap", gap_usd=_SOL_SIGNAL_GAP_USD, cheap_max=0.35, rich_strong=None, side="UP", kind="under_up"
+        "u_up_cheap",
+        gap_usd=_SOL_SIGNAL_GAP_5M_USD,
+        cheap_max=0.35,
+        rich_strong=None,
+        side="UP",
+        kind="under_up",
     ),
     MispriceRule(
-        "u_dn_cheap", gap_usd=_SOL_SIGNAL_GAP_USD, cheap_max=0.35, rich_strong=None, side="DOWN", kind="under_dn"
+        "u_dn_cheap",
+        gap_usd=_SOL_SIGNAL_GAP_5M_USD,
+        cheap_max=0.35,
+        rich_strong=None,
+        side="DOWN",
+        kind="under_dn",
     ),
     MispriceRule(
-        "o_fade_up_s", gap_usd=_SOL_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.68, side="DOWN", kind="fade_up_s"
+        "o_fade_up_s",
+        gap_usd=_SOL_SIGNAL_GAP_5M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="DOWN",
+        kind="fade_up_s",
     ),
     MispriceRule(
-        "o_fade_dn_s", gap_usd=_SOL_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.68, side="UP", kind="fade_dn_s"
+        "o_fade_dn_s",
+        gap_usd=_SOL_SIGNAL_GAP_5M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="UP",
+        kind="fade_dn_s",
     ),
 )
 
 SOL_RULES_15M: tuple[MispriceRule, ...] = (
     MispriceRule(
-        "u_up_cheap", gap_usd=_SOL_SIGNAL_GAP_USD, cheap_max=0.38, rich_strong=None, side="UP", kind="under_up"
+        "u_up_cheap",
+        gap_usd=_SOL_SIGNAL_GAP_15M_USD,
+        cheap_max=0.38,
+        rich_strong=None,
+        side="UP",
+        kind="under_up",
     ),
     MispriceRule(
-        "u_dn_cheap", gap_usd=_SOL_SIGNAL_GAP_USD, cheap_max=0.38, rich_strong=None, side="DOWN", kind="under_dn"
+        "u_dn_cheap",
+        gap_usd=_SOL_SIGNAL_GAP_15M_USD,
+        cheap_max=0.38,
+        rich_strong=None,
+        side="DOWN",
+        kind="under_dn",
     ),
     MispriceRule(
-        "o_fade_up_s", gap_usd=_SOL_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.72, side="DOWN", kind="fade_up_s"
+        "o_fade_up_s",
+        gap_usd=_SOL_SIGNAL_GAP_15M_USD,
+        cheap_max=None,
+        rich_strong=0.72,
+        side="DOWN",
+        kind="fade_up_s",
     ),
     MispriceRule(
-        "o_fade_dn_s", gap_usd=_SOL_SIGNAL_GAP_USD, cheap_max=None, rich_strong=0.68, side="UP", kind="fade_dn_s"
+        "o_fade_dn_s",
+        gap_usd=_SOL_SIGNAL_GAP_15M_USD,
+        cheap_max=None,
+        rich_strong=0.68,
+        side="UP",
+        kind="fade_dn_s",
     ),
 )
 

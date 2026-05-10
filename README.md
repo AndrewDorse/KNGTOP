@@ -5,27 +5,27 @@ Dockerized Polymarket **BTC Up/Down** runner: **5m** and **15m** windows **at th
 - **Prices:** Polymarket **WebSocket** market channel (`wss://ws-subscriptions-clob.polymarket.com/ws/market`) for UP/DOWN mids.
 - **BTC:** **Binance WebSocket** `btcusdt@trade` for live spot; **Binance REST** kline **open** at the slug epoch for `start_btc` (same idea as `KNG4/prst1/clob_shim.fetch_binance_window_open_btc`).
 
-## Preset strategies (from `kng_bot3` sweep — best total PnL)
+## Preset strategies (BTC aligned with `kng_bot3` PALADIN KNGTOP presets)
 
 Per window, rules are evaluated **in list order**; the **first** that fires gets the single trade.
 
-### 5m (`RULES_5M`)
+### 5m (`RULES_5M`) — gap **$5** for every rule
 
 | Order | Key | Logic |
 |------|-----|--------|
 | 1 | `u_up_cheap` | `btc > start + 5` and `mid_up ≤ 0.35` → buy **UP** |
 | 2 | `u_dn_cheap` | `btc < start − 5` and `mid_dn ≤ 0.35` → buy **DOWN** |
 | 3 | `o_fade_up_s` | `btc < start − 5` and `mid_up ≥ 0.68` → buy **DOWN** |
-| 4 | `o_fade_dn_s` | `btc > start + 8` and `mid_dn ≥ 0.68` → buy **UP** |
+| 4 | `o_fade_dn_s` | `btc > start + 5` and `mid_dn ≥ 0.68` → buy **UP** |
 
-### 15m (`RULES_15M`)
+### 15m (`RULES_15M`) — gap **$10** for every rule
 
 | Order | Key | Logic |
 |------|-----|--------|
-| 1 | `u_up_cheap` | `btc > start + 5` and `mid_up ≤ 0.38` → buy **UP** |
-| 2 | `u_dn_cheap` | `btc < start − 8` and `mid_dn ≤ 0.38` → buy **DOWN** |
-| 3 | `o_fade_up_s` | `btc < start − 5` and `mid_up ≥ 0.72` → buy **DOWN** |
-| 4 | `o_fade_dn_s` | `btc > start + 5` and `mid_dn ≥ 0.68` → buy **UP** |
+| 1 | `u_up_cheap` | `btc > start + 10` and `mid_up ≤ 0.38` → buy **UP** |
+| 2 | `u_dn_cheap` | `btc < start − 10` and `mid_dn ≤ 0.38` → buy **DOWN** |
+| 3 | `o_fade_up_s` | `btc < start − 10` and `mid_up ≥ 0.72` → buy **DOWN** |
+| 4 | `o_fade_dn_s` | `btc > start + 10` and `mid_dn ≥ 0.68` → buy **UP** |
 
 **Disclaimer:** Live Polymarket resolution may **not** match Binance `start_btc` / last trade. This is execution plumbing + the research thresholds, not guaranteed edge.
 

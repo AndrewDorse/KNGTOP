@@ -41,6 +41,14 @@ def test_pairs_rejects_unknown_asset(monkeypatch: pytest.MonkeyPatch) -> None:
         KngtopConfig.from_env()
 
 
+def test_market_buy_max_price_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
+    monkeypatch.delenv("KNGTOP_MARKET_BUY_MAX_PRICE", raising=False)
+    cfg = KngtopConfig.from_env()
+    assert cfg.market_buy_max_price == 0.4
+
+
 def test_ws_rest_poll_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
     monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)

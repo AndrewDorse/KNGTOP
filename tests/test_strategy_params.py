@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from kngtop.strategy_params import (
+    RULES_15M,
     RULES_5M,
+    XRP_RULES_15M,
+    XRP_RULES_5M,
     MispriceRule,
     effective_gap_px,
     rule_fires,
@@ -25,6 +28,19 @@ def test_rule_fires_fade_dn_s() -> None:
 
 def test_rules_5m_count() -> None:
     assert len(RULES_5M) == 4
+
+
+def test_xrp_rules_gap_zero() -> None:
+    assert {r.gap_usd for r in XRP_RULES_5M} == {0.0}
+    assert {r.gap_usd for r in XRP_RULES_15M} == {0.0}
+
+
+def test_btc_rules_uniform_gap_matches_paladin_presets() -> None:
+    """BTC 5m/15m: one gap_usd per horizon (PALADIN misprice_kngtop_preset_defs_*)."""
+    g5 = {r.gap_usd for r in RULES_5M}
+    g15 = {r.gap_usd for r in RULES_15M}
+    assert g5 == {5.0}
+    assert g15 == {10.0}
 
 
 def test_effective_gap_pct_overrides_usd() -> None:
