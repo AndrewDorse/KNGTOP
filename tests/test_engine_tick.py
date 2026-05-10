@@ -83,7 +83,7 @@ def test_tick_no_fire_when_price_not_cheap(monkeypatch: pytest.MonkeyPatch) -> N
         rules=RULES_5M,
     )
     runner.start_px = 100_000.0
-    poly = _FakePoly(mid_up=0.20, mid_dn=0.80)
+    poly = _FakePoly(mid_up=0.31, mid_dn=0.80)
     bn = _FakeBinanceCombo(100_002.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
     assert not runner.traded

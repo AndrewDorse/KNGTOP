@@ -13,17 +13,17 @@ from kngtop.strategy_params import (
 
 
 def test_rule_fires_cheap_up() -> None:
-    r = MispriceRule("cheap_buy_up", cheap_max=CHEAP_PRICE_MAX, side="UP", kind="cheap_up")
-    assert rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.19, mid_dn=0.81)
-    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.19, mid_dn=0.81)
-    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.20, mid_dn=0.80)
+    r = MispriceRule("cheap_buy_up", cheap_max=CHEAP_PRICE_MAX, side="DOWN", kind="cheap_up")
+    assert rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.30, mid_dn=0.70)
+    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.30, mid_dn=0.70)
+    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.31, mid_dn=0.69)
 
 
 def test_rule_fires_cheap_down() -> None:
-    r = MispriceRule("cheap_buy_down", cheap_max=CHEAP_PRICE_MAX, side="DOWN", kind="cheap_dn")
-    assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.81, mid_dn=0.19)
-    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.81, mid_dn=0.19)
-    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.80, mid_dn=0.20)
+    r = MispriceRule("cheap_buy_down", cheap_max=CHEAP_PRICE_MAX, side="UP", kind="cheap_dn")
+    assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.30)
+    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.30)
+    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.69, mid_dn=0.31)
 
 
 def test_rules_count_per_window() -> None:

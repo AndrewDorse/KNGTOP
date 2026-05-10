@@ -137,7 +137,7 @@ def _tick_runner(
                 continue
             tok = _pick_token(runner.contract, rule.side)
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
-            trigger_px = mid_up if rule.side == "UP" else mid_dn
+            trigger_px = mid_up if rule.kind == "cheap_up" else mid_dn
             _execute_buy(
                 clob,
                 cfg,

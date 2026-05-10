@@ -1,4 +1,4 @@
-"""Cheap side presets for KNGTOP live trading."""
+"""Inverted side presets for KNGTOP live trading."""
 
 from __future__ import annotations
 
@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-CHEAP_PRICE_MAX = 0.20
+CHEAP_PRICE_MAX = 0.30
 
 
 @dataclass(frozen=True, slots=True)
 class MispriceRule:
-    """One cheap-side strategy for a timeframe."""
+    """One trigger rule for a timeframe."""
 
     key: str
     cheap_max: float
@@ -23,13 +23,13 @@ _CHEAP_RULES: tuple[MispriceRule, ...] = (
     MispriceRule(
         "cheap_buy_up",
         cheap_max=CHEAP_PRICE_MAX,
-        side="UP",
+        side="DOWN",
         kind="cheap_up",
     ),
     MispriceRule(
         "cheap_buy_down",
         cheap_max=CHEAP_PRICE_MAX,
-        side="DOWN",
+        side="UP",
         kind="cheap_dn",
     ),
 )
@@ -45,7 +45,7 @@ SOL_RULES_15M: tuple[MispriceRule, ...] = _CHEAP_RULES
 
 
 def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
-    """Return the cheap-side rules for a Gamma asset key and timeframe."""
+    """Return the inverted-side rules for a Gamma asset key and timeframe."""
     p = (pair or "").strip().upper()
     if p not in {"BTC", "ETH", "XRP", "SOL"}:
         raise ValueError(f"unsupported asset pair {pair!r} (expected BTC, ETH, XRP, or SOL)")
@@ -54,7 +54,7 @@ def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
 
 def rule_fires(rule: MispriceRule, *, btc: float, start_btc: float, mid_up: float, mid_dn: float) -> bool:
     if rule.kind == "cheap_up":
-        return btc > start_btc and mid_up < rule.cheap_max
+        return btc > start_btc and mid_up <= rule.cheap_max
     if rule.kind == "cheap_dn":
-        return btc < start_btc and mid_dn < rule.cheap_max
+        return btc < start_btc and mid_dn <= rule.cheap_max
     return False

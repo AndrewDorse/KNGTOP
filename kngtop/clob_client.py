@@ -43,7 +43,7 @@ class KngtopClob:
         relayer_api_key: str,
         relayer_secret: str,
         relayer_passphrase: str,
-        market_buy_max_price: float = 0.33,
+        market_buy_max_price: float = 0.85,
     ) -> None:
         self._signature_type = int(signature_type)
         self._buy = Side.BUY

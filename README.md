@@ -11,8 +11,8 @@ Per window, rules are evaluated in list order. The first rule that fires gets th
 
 | Order | Key | Logic |
 |------|-----|--------|
-| 1 | `cheap_buy_up` | `mid_up < 0.20` and `binance_spot > window_open` -> buy `UP` |
-| 2 | `cheap_buy_down` | `mid_dn < 0.20` and `binance_spot < window_open` -> buy `DOWN` |
+| 1 | `cheap_buy_up` | `mid_up <= 0.30` and `binance_spot > window_open` -> buy `DOWN` |
+| 2 | `cheap_buy_down` | `mid_dn <= 0.30` and `binance_spot < window_open` -> buy `UP` |
 
 This logic is used for every configured asset and for both 5m and 15m contracts.
 
