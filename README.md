@@ -1,59 +1,29 @@
 # KNGTOP
 
-Dockerized Polymarket **BTC Up/Down** runner: **5m** and **15m** windows **at the same time**, **one** `$1` **FAK market buy** ( [`py_clob_client_v2`](https://github.com/Polymarket/py-clob-client) ) **per slug per window**.
+Dockerized Polymarket Up/Down runner for BTC, ETH, XRP, and SOL across 5m and 15m windows, with one `$1` FAK market buy per slug per window.
 
-- **Prices:** Polymarket **WebSocket** market channel (`wss://ws-subscriptions-clob.polymarket.com/ws/market`) for UP/DOWN mids.
-- **BTC:** **Binance WebSocket** `btcusdt@trade` for live spot; **Binance REST** kline **open** at the slug epoch for `start_btc` (same idea as `KNG4/prst1/clob_shim.fetch_binance_window_open_btc`).
+- Prices: Polymarket WebSocket market channel for UP/DOWN mids.
+- Binance: live spot from WebSocket and window-open start price from REST kline open at the slug epoch.
 
-## Preset strategies (BTC aligned with `kng_bot3` PALADIN KNGTOP presets)
+## Current strategy
 
-Per window, rules are evaluated **in list order**; the **first** that fires gets the single trade.
-
-### 5m (`RULES_5M`) — gap **$5** for every rule
+Per window, rules are evaluated in list order. The first rule that fires gets the single trade.
 
 | Order | Key | Logic |
 |------|-----|--------|
-| 1 | `u_up_cheap` | `btc > start + 5` and `mid_up ≤ 0.35` → buy **UP** |
-| 2 | `u_dn_cheap` | `btc < start − 5` and `mid_dn ≤ 0.35` → buy **DOWN** |
-| 3 | `o_fade_up_s` | `btc < start − 5` and `mid_up ≥ 0.68` → buy **DOWN** |
-| 4 | `o_fade_dn_s` | `btc > start + 5` and `mid_dn ≥ 0.68` → buy **UP** |
+| 1 | `cheap_buy_up` | `mid_up < 0.20` and `binance_spot > window_open` -> buy `UP` |
+| 2 | `cheap_buy_down` | `mid_dn < 0.20` and `binance_spot < window_open` -> buy `DOWN` |
 
-### 15m (`RULES_15M`) — gap **$10** for every rule
+This logic is used for every configured asset and for both 5m and 15m contracts.
 
-| Order | Key | Logic |
-|------|-----|--------|
-| 1 | `u_up_cheap` | `btc > start + 10` and `mid_up ≤ 0.38` → buy **UP** |
-| 2 | `u_dn_cheap` | `btc < start − 10` and `mid_dn ≤ 0.38` → buy **DOWN** |
-| 3 | `o_fade_up_s` | `btc < start − 10` and `mid_up ≥ 0.72` → buy **DOWN** |
-| 4 | `o_fade_dn_s` | `btc > start + 10` and `mid_dn ≥ 0.68` → buy **UP** |
-
-**Disclaimer:** Live Polymarket resolution may **not** match Binance `start_btc` / last trade. This is execution plumbing + the research thresholds, not guaranteed edge.
-
-## Run (Docker)
+## Run
 
 ```bash
 cp .env.example .env
-# edit .env — set keys; POLY_DRY_RUN=false only when ready
 docker compose --env-file .env up --build -d
 ```
 
-## Runtime Logging And Retry
-
-- Log stream is intentionally minimal for live ops:
-  - `INIT`
-  - `DEAL_START`
-  - `DEAL_SUCCESS` / `DEAL_FAIL`
-  - `ERROR`
-- Configure retry-on-error for `$1` market order with `KNGTOP_ORDER_RETRY_ON_ERROR`:
-  - `2` means first attempt + 2 retries = **3 total attempts**
-
-## Layout
-
-- **`Dockerfile` / `docker-compose.yml`**: modeled on **`KNG4`** (slim Python, `python -m` entry).
-- **`kngtop/ws_market.py`**: from **`KNG3`** `polymarket_ws.py` (market channel).
-- **`kngtop/clob_client.py`**: from **`KNG4`** `prst1/clob_shim.py` (v2 `create_and_post_market_order`).
-
-## Local (no Docker)
+## Local
 
 ```bash
 pip install -r requirements.txt
@@ -67,5 +37,3 @@ python -m kngtop
 pip install -r requirements.txt -r requirements-dev.txt
 pytest -q
 ```
-
-CI (GitHub Actions) runs **pytest** and **`docker build`** on each push/PR to `main`.

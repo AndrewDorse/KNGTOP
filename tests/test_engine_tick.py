@@ -47,7 +47,7 @@ def _contract() -> ActiveContract:
     )
 
 
-def test_tick_fires_under_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_fires_cheap_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
     monkeypatch.setenv("POLY_FUNDER", "0x" + "a" * 40)
     monkeypatch.setenv("POLY_DRY_RUN", "true")
@@ -63,13 +63,13 @@ def test_tick_fires_under_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     runner.start_px = 100_000.0
     runner.traded = False
-    poly = _FakePoly(mid_up=0.30, mid_dn=0.70)
+    poly = _FakePoly(mid_up=0.19, mid_dn=0.81)
     bn = _FakeBinanceCombo(100_020.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
     assert runner.traded
 
 
-def test_tick_no_fire_when_below_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_no_fire_when_price_not_cheap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
     monkeypatch.setenv("POLY_FUNDER", "0x" + "b" * 40)
     monkeypatch.setenv("POLY_DRY_RUN", "true")
@@ -83,7 +83,28 @@ def test_tick_no_fire_when_below_gap(monkeypatch: pytest.MonkeyPatch) -> None:
         rules=RULES_5M,
     )
     runner.start_px = 100_000.0
-    poly = _FakePoly(mid_up=0.30, mid_dn=0.70)
+    poly = _FakePoly(mid_up=0.20, mid_dn=0.80)
     bn = _FakeBinanceCombo(100_002.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
     assert not runner.traded
+
+
+def test_tick_fires_cheap_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "c" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "true")
+    cfg = KngtopConfig.from_env()
+
+    c = _contract()
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=c,
+        window_minutes=5,
+        rules=RULES_5M,
+    )
+    runner.start_px = 100_000.0
+    poly = _FakePoly(mid_up=0.81, mid_dn=0.19)
+    bn = _FakeBinanceCombo(99_980.0)
+    _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
+    assert runner.traded
