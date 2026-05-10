@@ -43,7 +43,7 @@ class KngtopClob:
         relayer_api_key: str,
         relayer_secret: str,
         relayer_passphrase: str,
-        market_buy_max_price: float = 0.4,
+        market_buy_max_price: float = 0.33,
     ) -> None:
         self._signature_type = int(signature_type)
         self._buy = Side.BUY
@@ -122,7 +122,7 @@ class KngtopClob:
         )
         tick_f = float(tick_raw or "0.01")
         hi = 1.0 - tick_f
-        # High per-share ceiling so FAK walks the book; clamp to valid (tick, 1-tick).
+        # Per-share ceiling for FAK; clamp to valid (tick, 1-tick).
         price_cap = min(max(self._market_buy_max_price, tick_f), hi)
         margs = MarketOrderArgs(
             token_id=token.token_id,

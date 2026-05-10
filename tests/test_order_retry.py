@@ -35,7 +35,15 @@ def _cfg(monkeypatch: pytest.MonkeyPatch, *, dry_run: bool = False, retries: int
 def test_execute_buy_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=False, retries=2)
     clob = _FakeClobRetry(fail_times=2)
-    _execute_buy(clob, cfg, _FakeToken(), "5m/u_up_cheap/UP")
+    _execute_buy(
+        clob,
+        cfg,
+        _FakeToken(),
+        "5m/cheap_buy_up/UP",
+        start_px=100_000.0,
+        spot_px=100_005.0,
+        pm_trigger_px=0.19,
+    )
     assert clob.calls == 3
 
 
@@ -43,5 +51,13 @@ def test_execute_buy_raises_after_exhausting_retries(monkeypatch: pytest.MonkeyP
     cfg = _cfg(monkeypatch, dry_run=False, retries=2)
     clob = _FakeClobRetry(fail_times=10)
     with pytest.raises(RuntimeError, match="simulated order error"):
-        _execute_buy(clob, cfg, _FakeToken(), "15m/u_dn_cheap/DOWN")
+        _execute_buy(
+            clob,
+            cfg,
+            _FakeToken(),
+            "15m/cheap_buy_down/DOWN",
+            start_px=100_000.0,
+            spot_px=99_995.0,
+            pm_trigger_px=0.18,
+        )
     assert clob.calls == 3

@@ -75,9 +75,21 @@ def _execute_buy(
     cfg: KngtopConfig,
     token,
     label: str,
+    *,
+    start_px: float,
+    spot_px: float,
+    pm_trigger_px: float,
 ) -> None:
     usdc = float(cfg.notional_usd)
-    _event("DEAL_START", label=label, notional=str(usdc), token=token.token_id[:16])
+    _event(
+        "DEAL_START",
+        label=label,
+        notional=str(usdc),
+        token=token.token_id[:16],
+        start_px=f"{start_px:.10f}",
+        spot_px=f"{spot_px:.10f}",
+        pm_trigger_px=f"{pm_trigger_px:.10f}",
+    )
     if cfg.dry_run:
         return
     assert clob is not None
@@ -125,7 +137,16 @@ def _tick_runner(
                 continue
             tok = _pick_token(runner.contract, rule.side)
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
-            _execute_buy(clob, cfg, tok, label)
+            trigger_px = mid_up if rule.side == "UP" else mid_dn
+            _execute_buy(
+                clob,
+                cfg,
+                tok,
+                label,
+                start_px=start,
+                spot_px=spot,
+                pm_trigger_px=trigger_px,
+            )
             runner.traded = True
             break
 
