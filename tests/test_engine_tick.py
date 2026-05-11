@@ -10,6 +10,7 @@ from kngtop.config import KngtopConfig
 from kngtop.engine import BALANCE_NOTIONAL_FRACTION, WindowRunner, _planned_window_notional_usd, _tick_runner
 from kngtop.gamma import ActiveContract, TokenMarket
 from kngtop.strategy_params import RULES_5M
+from kngtop.clob_client import _normalize_usdc_balance
 
 
 class _FakePoly:
@@ -137,3 +138,9 @@ def test_planned_window_notional_has_one_dollar_floor(monkeypatch: pytest.Monkey
     cfg = KngtopConfig.from_env()
     clob = _FakeClobBalance(5.0)
     assert _planned_window_notional_usd(cfg, clob) == 1.0
+
+
+def test_normalize_usdc_balance_converts_base_units() -> None:
+    assert _normalize_usdc_balance(28_812_657) == 28.812657
+    assert _normalize_usdc_balance("28812657") == 28.812657
+    assert _normalize_usdc_balance(50.25) == 50.25

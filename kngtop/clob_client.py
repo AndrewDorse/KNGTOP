@@ -42,6 +42,16 @@ def _maybe_float(raw: object) -> float | None:
         return None
 
 
+def _normalize_usdc_balance(raw: object) -> float | None:
+    val = _maybe_float(raw)
+    if val is None:
+        return None
+    # Polymarket collateral balances may arrive in 6-decimal base units.
+    if float(val).is_integer() and val >= 100_000:
+        return max(0.0, val / 1_000_000.0)
+    return max(0.0, val)
+
+
 class KngtopClob:
     def __init__(
         self,
@@ -111,16 +121,16 @@ class KngtopClob:
             "balanceAvailable",
         )
         for key in direct_keys:
-            val = _maybe_float(payload.get(key))
+            val = _normalize_usdc_balance(payload.get(key))
             if val is not None:
-                return max(0.0, val)
+                return val
 
         nested = payload.get("balanceAllowance")
         if isinstance(nested, dict):
             for key in direct_keys:
-                val = _maybe_float(nested.get(key))
+                val = _normalize_usdc_balance(nested.get(key))
                 if val is not None:
-                    return max(0.0, val)
+                    return val
         return None
 
     def _book_opts(self, token: TokenMarket) -> PartialCreateOrderOptions | None:
