@@ -20,6 +20,7 @@ from kngtop.rest_poll import run_ws_rest_fallback_loop
 from kngtop.ws_market import MarketWsFeed
 
 LOGGER = logging.getLogger("kngtop")
+BALANCE_NOTIONAL_FRACTION = 0.10
 
 
 @dataclass
@@ -30,6 +31,7 @@ class WindowRunner:
     window_minutes: int
     rules: tuple[MispriceRule, ...]
     start_px: float | None = None
+    trade_notional_usd: float | None = None
     traded: bool = False
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -45,6 +47,16 @@ class WindowRunner:
             window_minutes=self.window_minutes,
             timeout=cfg.request_timeout_sec,
         )
+
+
+def _planned_window_notional_usd(cfg: KngtopConfig, clob: KngtopClob | None) -> float:
+    floor_usd = max(1.0, float(cfg.notional_usd))
+    if clob is None:
+        return floor_usd
+    avail = clob.available_balance_usdc()
+    if avail is None:
+        return floor_usd
+    return max(floor_usd, avail * BALANCE_NOTIONAL_FRACTION)
 
 
 def _setup_logging(level: str) -> None:
@@ -73,6 +85,7 @@ def _pick_token(c: ActiveContract, side: str):
 def _execute_buy(
     clob: KngtopClob | None,
     cfg: KngtopConfig,
+    usdc: float,
     token,
     label: str,
     *,
@@ -80,11 +93,11 @@ def _execute_buy(
     spot_px: float,
     pm_trigger_px: float,
 ) -> None:
-    usdc = float(cfg.notional_usd)
+    usdc_f = float(usdc)
     _event(
         "DEAL_START",
         label=label,
-        notional=str(usdc),
+        notional=str(usdc_f),
         token=token.token_id[:16],
         start_px=f"{start_px:.10f}",
         spot_px=f"{spot_px:.10f}",
@@ -96,7 +109,7 @@ def _execute_buy(
     attempts = 1 + int(cfg.order_retry_on_error)
     for attempt in range(1, attempts + 1):
         try:
-            _ = clob.market_buy_usdc(token, usdc)
+            _ = clob.market_buy_usdc(token, usdc_f)
             return
         except Exception as exc:  # noqa: BLE001
             _event("DEAL_FAIL", label=label, attempt=attempt, error=str(exc))
@@ -116,7 +129,7 @@ def _tick_runner(
     if runner is None:
         return
     with runner._exec_lock:
-        if runner.traded or runner.start_px is None:
+        if runner.traded or runner.start_px is None or runner.trade_notional_usd is None:
             return
         now = datetime.now(timezone.utc)
         remaining = (runner.contract.end_time - now).total_seconds()
@@ -141,6 +154,7 @@ def _tick_runner(
             _execute_buy(
                 clob,
                 cfg,
+                runner.trade_notional_usd,
                 tok,
                 label,
                 start_px=start,
@@ -183,6 +197,7 @@ def _run_iteration(
                     contract=c,
                     window_minutes=wm,
                     rules=rules_for_asset(pair_key, wm),
+                    trade_notional_usd=_planned_window_notional_usd(cfg, clob),
                 )
 
     asset_ids: list[str] = []

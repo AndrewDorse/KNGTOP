@@ -38,6 +38,7 @@ def test_execute_buy_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> N
     _execute_buy(
         clob,
         cfg,
+        1.0,
         _FakeToken(),
         "5m/cheap_buy_up/UP",
         start_px=100_000.0,
@@ -54,6 +55,7 @@ def test_execute_buy_raises_after_exhausting_retries(monkeypatch: pytest.MonkeyP
         _execute_buy(
             clob,
             cfg,
+            1.0,
             _FakeToken(),
             "15m/cheap_buy_down/DOWN",
             start_px=100_000.0,

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from kngtop.config import KngtopConfig
-from kngtop.engine import WindowRunner, _tick_runner
+from kngtop.engine import BALANCE_NOTIONAL_FRACTION, WindowRunner, _planned_window_notional_usd, _tick_runner
 from kngtop.gamma import ActiveContract, TokenMarket
 from kngtop.strategy_params import RULES_5M
 
@@ -62,6 +62,7 @@ def test_tick_fires_cheap_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
         rules=RULES_5M,
     )
     runner.start_px = 100_000.0
+    runner.trade_notional_usd = 1.0
     runner.traded = False
     poly = _FakePoly(mid_up=0.15, mid_dn=0.85)
     bn = _FakeBinanceCombo(100_020.0)
@@ -83,6 +84,7 @@ def test_tick_no_fire_when_price_not_cheap(monkeypatch: pytest.MonkeyPatch) -> N
         rules=RULES_5M,
     )
     runner.start_px = 100_000.0
+    runner.trade_notional_usd = 1.0
     poly = _FakePoly(mid_up=0.16, mid_dn=0.80)
     bn = _FakeBinanceCombo(100_002.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
@@ -104,7 +106,34 @@ def test_tick_fires_cheap_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
         rules=RULES_5M,
     )
     runner.start_px = 100_000.0
+    runner.trade_notional_usd = 1.0
     poly = _FakePoly(mid_up=0.85, mid_dn=0.15)
     bn = _FakeBinanceCombo(99_980.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
     assert runner.traded
+
+
+class _FakeClobBalance:
+    def __init__(self, balance: float | None) -> None:
+        self._balance = balance
+
+    def available_balance_usdc(self) -> float | None:
+        return self._balance
+
+
+def test_planned_window_notional_uses_balance_fraction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "d" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "true")
+    cfg = KngtopConfig.from_env()
+    clob = _FakeClobBalance(50.0)
+    assert _planned_window_notional_usd(cfg, clob) == 50.0 * BALANCE_NOTIONAL_FRACTION
+
+
+def test_planned_window_notional_has_one_dollar_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "e" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "true")
+    cfg = KngtopConfig.from_env()
+    clob = _FakeClobBalance(5.0)
+    assert _planned_window_notional_usd(cfg, clob) == 1.0

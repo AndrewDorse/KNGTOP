@@ -33,6 +33,15 @@ def _norm_tick(raw: str | None) -> str | None:
     return s if s in {"0.1", "0.01", "0.001", "0.0001"} else None
 
 
+def _maybe_float(raw: object) -> float | None:
+    try:
+        if raw is None:
+            return None
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class KngtopClob:
     def __init__(
         self,
@@ -78,6 +87,41 @@ class KngtopClob:
             )
         except Exception as exc:  # noqa: BLE001
             LOGGER.debug("Collateral allowance sync: %s", exc)
+
+    def available_balance_usdc(self) -> float | None:
+        try:
+            payload = self.client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.COLLATERAL,
+                    signature_type=self._signature_type,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Balance fetch failed: %s", exc)
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        direct_keys = (
+            "available",
+            "available_balance",
+            "balance",
+            "availableBalance",
+            "balanceAvailable",
+        )
+        for key in direct_keys:
+            val = _maybe_float(payload.get(key))
+            if val is not None:
+                return max(0.0, val)
+
+        nested = payload.get("balanceAllowance")
+        if isinstance(nested, dict):
+            for key in direct_keys:
+                val = _maybe_float(nested.get(key))
+                if val is not None:
+                    return max(0.0, val)
+        return None
 
     def _book_opts(self, token: TokenMarket) -> PartialCreateOrderOptions | None:
         tid = token.token_id
