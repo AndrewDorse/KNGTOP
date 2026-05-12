@@ -36,3 +36,7 @@ def test_rules_are_uniform_across_assets() -> None:
     assert rules_for_asset("ETH", 15) == RULES_15M
     assert rules_for_asset("XRP", 5) == RULES_5M
     assert rules_for_asset("SOL", 15) == RULES_15M
+    assert rules_for_asset("DOGE", 5) == RULES_5M
+    assert rules_for_asset("BNB", 15) == RULES_15M
+    assert rules_for_asset("HYPE", 5) == RULES_5M
+    assert rules_for_asset("LINK", 15) == RULES_15M

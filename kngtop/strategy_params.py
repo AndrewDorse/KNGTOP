@@ -47,8 +47,8 @@ SOL_RULES_15M: tuple[MispriceRule, ...] = _CHEAP_RULES
 def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
     """Return the cheap-side rules for a Gamma asset key and timeframe."""
     p = (pair or "").strip().upper()
-    if p not in {"BTC", "ETH", "XRP", "SOL"}:
-        raise ValueError(f"unsupported asset pair {pair!r} (expected BTC, ETH, XRP, or SOL)")
+    if p not in {"BTC", "ETH", "XRP", "SOL", "DOGE", "BNB", "HYPE", "LINK"}:
+        raise ValueError(f"unsupported asset pair {pair!r} (expected BTC, ETH, XRP, SOL, DOGE, BNB, HYPE, or LINK)")
     return RULES_15M if int(window_minutes) >= 15 else RULES_5M
 
 
