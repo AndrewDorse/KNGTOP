@@ -24,6 +24,7 @@ BALANCE_NOTIONAL_FRACTION = 0.10
 ALT_BALANCE_NOTIONAL_FRACTION = 0.05
 WINDOWS_TO_TRADE: tuple[int, ...] = (5, 15, 60, 240)
 ALT_BALANCE_ASSETS = frozenset({"DOGE", "BNB", "HYPE", "LINK"})
+MIN_WINDOW_PROGRESS_FRACTION = 0.20
 
 
 @dataclass
@@ -94,6 +95,15 @@ def _pick_token(c: ActiveContract, side: str):
     return c.up if side.upper() == "UP" else c.down
 
 
+def _window_elapsed_ready(runner: WindowRunner, now: datetime) -> bool:
+    start_ts = window_start_ts_from_slug(runner.contract.slug)
+    if start_ts is None:
+        return False
+    elapsed = now.timestamp() - float(start_ts)
+    min_elapsed = float(runner.window_minutes) * 60.0 * MIN_WINDOW_PROGRESS_FRACTION
+    return elapsed >= min_elapsed
+
+
 def _execute_buy(
     clob: KngtopClob | None,
     cfg: KngtopConfig,
@@ -144,6 +154,8 @@ def _tick_runner(
         if runner.traded or runner.start_px is None or runner.trade_notional_usd is None:
             return
         now = datetime.now(timezone.utc)
+        if not _window_elapsed_ready(runner, now):
+            return
         remaining = (runner.contract.end_time - now).total_seconds()
         if remaining < cfg.order_cutoff_remaining_sec:
             return
