@@ -18,7 +18,11 @@ def _interval_for_window(window_minutes: int) -> str:
         return "5m"
     if wm <= 15:
         return "15m"
-    return "15m"
+    if wm <= 60:
+        return "1h"
+    if wm <= 240:
+        return "4h"
+    return "4h"
 
 
 def fetch_binance_window_open_px(

@@ -1,4 +1,4 @@
-"""Gamma discovery for crypto Up/Down (5m / 15m) slugs ``{asset}-updown-{tf}``. From KNG4 ``prst1/gamma_market.py``."""
+"""Gamma discovery for crypto Up/Down slugs ``{asset}-updown-{tf}``. From KNG4 ``prst1/gamma_market.py``."""
 
 from __future__ import annotations
 
@@ -78,7 +78,15 @@ def discover_active_updown_window(
     window_sec = int(window_minutes) * 60
     start = (now_ts // window_sec) * window_sec
     sym = market_symbol.lower()
-    slug = f"{sym}-updown-{window_minutes}m-{start}"
+    if int(window_minutes) <= 15:
+        tf = f"{int(window_minutes)}m"
+    elif int(window_minutes) == 60:
+        tf = "1h"
+    elif int(window_minutes) == 240:
+        tf = "4h"
+    else:
+        tf = f"{int(window_minutes)}m"
+    slug = f"{sym}-updown-{tf}-{start}"
     url = f"{GAMMA_URL}/markets"
     try:
         r = requests.get(url, params={"slug": slug}, timeout=timeout)

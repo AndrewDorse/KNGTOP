@@ -7,7 +7,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from kngtop.config import KngtopConfig
-from kngtop.engine import BALANCE_NOTIONAL_FRACTION, WindowRunner, _planned_window_notional_usd, _tick_runner
+from kngtop.engine import (
+    ALT_BALANCE_NOTIONAL_FRACTION,
+    BALANCE_NOTIONAL_FRACTION,
+    WindowRunner,
+    _planned_window_notional_usd,
+    _tick_runner,
+)
 from kngtop.gamma import ActiveContract, TokenMarket
 from kngtop.strategy_params import RULES_5M
 from kngtop.clob_client import _normalize_usdc_balance
@@ -128,7 +134,7 @@ def test_planned_window_notional_uses_balance_fraction(monkeypatch: pytest.Monke
     monkeypatch.setenv("POLY_DRY_RUN", "true")
     cfg = KngtopConfig.from_env()
     clob = _FakeClobBalance(50.0)
-    assert _planned_window_notional_usd(cfg, clob) == 50.0 * BALANCE_NOTIONAL_FRACTION
+    assert _planned_window_notional_usd(cfg, clob, pair_key="BTC", window_minutes=5) == 50.0 * BALANCE_NOTIONAL_FRACTION
 
 
 def test_planned_window_notional_has_one_dollar_floor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -137,7 +143,26 @@ def test_planned_window_notional_has_one_dollar_floor(monkeypatch: pytest.Monkey
     monkeypatch.setenv("POLY_DRY_RUN", "true")
     cfg = KngtopConfig.from_env()
     clob = _FakeClobBalance(5.0)
-    assert _planned_window_notional_usd(cfg, clob) == 1.0
+    assert _planned_window_notional_usd(cfg, clob, pair_key="BTC", window_minutes=5) == 1.0
+
+
+def test_planned_window_notional_uses_five_percent_for_new_assets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "f" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "true")
+    cfg = KngtopConfig.from_env()
+    clob = _FakeClobBalance(50.0)
+    assert _planned_window_notional_usd(cfg, clob, pair_key="DOGE", window_minutes=5) == 50.0 * ALT_BALANCE_NOTIONAL_FRACTION
+
+
+def test_planned_window_notional_uses_one_dollar_for_hourly_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "a" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "true")
+    cfg = KngtopConfig.from_env()
+    clob = _FakeClobBalance(500.0)
+    assert _planned_window_notional_usd(cfg, clob, pair_key="BTC", window_minutes=60) == 1.0
+    assert _planned_window_notional_usd(cfg, clob, pair_key="DOGE", window_minutes=240) == 1.0
 
 
 def test_normalize_usdc_balance_converts_base_units() -> None:

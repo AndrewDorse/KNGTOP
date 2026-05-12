@@ -20,7 +20,7 @@ def test_dry_run_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.dry_run is True
 
 
-def test_pairs_default_includes_four_assets(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pairs_default_includes_all_assets(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
     monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
     monkeypatch.delenv("KNGTOP_PAIRS", raising=False)
@@ -30,13 +30,30 @@ def test_pairs_default_includes_four_assets(monkeypatch: pytest.MonkeyPatch) -> 
         ("ETH", "ETHUSDT"),
         ("XRP", "XRPUSDT"),
         ("SOL", "SOLUSDT"),
+        ("DOGE", "DOGEUSDT"),
+        ("BNB", "BNBUSDT"),
+        ("HYPE", "HYPEUSDT"),
+        ("LINK", "LINKUSDT"),
+    )
+
+
+def test_pairs_accepts_new_assets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
+    monkeypatch.setenv("KNGTOP_PAIRS", "DOGE:DOGEUSDT,BNB:BNBUSDT,HYPE:HYPEUSDT,LINK:LINKUSDT")
+    cfg = KngtopConfig.from_env()
+    assert tuple(cfg.trading_pairs) == (
+        ("DOGE", "DOGEUSDT"),
+        ("BNB", "BNBUSDT"),
+        ("HYPE", "HYPEUSDT"),
+        ("LINK", "LINKUSDT"),
     )
 
 
 def test_pairs_rejects_unknown_asset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
     monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
-    monkeypatch.setenv("KNGTOP_PAIRS", "DOGE:DOGEUSDT")
+    monkeypatch.setenv("KNGTOP_PAIRS", "ADA:ADAUSDT")
     with pytest.raises(RuntimeError, match="Unsupported asset"):
         KngtopConfig.from_env()
 

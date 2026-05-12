@@ -21,6 +21,9 @@ from kngtop.ws_market import MarketWsFeed
 
 LOGGER = logging.getLogger("kngtop")
 BALANCE_NOTIONAL_FRACTION = 0.10
+ALT_BALANCE_NOTIONAL_FRACTION = 0.05
+WINDOWS_TO_TRADE: tuple[int, ...] = (5, 15, 60, 240)
+ALT_BALANCE_ASSETS = frozenset({"DOGE", "BNB", "HYPE", "LINK"})
 
 
 @dataclass
@@ -49,14 +52,23 @@ class WindowRunner:
         )
 
 
-def _planned_window_notional_usd(cfg: KngtopConfig, clob: KngtopClob | None) -> float:
+def _planned_window_notional_usd(
+    cfg: KngtopConfig,
+    clob: KngtopClob | None,
+    *,
+    pair_key: str,
+    window_minutes: int,
+) -> float:
     floor_usd = max(1.0, float(cfg.notional_usd))
+    if int(window_minutes) >= 60:
+        return floor_usd
     if clob is None:
         return floor_usd
     avail = clob.available_balance_usdc()
     if avail is None:
         return floor_usd
-    return max(floor_usd, avail * BALANCE_NOTIONAL_FRACTION)
+    frac = ALT_BALANCE_NOTIONAL_FRACTION if pair_key.upper() in ALT_BALANCE_ASSETS else BALANCE_NOTIONAL_FRACTION
+    return max(floor_usd, avail * frac)
 
 
 def _setup_logging(level: str) -> None:
@@ -183,7 +195,7 @@ def _run_iteration(
     for pair_key in sym_for_pair:
         gamma_sym = pair_key.lower()
         bs_sym = sym_for_pair[pair_key]
-        for wm in (5, 15):
+        for wm in WINDOWS_TO_TRADE:
             c = discover_active_btc_window(market_symbol=gamma_sym, window_minutes=wm, timeout=timeout)
             rk = (pair_key, wm)
             if c is None:
@@ -197,7 +209,12 @@ def _run_iteration(
                     contract=c,
                     window_minutes=wm,
                     rules=rules_for_asset(pair_key, wm),
-                    trade_notional_usd=_planned_window_notional_usd(cfg, clob),
+                    trade_notional_usd=_planned_window_notional_usd(
+                        cfg,
+                        clob,
+                        pair_key=pair_key,
+                        window_minutes=wm,
+                    ),
                 )
 
     asset_ids: list[str] = []
@@ -211,7 +228,7 @@ def _run_iteration(
             rv.refresh_start_px(cfg)
 
     for pair_key in sym_for_pair:
-        for wm in (5, 15):
+        for wm in WINDOWS_TO_TRADE:
             try:
                 _tick_runner(
                     runners.get((pair_key, wm)),

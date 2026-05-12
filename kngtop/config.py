@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-_ALLOWED_PAIR_KEYS = frozenset({"BTC", "ETH", "XRP", "SOL"})
+_ALLOWED_PAIR_KEYS = frozenset({"BTC", "ETH", "XRP", "SOL", "DOGE", "BNB", "HYPE", "LINK"})
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -19,7 +19,7 @@ def parse_trading_pairs(raw: str | None) -> tuple[tuple[str, str], ...]:
     """``GAMMA_KEY:BINANCE_SYMBOL`` comma list, e.g. ``BTC:BTCUSDT,ETH:ETHUSDT``."""
     s = (raw or "").strip()
     if not s:
-        s = "BTC:BTCUSDT,ETH:ETHUSDT,XRP:XRPUSDT,SOL:SOLUSDT"
+        s = "BTC:BTCUSDT,ETH:ETHUSDT,XRP:XRPUSDT,SOL:SOLUSDT,DOGE:DOGEUSDT,BNB:BNBUSDT,HYPE:HYPEUSDT,LINK:LINKUSDT"
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
     for part in s.split(","):
