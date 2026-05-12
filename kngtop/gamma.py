@@ -67,38 +67,18 @@ class ActiveContract:
     down: TokenMarket
 
 
-def discover_active_updown_window(
-    *,
-    market_symbol: str,
-    window_minutes: int,
-    timeout: float,
-) -> ActiveContract | None:
-    now = datetime.now(timezone.utc)
-    now_ts = int(now.timestamp())
-    window_sec = int(window_minutes) * 60
-    start = (now_ts // window_sec) * window_sec
-    sym = market_symbol.lower()
-    if int(window_minutes) <= 15:
-        tf = f"{int(window_minutes)}m"
-    elif int(window_minutes) == 60:
-        tf = "1h"
-    elif int(window_minutes) == 240:
-        tf = "4h"
-    else:
-        tf = f"{int(window_minutes)}m"
-    slug = f"{sym}-updown-{tf}-{start}"
-    url = f"{GAMMA_URL}/markets"
-    try:
-        r = requests.get(url, params={"slug": slug}, timeout=timeout)
-        r.raise_for_status()
-        markets = r.json()
-    except requests.RequestException as exc:
-        LOGGER.debug("Gamma request failed: %s", exc)
-        return None
-    if not markets:
-        LOGGER.debug("No market for slug %s", slug)
-        return None
-    m0 = markets[0]
+def _timeframe_aliases(window_minutes: int) -> tuple[str, ...]:
+    wm = int(window_minutes)
+    if wm <= 15:
+        return (f"{wm}m",)
+    if wm == 60:
+        return ("1h", "60m")
+    if wm == 240:
+        return ("4h", "240m")
+    return (f"{wm}m",)
+
+
+def _active_contract_from_market(m0: dict[str, Any], fallback_slug: str, *, now: datetime) -> ActiveContract | None:
     if not m0.get("active") or m0.get("closed") or m0.get("archived"):
         return None
     end_time = _parse_dt(m0.get("endDate") or m0.get("endDateIso"))
@@ -128,12 +108,42 @@ def discover_active_updown_window(
     if up is None or down is None:
         return None
     return ActiveContract(
-        slug=str(m0.get("slug") or slug),
+        slug=str(m0.get("slug") or fallback_slug),
         question=str(m0.get("question") or ""),
         end_time=end_time,
         up=up,
         down=down,
     )
+
+
+def discover_active_updown_window(
+    *,
+    market_symbol: str,
+    window_minutes: int,
+    timeout: float,
+) -> ActiveContract | None:
+    now = datetime.now(timezone.utc)
+    now_ts = int(now.timestamp())
+    window_sec = int(window_minutes) * 60
+    start = (now_ts // window_sec) * window_sec
+    sym = market_symbol.lower()
+    url = f"{GAMMA_URL}/markets"
+    for tf in _timeframe_aliases(window_minutes):
+        slug = f"{sym}-updown-{tf}-{start}"
+        try:
+            r = requests.get(url, params={"slug": slug}, timeout=timeout)
+            r.raise_for_status()
+            markets = r.json()
+        except requests.RequestException as exc:
+            LOGGER.debug("Gamma request failed for slug %s: %s", slug, exc)
+            continue
+        if not markets:
+            LOGGER.debug("No market for slug %s", slug)
+            continue
+        contract = _active_contract_from_market(markets[0], slug, now=now)
+        if contract is not None:
+            return contract
+    return None
 
 
 # Back-compat alias
