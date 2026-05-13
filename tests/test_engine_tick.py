@@ -18,7 +18,7 @@ from kngtop.engine import (
     _window_elapsed_ready,
 )
 from kngtop.gamma import ActiveContract, TokenMarket
-from kngtop.strategy_params import RULES_5M
+from kngtop.strategy_params import RULES_5M, SECONDARY_NOTIONAL_FRACTION
 from kngtop.clob_client import _normalize_usdc_balance
 
 
@@ -74,11 +74,10 @@ def test_tick_fires_cheap_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     runner.start_px = 100_000.0
     runner.trade_notional_usd = 1.0
-    runner.traded = False
     poly = _FakePoly(mid_up=0.15, mid_dn=0.85)
     bn = _FakeBinanceCombo(100_020.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
-    assert runner.traded
+    assert "cheap_buy_up" in runner.traded_rule_keys
 
 
 def test_tick_no_fire_when_price_not_cheap(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -100,7 +99,7 @@ def test_tick_no_fire_when_price_not_cheap(monkeypatch: pytest.MonkeyPatch) -> N
     poly = _FakePoly(mid_up=0.16, mid_dn=0.80)
     bn = _FakeBinanceCombo(100_002.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
-    assert not runner.traded
+    assert not runner.traded_rule_keys
 
 
 def test_tick_fires_cheap_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -123,7 +122,7 @@ def test_tick_fires_cheap_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     poly = _FakePoly(mid_up=0.85, mid_dn=0.15)
     bn = _FakeBinanceCombo(99_980.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
-    assert runner.traded
+    assert "cheap_buy_down" in runner.traded_rule_keys
 
 
 def test_tick_fires_when_only_needed_pm_side_is_present(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -146,7 +145,7 @@ def test_tick_fires_when_only_needed_pm_side_is_present(monkeypatch: pytest.Monk
     poly = _FakePoly(mid_up=0.15, mid_dn=None)
     bn = _FakeBinanceCombo(100_020.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
-    assert runner.traded
+    assert "cheap_buy_up" in runner.traded_rule_keys
 
 
 class _FakeClobBalance:
@@ -246,7 +245,7 @@ def test_tick_no_fire_before_min_window_progress(monkeypatch: pytest.MonkeyPatch
     poly = _FakePoly(mid_up=0.15, mid_dn=0.85)
     bn = _FakeBinanceCombo(100_020.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
-    assert not runner.traded
+    assert not runner.traded_rule_keys
 
 
 def test_tick_logs_signal_blocked_before_min_window_progress(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -269,8 +268,85 @@ def test_tick_logs_signal_blocked_before_min_window_progress(monkeypatch: pytest
     bn = _FakeBinanceCombo(100_020.0)
     with patch("kngtop.engine._event") as event_mock:
         _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
-    assert not runner.traded
+    assert not runner.traded_rule_keys
     assert any(
         call.args and call.args[0] == "SIGNAL_BLOCKED" and call.kwargs.get("reason") == "min_window_progress"
         for call in event_mock.call_args_list
     )
+
+
+def test_tick_fires_secondary_revert_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "9" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "true")
+    cfg = KngtopConfig.from_env()
+
+    start = int(datetime.now(timezone.utc).timestamp()) - 180
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=_contract(slug=f"btc-updown-5m-{start}"),
+        window_minutes=5,
+        rules=RULES_5M,
+    )
+    runner.start_px = 100_000.0
+    runner.trade_notional_usd = 5.0
+    runner.spot_history.extend(
+        [
+            (float(start + 70), 100_040.0),
+            (float(start + 120), 100_020.0),
+        ]
+    )
+    poly = _FakePoly(mid_up=0.12, mid_dn=0.85)
+    bn = _FakeBinanceCombo(100_010.0)
+    _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
+    assert "revert_buy_up" in runner.traded_rule_keys
+
+
+def test_secondary_strategy_uses_two_percent_balance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "8" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "false")
+    cfg = KngtopConfig.from_env()
+
+    start = int(datetime.now(timezone.utc).timestamp()) - 180
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=_contract(slug=f"btc-updown-5m-{start}"),
+        window_minutes=5,
+        rules=RULES_5M,
+    )
+    runner.start_px = 100_000.0
+    runner.trade_notional_usd = 5.0
+    runner.spot_history.extend([(float(start + 70), 100_040.0)])
+    poly = _FakePoly(mid_up=0.12, mid_dn=0.85)
+    bn = _FakeBinanceCombo(100_010.0)
+    clob = _FakeClobBalance(50.0)
+    with patch("kngtop.engine._execute_buy") as exec_mock:
+        _tick_runner(runner, poly=poly, binance=bn, clob=clob, cfg=cfg)
+    assert exec_mock.call_args is not None
+    assert exec_mock.call_args.args[2] == 50.0 * SECONDARY_NOTIONAL_FRACTION
+
+
+def test_primary_and_secondary_do_not_block_each_other(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "7" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "true")
+    cfg = KngtopConfig.from_env()
+
+    start = int(datetime.now(timezone.utc).timestamp()) - 180
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=_contract(slug=f"btc-updown-5m-{start}"),
+        window_minutes=5,
+        rules=RULES_5M,
+    )
+    runner.start_px = 100_000.0
+    runner.trade_notional_usd = 5.0
+    runner.spot_history.extend([(float(start + 70), 100_040.0)])
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.12, mid_dn=0.85), binance=_FakeBinanceCombo(100_010.0), clob=None, cfg=cfg)
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.15, mid_dn=0.85), binance=_FakeBinanceCombo(100_020.0), clob=None, cfg=cfg)
+    assert "revert_buy_up" in runner.traded_rule_keys
+    assert "cheap_buy_up" in runner.traded_rule_keys

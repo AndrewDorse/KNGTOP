@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from kngtop.strategy_params import (
     CHEAP_PRICE_MAX,
+    ETH_RULES_15M,
     RULES_15M,
     RULES_5M,
+    SOL_RULES_15M,
+    XRP_RULES_5M,
     MispriceRule,
     rule_fires,
     rules_for_asset,
@@ -27,15 +30,18 @@ def test_rule_fires_cheap_down() -> None:
 
 
 def test_rules_count_per_window() -> None:
-    assert len(RULES_5M) == 2
-    assert len(RULES_15M) == 2
+    assert len(RULES_5M) == 4
+    assert len(RULES_15M) == 4
+    assert len(ETH_RULES_15M) == 4
+    assert len(SOL_RULES_15M) == 4
+    assert len(XRP_RULES_5M) == 2
 
 
-def test_rules_are_uniform_across_assets() -> None:
+def test_rules_are_selected_per_asset() -> None:
     assert rules_for_asset("BTC", 5) == RULES_5M
-    assert rules_for_asset("ETH", 15) == RULES_15M
-    assert rules_for_asset("XRP", 5) == RULES_5M
-    assert rules_for_asset("SOL", 15) == RULES_15M
+    assert rules_for_asset("ETH", 15) == ETH_RULES_15M
+    assert rules_for_asset("XRP", 5) == XRP_RULES_5M
+    assert rules_for_asset("SOL", 15) == SOL_RULES_15M
     assert rules_for_asset("DOGE", 5) == RULES_5M
     assert rules_for_asset("BNB", 15) == RULES_15M
     assert rules_for_asset("HYPE", 5) == RULES_5M

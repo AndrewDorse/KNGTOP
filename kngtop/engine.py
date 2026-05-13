@@ -6,6 +6,7 @@ import logging
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -25,10 +26,12 @@ ALT_BALANCE_NOTIONAL_FRACTION = 0.05
 WINDOWS_TO_TRADE: tuple[int, ...] = (5, 15)
 ALT_BALANCE_ASSETS = frozenset({"DOGE", "BNB", "HYPE", "LINK"})
 MIN_WINDOW_PROGRESS_FRACTION = 0.20
+SECONDARY_NOTIONAL_FRACTION = 0.02
 ENTRY_MARKET_FRACTION = 0.50
 ENTRY_LIMIT_FRACTION = 0.50
 ENTRY_LIMIT_PRICE = 0.20
 BOOT_WARMUP_DELAY_SEC = 60.0
+MAX_SPOT_HISTORY_SEC = 180
 
 
 @dataclass
@@ -40,7 +43,8 @@ class WindowRunner:
     rules: tuple[MispriceRule, ...]
     start_px: float | None = None
     trade_notional_usd: float | None = None
-    traded: bool = False
+    traded_rule_keys: set[str] = field(default_factory=set)
+    spot_history: deque[tuple[float, float]] = field(default_factory=deque)
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def refresh_start_px(self, cfg: KngtopConfig) -> None:
@@ -74,6 +78,26 @@ def _planned_window_notional_usd(
         return floor_usd
     frac = ALT_BALANCE_NOTIONAL_FRACTION if pair_key.upper() in ALT_BALANCE_ASSETS else BALANCE_NOTIONAL_FRACTION
     return max(floor_usd, avail * frac)
+
+
+def _rule_notional_usd(
+    cfg: KngtopConfig,
+    clob: KngtopClob | None,
+    *,
+    pair_key: str,
+    window_minutes: int,
+    rule: MispriceRule,
+    fallback_usd: float | None,
+) -> float:
+    if rule.notional_fraction is None:
+        return float(fallback_usd or max(1.0, float(cfg.notional_usd)))
+    floor_usd = max(1.0, float(cfg.notional_usd))
+    if clob is None:
+        return floor_usd
+    avail = clob.available_balance_usdc()
+    if avail is None:
+        return floor_usd
+    return max(floor_usd, avail * float(rule.notional_fraction))
 
 
 def _setup_logging(level: str) -> None:
@@ -125,6 +149,44 @@ def _signal_ready(
             return False, None
         return spot < start_px and mid_dn <= rule.cheap_max, mid_dn
     return False, None
+
+
+def _append_spot_history(runner: WindowRunner, *, now_ts: float, spot: float) -> None:
+    runner.spot_history.append((now_ts, spot))
+    cutoff = now_ts - MAX_SPOT_HISTORY_SEC
+    while runner.spot_history and runner.spot_history[0][0] < cutoff:
+        runner.spot_history.popleft()
+
+
+def _revert_signal_ready(
+    rule: MispriceRule,
+    *,
+    now_ts: float,
+    spot: float,
+    start_px: float,
+    trigger_px: float | None,
+    history: deque[tuple[float, float]],
+) -> bool:
+    if trigger_px is None or trigger_px > rule.cheap_max:
+        return False
+    if start_px <= 0:
+        return False
+    diff_bps = (spot - start_px) / start_px * 10_000.0
+    if rule.kind == "revert_up":
+        if diff_bps < 0.0 or diff_bps > rule.close_bps:
+            return False
+        return any(
+            ts < now_ts and now_ts - ts <= rule.lookback_sec and (hist_spot - start_px) / start_px * 10_000.0 >= rule.lead_bps
+            for ts, hist_spot in history
+        )
+    if rule.kind == "revert_dn":
+        if diff_bps > 0.0 or -diff_bps > rule.close_bps:
+            return False
+        return any(
+            ts < now_ts and now_ts - ts <= rule.lookback_sec and (hist_spot - start_px) / start_px * 10_000.0 <= -rule.lead_bps
+            for ts, hist_spot in history
+        )
+    return False
 
 
 def _execute_buy(
@@ -189,12 +251,13 @@ def _tick_runner(
     if runner is None:
         return
     with runner._exec_lock:
-        if runner.traded or runner.start_px is None or runner.trade_notional_usd is None:
+        if runner.start_px is None or runner.trade_notional_usd is None:
             return
         now = datetime.now(timezone.utc)
         spot = binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec)
         if spot is None:
             return
+        _append_spot_history(runner, now_ts=now.timestamp(), spot=spot)
         up_id = runner.contract.up.token_id
         dn_id = runner.contract.down.token_id
         mid_up = poly.mid_for(up_id, max_age_sec=cfg.poly_mid_max_age_sec)
@@ -202,6 +265,8 @@ def _tick_runner(
         start = float(runner.start_px)
         elapsed_ready = _window_elapsed_ready(runner, now)
         for rule in runner.rules:
+            if rule.key in runner.traded_rule_keys:
+                continue
             ready, trigger_px = _signal_ready(
                 rule,
                 spot=spot,
@@ -209,6 +274,17 @@ def _tick_runner(
                 mid_up=mid_up,
                 mid_dn=mid_dn,
             )
+            if not ready and rule.kind in {"revert_up", "revert_dn"}:
+                side_px = mid_up if rule.kind == "revert_up" else mid_dn
+                ready = _revert_signal_ready(
+                    rule,
+                    now_ts=now.timestamp(),
+                    spot=spot,
+                    start_px=start,
+                    trigger_px=side_px,
+                    history=runner.spot_history,
+                )
+                trigger_px = side_px
             if not ready:
                 continue
             if not elapsed_ready:
@@ -226,15 +302,21 @@ def _tick_runner(
             _execute_buy(
                 clob,
                 cfg,
-                runner.trade_notional_usd,
+                _rule_notional_usd(
+                    cfg,
+                    clob,
+                    pair_key=runner.pair_key,
+                    window_minutes=runner.window_minutes,
+                    rule=rule,
+                    fallback_usd=runner.trade_notional_usd,
+                ),
                 tok,
                 label,
                 start_px=start,
                 spot_px=spot,
                 pm_trigger_px=float(trigger_px),
             )
-            runner.traded = True
-            break
+            runner.traded_rule_keys.add(rule.key)
 
 
 def _pairs_summary(cfg: KngtopConfig) -> str:
