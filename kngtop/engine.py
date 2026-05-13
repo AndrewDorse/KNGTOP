@@ -32,6 +32,8 @@ ENTRY_LIMIT_FRACTION = 0.50
 ENTRY_LIMIT_PRICE = 0.20
 BOOT_WARMUP_DELAY_SEC = 60.0
 MAX_SPOT_HISTORY_SEC = 180
+MIN_MARKET_BUY_USDC = 1.0
+MIN_LIMIT_SHARES = 5.0
 
 
 @dataclass
@@ -203,6 +205,9 @@ def _execute_buy(
     usdc_f = float(usdc)
     market_usdc = usdc_f * ENTRY_MARKET_FRACTION
     limit_usdc = usdc_f * ENTRY_LIMIT_FRACTION
+    if market_usdc < MIN_MARKET_BUY_USDC or (limit_usdc / ENTRY_LIMIT_PRICE) < MIN_LIMIT_SHARES:
+        market_usdc = usdc_f
+        limit_usdc = 0.0
     _event(
         "DEAL_START",
         label=label,
@@ -219,11 +224,12 @@ def _execute_buy(
         return
     assert clob is not None
     limit_error: Exception | None = None
-    try:
-        _ = clob.limit_buy(token, price=ENTRY_LIMIT_PRICE, usdc=limit_usdc)
-    except Exception as exc:  # noqa: BLE001
-        limit_error = exc
-        _event("DEAL_FAIL", label=label, attempt=1, leg="limit", error=str(exc))
+    if limit_usdc > 0.0:
+        try:
+            _ = clob.limit_buy(token, price=ENTRY_LIMIT_PRICE, usdc=limit_usdc)
+        except Exception as exc:  # noqa: BLE001
+            limit_error = exc
+            _event("DEAL_FAIL", label=label, attempt=1, leg="limit", error=str(exc))
     attempts = 1 + int(cfg.order_retry_on_error)
     for attempt in range(1, attempts + 1):
         try:

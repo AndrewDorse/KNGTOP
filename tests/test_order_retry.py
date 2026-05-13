@@ -56,8 +56,8 @@ def test_execute_buy_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> N
         pm_trigger_px=0.19,
     )
     assert clob.market_calls == 3
-    assert clob.limit_calls == 1
-    assert clob.limit_args == (0.20, 0.5)
+    assert clob.limit_calls == 0
+    assert clob.limit_args is None
 
 
 def test_execute_buy_raises_after_exhausting_retries(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -75,7 +75,7 @@ def test_execute_buy_raises_after_exhausting_retries(monkeypatch: pytest.MonkeyP
             pm_trigger_px=0.18,
         )
     assert clob.market_calls == 3
-    assert clob.limit_calls == 1
+    assert clob.limit_calls == 0
 
 
 def test_execute_buy_sends_limit_once_even_when_market_retries(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -92,7 +92,7 @@ def test_execute_buy_sends_limit_once_even_when_market_retries(monkeypatch: pyte
         pm_trigger_px=0.19,
     )
     assert clob.market_calls == 2
-    assert clob.limit_calls == 1
+    assert clob.limit_calls == 0
 
 
 def test_execute_buy_raises_limit_error_after_market_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -102,7 +102,7 @@ def test_execute_buy_raises_limit_error_after_market_succeeds(monkeypatch: pytes
         _execute_buy(
             clob,
             cfg,
-            1.0,
+            2.0,
             _FakeToken(),
             "15m/cheap_buy_down/DOWN",
             start_px=100_000.0,
@@ -111,3 +111,21 @@ def test_execute_buy_raises_limit_error_after_market_succeeds(monkeypatch: pytes
         )
     assert clob.market_calls == 1
     assert clob.limit_calls == 1
+
+
+def test_execute_buy_splits_when_total_notional_is_large_enough(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False, retries=0)
+    clob = _FakeClobRetry(fail_times=0)
+    _execute_buy(
+        clob,
+        cfg,
+        2.0,
+        _FakeToken(),
+        "5m/cheap_buy_up/UP",
+        start_px=100_000.0,
+        spot_px=100_005.0,
+        pm_trigger_px=0.19,
+    )
+    assert clob.market_calls == 1
+    assert clob.limit_calls == 1
+    assert clob.limit_args == (0.20, 1.0)
