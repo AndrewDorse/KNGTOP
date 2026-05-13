@@ -13,8 +13,9 @@ class _FakeToken:
 
 
 class _FakeClobRetry:
-    def __init__(self, fail_times: int) -> None:
+    def __init__(self, fail_times: int, *, fail_limit: bool = False) -> None:
         self.fail_times = fail_times
+        self.fail_limit = fail_limit
         self.market_calls = 0
         self.limit_calls = 0
         self.limit_args: tuple[float, float] | None = None
@@ -28,6 +29,8 @@ class _FakeClobRetry:
     def limit_buy(self, token: _FakeToken, *, price: float, usdc: float):  # noqa: ANN201
         self.limit_calls += 1
         self.limit_args = (price, usdc)
+        if self.fail_limit:
+            raise RuntimeError("simulated limit error")
         return {"ok": True, "price": price, "usdc": usdc, "token": token.token_id}
 
 
@@ -53,7 +56,7 @@ def test_execute_buy_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> N
         pm_trigger_px=0.19,
     )
     assert clob.market_calls == 3
-    assert clob.limit_calls == 3
+    assert clob.limit_calls == 1
     assert clob.limit_args == (0.20, 0.5)
 
 
@@ -72,4 +75,39 @@ def test_execute_buy_raises_after_exhausting_retries(monkeypatch: pytest.MonkeyP
             pm_trigger_px=0.18,
         )
     assert clob.market_calls == 3
-    assert clob.limit_calls == 3
+    assert clob.limit_calls == 1
+
+
+def test_execute_buy_sends_limit_once_even_when_market_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False, retries=2)
+    clob = _FakeClobRetry(fail_times=1)
+    _execute_buy(
+        clob,
+        cfg,
+        1.0,
+        _FakeToken(),
+        "5m/cheap_buy_up/UP",
+        start_px=100_000.0,
+        spot_px=100_005.0,
+        pm_trigger_px=0.19,
+    )
+    assert clob.market_calls == 2
+    assert clob.limit_calls == 1
+
+
+def test_execute_buy_raises_limit_error_after_market_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False, retries=2)
+    clob = _FakeClobRetry(fail_times=0, fail_limit=True)
+    with pytest.raises(RuntimeError, match="simulated limit error"):
+        _execute_buy(
+            clob,
+            cfg,
+            1.0,
+            _FakeToken(),
+            "15m/cheap_buy_down/DOWN",
+            start_px=100_000.0,
+            spot_px=99_995.0,
+            pm_trigger_px=0.18,
+        )
+    assert clob.market_calls == 1
+    assert clob.limit_calls == 1

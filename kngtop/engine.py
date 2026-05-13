@@ -136,33 +136,26 @@ def _execute_buy(
     if cfg.dry_run:
         return
     assert clob is not None
+    limit_error: Exception | None = None
+    try:
+        _ = clob.limit_buy(token, price=ENTRY_LIMIT_PRICE, usdc=limit_usdc)
+    except Exception as exc:  # noqa: BLE001
+        limit_error = exc
+        _event("DEAL_FAIL", label=label, attempt=1, leg="limit", error=str(exc))
     attempts = 1 + int(cfg.order_retry_on_error)
     for attempt in range(1, attempts + 1):
-        errors: list[Exception] = []
         try:
             _ = clob.market_buy_usdc(token, market_usdc)
         except Exception as exc:  # noqa: BLE001
-            errors.append(exc)
             _event("DEAL_FAIL", label=label, attempt=attempt, leg="market", error=str(exc))
-        try:
-            _ = clob.limit_buy(token, price=ENTRY_LIMIT_PRICE, usdc=limit_usdc)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(exc)
-            _event("DEAL_FAIL", label=label, attempt=attempt, leg="limit", error=str(exc))
-        if not errors:
-            return
-        if attempt >= attempts:
-            raise RuntimeError("; ".join(str(exc) for exc in errors))
-        if len(errors) == 1:
-            _event("DEAL_RETRY", label=label, attempt=attempt, error=str(errors[0]))
-        else:
-            _event(
-                "DEAL_RETRY",
-                label=label,
-                attempt=attempt,
-                error="; ".join(str(exc) for exc in errors),
-            )
+            if attempt >= attempts:
+                raise
+            _event("DEAL_RETRY", label=label, attempt=attempt, error=str(exc))
             time.sleep(0.35)
+            continue
+        if limit_error is None:
+            return
+        raise RuntimeError(str(limit_error))
 
 
 def _tick_runner(
