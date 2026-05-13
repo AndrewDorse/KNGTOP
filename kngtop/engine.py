@@ -22,7 +22,7 @@ from kngtop.ws_market import MarketWsFeed
 LOGGER = logging.getLogger("kngtop")
 BALANCE_NOTIONAL_FRACTION = 0.10
 ALT_BALANCE_NOTIONAL_FRACTION = 0.05
-WINDOWS_TO_TRADE: tuple[int, ...] = (5, 15, 60, 240)
+WINDOWS_TO_TRADE: tuple[int, ...] = (5, 15)
 ALT_BALANCE_ASSETS = frozenset({"DOGE", "BNB", "HYPE", "LINK"})
 MIN_WINDOW_PROGRESS_FRACTION = 0.20
 ENTRY_MARKET_FRACTION = 0.50
