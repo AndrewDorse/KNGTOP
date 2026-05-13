@@ -15,7 +15,7 @@ from kngtop.clob_client import KngtopClob
 from kngtop.config import KngtopConfig
 from kngtop.eval_coordinator import EvalCoordinator
 from kngtop.gamma import ActiveContract, discover_active_btc_window, window_start_ts_from_slug
-from kngtop.strategy_params import MispriceRule, rule_fires, rules_for_asset
+from kngtop.strategy_params import MispriceRule, rules_for_asset
 from kngtop.rest_poll import run_ws_rest_fallback_loop
 from kngtop.ws_market import MarketWsFeed
 
@@ -108,6 +108,25 @@ def _window_elapsed_ready(runner: WindowRunner, now: datetime) -> bool:
     return elapsed >= min_elapsed
 
 
+def _signal_ready(
+    rule: MispriceRule,
+    *,
+    spot: float,
+    start_px: float,
+    mid_up: float | None,
+    mid_dn: float | None,
+) -> tuple[bool, float | None]:
+    if rule.kind == "cheap_up":
+        if mid_up is None:
+            return False, None
+        return spot > start_px and mid_up <= rule.cheap_max, mid_up
+    if rule.kind == "cheap_dn":
+        if mid_dn is None:
+            return False, None
+        return spot < start_px and mid_dn <= rule.cheap_max, mid_dn
+    return False, None
+
+
 def _execute_buy(
     clob: KngtopClob | None,
     cfg: KngtopConfig,
@@ -173,11 +192,6 @@ def _tick_runner(
         if runner.traded or runner.start_px is None or runner.trade_notional_usd is None:
             return
         now = datetime.now(timezone.utc)
-        if not _window_elapsed_ready(runner, now):
-            return
-        remaining = (runner.contract.end_time - now).total_seconds()
-        if remaining < cfg.order_cutoff_remaining_sec:
-            return
         spot = binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec)
         if spot is None:
             return
@@ -186,18 +200,29 @@ def _tick_runner(
         mid_up = poly.mid_for(up_id, max_age_sec=cfg.poly_mid_max_age_sec)
         mid_dn = poly.mid_for(dn_id, max_age_sec=cfg.poly_mid_max_age_sec)
         start = float(runner.start_px)
+        elapsed_ready = _window_elapsed_ready(runner, now)
         for rule in runner.rules:
-            rule_mid_up = mid_up if mid_up is not None else 1.0
-            rule_mid_dn = mid_dn if mid_dn is not None else 1.0
-            if rule.kind == "cheap_up" and mid_up is None:
+            ready, trigger_px = _signal_ready(
+                rule,
+                spot=spot,
+                start_px=start,
+                mid_up=mid_up,
+                mid_dn=mid_dn,
+            )
+            if not ready:
                 continue
-            if rule.kind == "cheap_dn" and mid_dn is None:
-                continue
-            if not rule_fires(rule, btc=spot, start_btc=start, mid_up=rule_mid_up, mid_dn=rule_mid_dn):
+            if not elapsed_ready:
+                _event(
+                    "SIGNAL_BLOCKED",
+                    label=f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}",
+                    reason="min_window_progress",
+                    start_px=f"{start:.10f}",
+                    spot_px=f"{spot:.10f}",
+                    pm_trigger_px=f"{float(trigger_px):.10f}",
+                )
                 continue
             tok = _pick_token(runner.contract, rule.side)
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
-            trigger_px = mid_up if rule.kind == "cheap_up" else mid_dn
             _execute_buy(
                 clob,
                 cfg,
@@ -206,7 +231,7 @@ def _tick_runner(
                 label,
                 start_px=start,
                 spot_px=spot,
-                pm_trigger_px=trigger_px,
+                pm_trigger_px=float(trigger_px),
             )
             runner.traded = True
             break

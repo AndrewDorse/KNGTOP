@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from unittest.mock import patch
 
 from kngtop.config import KngtopConfig
 from kngtop.engine import (
@@ -246,3 +247,30 @@ def test_tick_no_fire_before_min_window_progress(monkeypatch: pytest.MonkeyPatch
     bn = _FakeBinanceCombo(100_020.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
     assert not runner.traded
+
+
+def test_tick_logs_signal_blocked_before_min_window_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "a" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "true")
+    cfg = KngtopConfig.from_env()
+
+    start = int(datetime.now(timezone.utc).timestamp()) - 30
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=_contract(slug=f"btc-updown-5m-{start}"),
+        window_minutes=5,
+        rules=RULES_5M,
+    )
+    runner.start_px = 100_000.0
+    runner.trade_notional_usd = 1.0
+    poly = _FakePoly(mid_up=0.15, mid_dn=0.85)
+    bn = _FakeBinanceCombo(100_020.0)
+    with patch("kngtop.engine._event") as event_mock:
+        _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
+    assert not runner.traded
+    assert any(
+        call.args and call.args[0] == "SIGNAL_BLOCKED" and call.kwargs.get("reason") == "min_window_progress"
+        for call in event_mock.call_args_list
+    )
