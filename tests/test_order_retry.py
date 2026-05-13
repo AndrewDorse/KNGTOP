@@ -53,7 +53,7 @@ def test_execute_buy_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> N
         pm_trigger_px=0.19,
     )
     assert clob.market_calls == 3
-    assert clob.limit_calls == 1
+    assert clob.limit_calls == 3
     assert clob.limit_args == (0.20, 0.5)
 
 
@@ -72,4 +72,4 @@ def test_execute_buy_raises_after_exhausting_retries(monkeypatch: pytest.MonkeyP
             pm_trigger_px=0.18,
         )
     assert clob.market_calls == 3
-    assert clob.limit_calls == 0
+    assert clob.limit_calls == 3

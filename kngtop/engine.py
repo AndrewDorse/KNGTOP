@@ -138,14 +138,30 @@ def _execute_buy(
     assert clob is not None
     attempts = 1 + int(cfg.order_retry_on_error)
     for attempt in range(1, attempts + 1):
+        errors: list[Exception] = []
         try:
             _ = clob.market_buy_usdc(token, market_usdc)
-            _ = clob.limit_buy(token, price=ENTRY_LIMIT_PRICE, usdc=limit_usdc)
-            return
         except Exception as exc:  # noqa: BLE001
-            _event("DEAL_FAIL", label=label, attempt=attempt, error=str(exc))
-            if attempt >= attempts:
-                raise
+            errors.append(exc)
+            _event("DEAL_FAIL", label=label, attempt=attempt, leg="market", error=str(exc))
+        try:
+            _ = clob.limit_buy(token, price=ENTRY_LIMIT_PRICE, usdc=limit_usdc)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+            _event("DEAL_FAIL", label=label, attempt=attempt, leg="limit", error=str(exc))
+        if not errors:
+            return
+        if attempt >= attempts:
+            raise RuntimeError("; ".join(str(exc) for exc in errors))
+        if len(errors) == 1:
+            _event("DEAL_RETRY", label=label, attempt=attempt, error=str(errors[0]))
+        else:
+            _event(
+                "DEAL_RETRY",
+                label=label,
+                attempt=attempt,
+                error="; ".join(str(exc) for exc in errors),
+            )
             time.sleep(0.35)
 
 
