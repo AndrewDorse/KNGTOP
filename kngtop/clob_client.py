@@ -20,6 +20,7 @@ from py_clob_client_v2 import (  # noqa: E402
     BalanceAllowanceParams,
     ClobClient,
     MarketOrderArgs,
+    OrderArgs,
     OrderType,
     PartialCreateOrderOptions,
     Side,
@@ -187,3 +188,26 @@ class KngtopClob:
         )
         with self._taker_lock:
             return self._create_and_post_market_order(margs, options=opts)
+
+    def limit_buy(self, token: TokenMarket, *, price: float, usdc: float) -> dict[str, Any]:
+        u = float(usdc)
+        px = float(price)
+        if u <= 0:
+            raise ValueError("usdc must be > 0")
+        if px <= 0 or px >= 1:
+            raise ValueError("price must be between 0 and 1")
+        size = u / px
+        order = OrderArgs(
+            token_id=token.token_id,
+            price=round(px, 2),
+            size=float(size),
+            side=self._buy,
+        )
+        create_and_post = getattr(self.client, "create_and_post_order", None)
+        if callable(create_and_post):
+            try:
+                return create_and_post(order_args=order, options=None, order_type=OrderType.GTC, post_only=False)
+            except TypeError:
+                return create_and_post(order, None, OrderType.GTC)
+        signed = self.client.create_order(order)
+        return self.client.post_order(signed, OrderType.GTC)

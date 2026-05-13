@@ -15,13 +15,20 @@ class _FakeToken:
 class _FakeClobRetry:
     def __init__(self, fail_times: int) -> None:
         self.fail_times = fail_times
-        self.calls = 0
+        self.market_calls = 0
+        self.limit_calls = 0
+        self.limit_args: tuple[float, float] | None = None
 
     def market_buy_usdc(self, token: _FakeToken, usdc: float):  # noqa: ANN201
-        self.calls += 1
-        if self.calls <= self.fail_times:
+        self.market_calls += 1
+        if self.market_calls <= self.fail_times:
             raise RuntimeError("simulated order error")
-        return {"ok": True, "calls": self.calls, "usdc": usdc, "token": token.token_id}
+        return {"ok": True, "calls": self.market_calls, "usdc": usdc, "token": token.token_id}
+
+    def limit_buy(self, token: _FakeToken, *, price: float, usdc: float):  # noqa: ANN201
+        self.limit_calls += 1
+        self.limit_args = (price, usdc)
+        return {"ok": True, "price": price, "usdc": usdc, "token": token.token_id}
 
 
 def _cfg(monkeypatch: pytest.MonkeyPatch, *, dry_run: bool = False, retries: int = 2) -> KngtopConfig:
@@ -45,7 +52,9 @@ def test_execute_buy_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> N
         spot_px=100_005.0,
         pm_trigger_px=0.19,
     )
-    assert clob.calls == 3
+    assert clob.market_calls == 3
+    assert clob.limit_calls == 1
+    assert clob.limit_args == (0.20, 0.5)
 
 
 def test_execute_buy_raises_after_exhausting_retries(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -62,4 +71,5 @@ def test_execute_buy_raises_after_exhausting_retries(monkeypatch: pytest.MonkeyP
             spot_px=99_995.0,
             pm_trigger_px=0.18,
         )
-    assert clob.calls == 3
+    assert clob.market_calls == 3
+    assert clob.limit_calls == 0

@@ -25,6 +25,9 @@ ALT_BALANCE_NOTIONAL_FRACTION = 0.05
 WINDOWS_TO_TRADE: tuple[int, ...] = (5, 15, 60, 240)
 ALT_BALANCE_ASSETS = frozenset({"DOGE", "BNB", "HYPE", "LINK"})
 MIN_WINDOW_PROGRESS_FRACTION = 0.20
+ENTRY_MARKET_FRACTION = 0.50
+ENTRY_LIMIT_FRACTION = 0.50
+ENTRY_LIMIT_PRICE = 0.20
 
 
 @dataclass
@@ -116,6 +119,8 @@ def _execute_buy(
     pm_trigger_px: float,
 ) -> None:
     usdc_f = float(usdc)
+    market_usdc = usdc_f * ENTRY_MARKET_FRACTION
+    limit_usdc = usdc_f * ENTRY_LIMIT_FRACTION
     _event(
         "DEAL_START",
         label=label,
@@ -124,6 +129,9 @@ def _execute_buy(
         start_px=f"{start_px:.10f}",
         spot_px=f"{spot_px:.10f}",
         pm_trigger_px=f"{pm_trigger_px:.10f}",
+        market_notional=f"{market_usdc:.10f}",
+        limit_notional=f"{limit_usdc:.10f}",
+        limit_px=f"{ENTRY_LIMIT_PRICE:.2f}",
     )
     if cfg.dry_run:
         return
@@ -131,7 +139,8 @@ def _execute_buy(
     attempts = 1 + int(cfg.order_retry_on_error)
     for attempt in range(1, attempts + 1):
         try:
-            _ = clob.market_buy_usdc(token, usdc_f)
+            _ = clob.market_buy_usdc(token, market_usdc)
+            _ = clob.limit_buy(token, price=ENTRY_LIMIT_PRICE, usdc=limit_usdc)
             return
         except Exception as exc:  # noqa: BLE001
             _event("DEAL_FAIL", label=label, attempt=attempt, error=str(exc))
