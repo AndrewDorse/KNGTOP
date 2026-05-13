@@ -28,6 +28,8 @@ cp .env.example .env
 docker compose --env-file .env up --build -d
 ```
 
+On deploy, the bot waits `60` seconds before entering the trading loop so the feeds can warm up.
+
 ## Local
 
 ```bash

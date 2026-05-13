@@ -28,6 +28,7 @@ MIN_WINDOW_PROGRESS_FRACTION = 0.20
 ENTRY_MARKET_FRACTION = 0.50
 ENTRY_LIMIT_FRACTION = 0.50
 ENTRY_LIMIT_PRICE = 0.20
+BOOT_WARMUP_DELAY_SEC = 60.0
 
 
 @dataclass
@@ -325,6 +326,8 @@ def main() -> None:
         ws_rest_poll=str(cfg.ws_rest_poll_enabled).lower(),
         ws_rest_poll_interval_sec=str(cfg.ws_rest_poll_interval_sec),
     )
+    _event("BOOT_DELAY", seconds=str(int(BOOT_WARMUP_DELAY_SEC)))
+    time.sleep(BOOT_WARMUP_DELAY_SEC)
 
     while True:
         try:
