@@ -22,7 +22,7 @@ from kngtop.clob_client import _normalize_usdc_balance
 
 
 class _FakePoly:
-    def __init__(self, mid_up: float, mid_dn: float) -> None:
+    def __init__(self, mid_up: float | None, mid_dn: float | None) -> None:
         self._up = mid_up
         self._dn = mid_dn
 
@@ -121,6 +121,29 @@ def test_tick_fires_cheap_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     runner.trade_notional_usd = 1.0
     poly = _FakePoly(mid_up=0.85, mid_dn=0.15)
     bn = _FakeBinanceCombo(99_980.0)
+    _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
+    assert runner.traded
+
+
+def test_tick_fires_when_only_needed_pm_side_is_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "c" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "true")
+    cfg = KngtopConfig.from_env()
+
+    start = int(datetime.now(timezone.utc).timestamp()) - 90
+    c = _contract(slug=f"btc-updown-5m-{start}")
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=c,
+        window_minutes=5,
+        rules=RULES_5M,
+    )
+    runner.start_px = 100_000.0
+    runner.trade_notional_usd = 1.0
+    poly = _FakePoly(mid_up=0.15, mid_dn=None)
+    bn = _FakeBinanceCombo(100_020.0)
     _tick_runner(runner, poly=poly, binance=bn, clob=None, cfg=cfg)
     assert runner.traded
 

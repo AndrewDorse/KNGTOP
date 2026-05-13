@@ -185,11 +185,15 @@ def _tick_runner(
         dn_id = runner.contract.down.token_id
         mid_up = poly.mid_for(up_id, max_age_sec=cfg.poly_mid_max_age_sec)
         mid_dn = poly.mid_for(dn_id, max_age_sec=cfg.poly_mid_max_age_sec)
-        if mid_up is None or mid_dn is None:
-            return
         start = float(runner.start_px)
         for rule in runner.rules:
-            if not rule_fires(rule, btc=spot, start_btc=start, mid_up=mid_up, mid_dn=mid_dn):
+            rule_mid_up = mid_up if mid_up is not None else 1.0
+            rule_mid_dn = mid_dn if mid_dn is not None else 1.0
+            if rule.kind == "cheap_up" and mid_up is None:
+                continue
+            if rule.kind == "cheap_dn" and mid_dn is None:
+                continue
+            if not rule_fires(rule, btc=spot, start_btc=start, mid_up=rule_mid_up, mid_dn=rule_mid_dn):
                 continue
             tok = _pick_token(runner.contract, rule.side)
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
