@@ -17,14 +17,16 @@ class _FakeClobRetry:
         self.fail_times = fail_times
         self.fail_limit = fail_limit
         self.market_calls = 0
+        self.max_price: float | None = None
         self.limit_calls = 0
         self.limit_args: tuple[float, float] | None = None
 
-    def market_buy_usdc(self, token: _FakeToken, usdc: float):  # noqa: ANN201
+    def market_buy_usdc(self, token: _FakeToken, usdc: float, *, max_price: float | None = None):  # noqa: ANN201
         self.market_calls += 1
+        self.max_price = max_price
         if self.market_calls <= self.fail_times:
             raise RuntimeError("simulated order error")
-        return {"ok": True, "calls": self.market_calls, "usdc": usdc, "token": token.token_id}
+        return {"ok": True, "calls": self.market_calls, "usdc": usdc, "token": token.token_id, "max_price": max_price}
 
     def limit_buy(self, token: _FakeToken, *, price: float, usdc: float):  # noqa: ANN201
         self.limit_calls += 1
@@ -129,3 +131,22 @@ def test_execute_buy_splits_when_total_notional_is_large_enough(monkeypatch: pyt
     assert clob.market_calls == 1
     assert clob.limit_calls == 1
     assert clob.limit_args == (0.20, 1.0)
+
+
+def test_execute_buy_uses_full_fak_when_rule_has_market_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False, retries=2)
+    clob = _FakeClobRetry(fail_times=0)
+    _execute_buy(
+        clob,
+        cfg,
+        1.0,
+        _FakeToken(),
+        "5m/flip_buy_up/UP",
+        start_px=100_000.0,
+        spot_px=100_001.0,
+        pm_trigger_px=0.31,
+        market_buy_max_price=0.35,
+    )
+    assert clob.market_calls == 1
+    assert clob.limit_calls == 0
+    assert clob.max_price == 0.35

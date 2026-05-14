@@ -8,10 +8,12 @@ from typing import Literal
 
 CHEAP_PRICE_MAX = 0.15
 SECONDARY_NOTIONAL_FRACTION = 0.02
+TERTIARY_PRICE_MAX = 0.35
+TERTIARY_NOTIONAL_FRACTION = 0.01
 
 
-RuleKind = Literal["cheap_up", "cheap_dn", "revert_up", "revert_dn"]
-RuleGroup = Literal["primary", "secondary"]
+RuleKind = Literal["cheap_up", "cheap_dn", "revert_up", "revert_dn", "flip_up", "flip_dn"]
+RuleGroup = Literal["primary", "secondary", "tertiary"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +29,7 @@ class MispriceRule:
     lead_bps: float = 0.0
     close_bps: float = 0.0
     notional_fraction: float | None = None
+    market_buy_max_price: float | None = None
 
 
 _CHEAP_RULES: tuple[MispriceRule, ...] = (
@@ -72,19 +75,47 @@ def _revert_rules(*, lookback_sec: int, lead_bps: float, close_bps: float) -> tu
     )
 
 
+def _flip_rules(*, cheap_max: float, lookback_sec: int) -> tuple[MispriceRule, ...]:
+    return (
+        MispriceRule(
+            "flip_buy_up",
+            cheap_max=cheap_max,
+            side="UP",
+            kind="flip_up",
+            group="tertiary",
+            lookback_sec=lookback_sec,
+            notional_fraction=TERTIARY_NOTIONAL_FRACTION,
+            market_buy_max_price=cheap_max,
+        ),
+        MispriceRule(
+            "flip_buy_down",
+            cheap_max=cheap_max,
+            side="DOWN",
+            kind="flip_dn",
+            group="tertiary",
+            lookback_sec=lookback_sec,
+            notional_fraction=TERTIARY_NOTIONAL_FRACTION,
+            market_buy_max_price=cheap_max,
+        ),
+    )
+
+
 BTC_SECONDARY = _revert_rules(lookback_sec=120, lead_bps=2.0, close_bps=10.0)
 ETH_SECONDARY = _revert_rules(lookback_sec=120, lead_bps=2.0, close_bps=10.0)
 SOL_SECONDARY = _revert_rules(lookback_sec=90, lead_bps=3.0, close_bps=10.0)
+BTC_TERTIARY = _flip_rules(cheap_max=TERTIARY_PRICE_MAX, lookback_sec=10)
+ETH_TERTIARY = _flip_rules(cheap_max=TERTIARY_PRICE_MAX, lookback_sec=10)
+SOL_TERTIARY = _flip_rules(cheap_max=TERTIARY_PRICE_MAX, lookback_sec=10)
 NO_SECONDARY: tuple[MispriceRule, ...] = ()
 
 
-RULES_5M: tuple[MispriceRule, ...] = _CHEAP_RULES + BTC_SECONDARY
+RULES_5M: tuple[MispriceRule, ...] = _CHEAP_RULES + BTC_SECONDARY + BTC_TERTIARY
 RULES_15M: tuple[MispriceRule, ...] = _CHEAP_RULES + BTC_SECONDARY
-ETH_RULES_5M: tuple[MispriceRule, ...] = _CHEAP_RULES + ETH_SECONDARY
+ETH_RULES_5M: tuple[MispriceRule, ...] = _CHEAP_RULES + ETH_SECONDARY + ETH_TERTIARY
 ETH_RULES_15M: tuple[MispriceRule, ...] = _CHEAP_RULES + ETH_SECONDARY
 XRP_RULES_5M: tuple[MispriceRule, ...] = _CHEAP_RULES + NO_SECONDARY
 XRP_RULES_15M: tuple[MispriceRule, ...] = _CHEAP_RULES + NO_SECONDARY
-SOL_RULES_5M: tuple[MispriceRule, ...] = _CHEAP_RULES + SOL_SECONDARY
+SOL_RULES_5M: tuple[MispriceRule, ...] = _CHEAP_RULES + SOL_SECONDARY + SOL_TERTIARY
 SOL_RULES_15M: tuple[MispriceRule, ...] = _CHEAP_RULES + SOL_SECONDARY
 
 

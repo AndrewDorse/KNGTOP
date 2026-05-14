@@ -165,7 +165,7 @@ class KngtopClob:
         except TypeError:
             return create_and_post(margs, options=options)
 
-    def market_buy_usdc(self, token: TokenMarket, usdc: float) -> dict[str, Any]:
+    def market_buy_usdc(self, token: TokenMarket, usdc: float, *, max_price: float | None = None) -> dict[str, Any]:
         u = float(usdc)
         if u <= 0:
             raise ValueError("usdc must be > 0")
@@ -178,7 +178,8 @@ class KngtopClob:
         tick_f = float(tick_raw or "0.01")
         hi = 1.0 - tick_f
         # Per-share ceiling for FAK; clamp to valid (tick, 1-tick).
-        price_cap = min(max(self._market_buy_max_price, tick_f), hi)
+        raw_price_cap = self._market_buy_max_price if max_price is None else float(max_price)
+        price_cap = min(max(raw_price_cap, tick_f), hi)
         margs = MarketOrderArgs(
             token_id=token.token_id,
             amount=u,

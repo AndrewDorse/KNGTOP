@@ -45,6 +45,7 @@ class WindowRunner:
     rules: tuple[MispriceRule, ...]
     start_px: float | None = None
     trade_notional_usd: float | None = None
+    rule_notional_usd: dict[str, float] = field(default_factory=dict)
     traded_rule_keys: set[str] = field(default_factory=set)
     spot_history: deque[tuple[float, float]] = field(default_factory=deque)
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -82,24 +83,10 @@ def _planned_window_notional_usd(
     return max(floor_usd, avail * frac)
 
 
-def _rule_notional_usd(
-    cfg: KngtopConfig,
-    clob: KngtopClob | None,
-    *,
-    pair_key: str,
-    window_minutes: int,
-    rule: MispriceRule,
-    fallback_usd: float | None,
-) -> float:
-    if rule.notional_fraction is None:
-        return float(fallback_usd or max(1.0, float(cfg.notional_usd)))
-    floor_usd = max(1.0, float(cfg.notional_usd))
-    if clob is None:
-        return floor_usd
-    avail = clob.available_balance_usdc()
-    if avail is None:
-        return floor_usd
-    return max(floor_usd, avail * float(rule.notional_fraction))
+def _rule_notional_usd(rule: MispriceRule, runner: WindowRunner) -> float:
+    if rule.key in runner.rule_notional_usd:
+        return float(runner.rule_notional_usd[rule.key])
+    return float(runner.trade_notional_usd or 1.0)
 
 
 def _setup_logging(level: str) -> None:
@@ -191,6 +178,28 @@ def _revert_signal_ready(
     return False
 
 
+def _flip_signal_ready(
+    rule: MispriceRule,
+    *,
+    now_ts: float,
+    spot: float,
+    start_px: float,
+    trigger_px: float | None,
+    history: deque[tuple[float, float]],
+) -> bool:
+    if trigger_px is None or trigger_px > rule.cheap_max or start_px <= 0:
+        return False
+    if rule.kind == "flip_up":
+        if spot <= start_px:
+            return False
+        return any(ts < now_ts and now_ts - ts <= rule.lookback_sec and hist_spot < start_px for ts, hist_spot in history)
+    if rule.kind == "flip_dn":
+        if spot >= start_px:
+            return False
+        return any(ts < now_ts and now_ts - ts <= rule.lookback_sec and hist_spot > start_px for ts, hist_spot in history)
+    return False
+
+
 def _execute_buy(
     clob: KngtopClob | None,
     cfg: KngtopConfig,
@@ -201,11 +210,15 @@ def _execute_buy(
     start_px: float,
     spot_px: float,
     pm_trigger_px: float,
+    market_buy_max_price: float | None = None,
 ) -> None:
     usdc_f = float(usdc)
     market_usdc = usdc_f * ENTRY_MARKET_FRACTION
     limit_usdc = usdc_f * ENTRY_LIMIT_FRACTION
-    if market_usdc < MIN_MARKET_BUY_USDC or (limit_usdc / ENTRY_LIMIT_PRICE) < MIN_LIMIT_SHARES:
+    if market_buy_max_price is not None:
+        market_usdc = usdc_f
+        limit_usdc = 0.0
+    elif market_usdc < MIN_MARKET_BUY_USDC or (limit_usdc / ENTRY_LIMIT_PRICE) < MIN_LIMIT_SHARES:
         market_usdc = usdc_f
         limit_usdc = 0.0
     _event(
@@ -219,6 +232,7 @@ def _execute_buy(
         market_notional=f"{market_usdc:.10f}",
         limit_notional=f"{limit_usdc:.10f}",
         limit_px=f"{ENTRY_LIMIT_PRICE:.2f}",
+        market_px_cap=f"{float(market_buy_max_price):.2f}" if market_buy_max_price is not None else "default",
     )
     if cfg.dry_run:
         return
@@ -233,7 +247,7 @@ def _execute_buy(
     attempts = 1 + int(cfg.order_retry_on_error)
     for attempt in range(1, attempts + 1):
         try:
-            _ = clob.market_buy_usdc(token, market_usdc)
+            _ = clob.market_buy_usdc(token, market_usdc, max_price=market_buy_max_price)
         except Exception as exc:  # noqa: BLE001
             _event("DEAL_FAIL", label=label, attempt=attempt, leg="market", error=str(exc))
             if attempt >= attempts:
@@ -291,6 +305,17 @@ def _tick_runner(
                     history=runner.spot_history,
                 )
                 trigger_px = side_px
+            if not ready and rule.kind in {"flip_up", "flip_dn"}:
+                side_px = mid_up if rule.kind == "flip_up" else mid_dn
+                ready = _flip_signal_ready(
+                    rule,
+                    now_ts=now.timestamp(),
+                    spot=spot,
+                    start_px=start,
+                    trigger_px=side_px,
+                    history=runner.spot_history,
+                )
+                trigger_px = side_px
             if not ready:
                 continue
             if not elapsed_ready:
@@ -308,19 +333,13 @@ def _tick_runner(
             _execute_buy(
                 clob,
                 cfg,
-                _rule_notional_usd(
-                    cfg,
-                    clob,
-                    pair_key=runner.pair_key,
-                    window_minutes=runner.window_minutes,
-                    rule=rule,
-                    fallback_usd=runner.trade_notional_usd,
-                ),
+                _rule_notional_usd(rule, runner),
                 tok,
                 label,
                 start_px=start,
                 spot_px=spot,
                 pm_trigger_px=float(trigger_px),
+                market_buy_max_price=rule.market_buy_max_price,
             )
             runner.traded_rule_keys.add(rule.key)
 
@@ -364,6 +383,17 @@ def _run_iteration(
                         window_minutes=wm,
                     ),
                 )
+                rv = runners[rk]
+                if rv is not None:
+                    fallback_usd = float(rv.trade_notional_usd or max(1.0, float(cfg.notional_usd)))
+                    for rule in rv.rules:
+                        if rule.notional_fraction is None:
+                            rv.rule_notional_usd[rule.key] = fallback_usd
+                        else:
+                            rv.rule_notional_usd[rule.key] = max(
+                                1.0,
+                                fallback_usd * (float(rule.notional_fraction) / BALANCE_NOTIONAL_FRACTION),
+                            )
 
     asset_ids: list[str] = []
     for rk, rv in runners.items():

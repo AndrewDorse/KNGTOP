@@ -30,7 +30,7 @@ def test_rule_fires_cheap_down() -> None:
 
 
 def test_rules_count_per_window() -> None:
-    assert len(RULES_5M) == 4
+    assert len(RULES_5M) == 6
     assert len(RULES_15M) == 4
     assert len(ETH_RULES_15M) == 4
     assert len(SOL_RULES_15M) == 4

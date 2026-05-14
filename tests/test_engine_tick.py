@@ -14,11 +14,12 @@ from kngtop.engine import (
     MIN_WINDOW_PROGRESS_FRACTION,
     WindowRunner,
     _planned_window_notional_usd,
+    _rule_notional_usd,
     _tick_runner,
     _window_elapsed_ready,
 )
 from kngtop.gamma import ActiveContract, TokenMarket
-from kngtop.strategy_params import RULES_5M, SECONDARY_NOTIONAL_FRACTION
+from kngtop.strategy_params import RULES_5M, SECONDARY_NOTIONAL_FRACTION, TERTIARY_NOTIONAL_FRACTION
 from kngtop.clob_client import _normalize_usdc_balance
 
 
@@ -156,6 +157,21 @@ class _FakeClobBalance:
         return self._balance
 
 
+class _FakeClobExec(_FakeClobBalance):
+    def __init__(self, balance: float | None) -> None:
+        super().__init__(balance)
+        self.market_calls: list[tuple[float, float | None]] = []
+        self.limit_calls = 0
+
+    def market_buy_usdc(self, token: TokenMarket, usdc: float, *, max_price: float | None = None):  # noqa: ANN201
+        self.market_calls.append((usdc, max_price))
+        return {"ok": True}
+
+    def limit_buy(self, token: TokenMarket, *, price: float, usdc: float):  # noqa: ANN201
+        self.limit_calls += 1
+        return {"ok": True}
+
+
 def test_planned_window_notional_uses_balance_fraction(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
     monkeypatch.setenv("POLY_FUNDER", "0x" + "d" * 40)
@@ -291,6 +307,7 @@ def test_tick_fires_secondary_revert_rule(monkeypatch: pytest.MonkeyPatch) -> No
     )
     runner.start_px = 100_000.0
     runner.trade_notional_usd = 5.0
+    runner.rule_notional_usd["revert_buy_up"] = 1.0
     runner.spot_history.extend(
         [
             (float(start + 70), 100_040.0),
@@ -319,6 +336,7 @@ def test_secondary_strategy_uses_two_percent_balance(monkeypatch: pytest.MonkeyP
     )
     runner.start_px = 100_000.0
     runner.trade_notional_usd = 5.0
+    runner.rule_notional_usd["revert_buy_up"] = 50.0 * SECONDARY_NOTIONAL_FRACTION
     runner.spot_history.extend([(float(start + 70), 100_040.0)])
     poly = _FakePoly(mid_up=0.12, mid_dn=0.85)
     bn = _FakeBinanceCombo(100_010.0)
@@ -345,8 +363,82 @@ def test_primary_and_secondary_do_not_block_each_other(monkeypatch: pytest.Monke
     )
     runner.start_px = 100_000.0
     runner.trade_notional_usd = 5.0
+    runner.rule_notional_usd["revert_buy_up"] = 1.0
     runner.spot_history.extend([(float(start + 70), 100_040.0)])
     _tick_runner(runner, poly=_FakePoly(mid_up=0.12, mid_dn=0.85), binance=_FakeBinanceCombo(100_010.0), clob=None, cfg=cfg)
     _tick_runner(runner, poly=_FakePoly(mid_up=0.15, mid_dn=0.85), binance=_FakeBinanceCombo(100_020.0), clob=None, cfg=cfg)
     assert "revert_buy_up" in runner.traded_rule_keys
     assert "cheap_buy_up" in runner.traded_rule_keys
+
+
+def test_rule_notional_uses_preplanned_tertiary_size() -> None:
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=_contract(),
+        window_minutes=5,
+        rules=RULES_5M,
+    )
+    runner.trade_notional_usd = 10.0
+    flip_rule = next(rule for rule in RULES_5M if rule.key == "flip_buy_up")
+    runner.rule_notional_usd["flip_buy_up"] = max(1.0, 50.0 * TERTIARY_NOTIONAL_FRACTION)
+    assert _rule_notional_usd(flip_rule, runner) == 1.0
+
+
+def test_tick_fires_tertiary_flip_rule_with_fak_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "6" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "false")
+    cfg = KngtopConfig.from_env()
+
+    start = int(datetime.now(timezone.utc).timestamp()) - 180
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=_contract(slug=f"btc-updown-5m-{start}"),
+        window_minutes=5,
+        rules=RULES_5M,
+    )
+    runner.start_px = 100_000.0
+    runner.trade_notional_usd = 5.0
+    runner.rule_notional_usd["flip_buy_up"] = 1.0
+    now_ts = datetime.now(timezone.utc).timestamp()
+    runner.spot_history.extend(
+        [
+            (now_ts - 6.0, 99_990.0),
+            (now_ts - 2.0, 100_001.0),
+        ]
+    )
+    clob = _FakeClobExec(100.0)
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.35, mid_dn=0.70), binance=_FakeBinanceCombo(100_002.0), clob=clob, cfg=cfg)
+    assert "flip_buy_up" in runner.traded_rule_keys
+    assert clob.market_calls == [(1.0, 0.35)]
+    assert clob.limit_calls == 0
+
+
+def test_primary_secondary_and_tertiary_do_not_block_each_other(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "5" * 40)
+    monkeypatch.setenv("POLY_DRY_RUN", "true")
+    cfg = KngtopConfig.from_env()
+
+    start = int(datetime.now(timezone.utc).timestamp()) - 180
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=_contract(slug=f"btc-updown-5m-{start}"),
+        window_minutes=5,
+        rules=RULES_5M,
+    )
+    runner.start_px = 100_000.0
+    runner.trade_notional_usd = 5.0
+    runner.rule_notional_usd["revert_buy_up"] = 1.0
+    runner.rule_notional_usd["flip_buy_up"] = 1.0
+    now_ts = datetime.now(timezone.utc).timestamp()
+    runner.spot_history.extend([(float(start + 70), 100_040.0), (now_ts - 5.0, 99_990.0)])
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.12, mid_dn=0.85), binance=_FakeBinanceCombo(100_010.0), clob=None, cfg=cfg)
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.15, mid_dn=0.85), binance=_FakeBinanceCombo(100_020.0), clob=None, cfg=cfg)
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.35, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=None, cfg=cfg)
+    assert "revert_buy_up" in runner.traded_rule_keys
+    assert "cheap_buy_up" in runner.traded_rule_keys
+    assert "flip_buy_up" in runner.traded_rule_keys
