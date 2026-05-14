@@ -385,7 +385,7 @@ def test_rule_notional_uses_preplanned_tertiary_size() -> None:
     assert _rule_notional_usd(flip_rule, runner) == 1.0
 
 
-def test_tick_fires_tertiary_flip_rule_with_fak_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_fires_tertiary_flip_rule_with_env_market_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
     monkeypatch.setenv("POLY_FUNDER", "0x" + "6" * 40)
     monkeypatch.setenv("POLY_DRY_RUN", "false")
@@ -412,7 +412,7 @@ def test_tick_fires_tertiary_flip_rule_with_fak_cap(monkeypatch: pytest.MonkeyPa
     clob = _FakeClobExec(100.0)
     _tick_runner(runner, poly=_FakePoly(mid_up=0.35, mid_dn=0.70), binance=_FakeBinanceCombo(100_002.0), clob=clob, cfg=cfg)
     assert "flip_buy_up" in runner.traded_rule_keys
-    assert clob.market_calls == [(1.0, 0.35)]
+    assert clob.market_calls == [(1.0, None)]
     assert clob.limit_calls == 0
 
 

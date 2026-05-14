@@ -85,7 +85,6 @@ def _flip_rules(*, cheap_max: float, lookback_sec: int) -> tuple[MispriceRule, .
             group="tertiary",
             lookback_sec=lookback_sec,
             notional_fraction=TERTIARY_NOTIONAL_FRACTION,
-            market_buy_max_price=cheap_max,
         ),
         MispriceRule(
             "flip_buy_down",
@@ -95,7 +94,6 @@ def _flip_rules(*, cheap_max: float, lookback_sec: int) -> tuple[MispriceRule, .
             group="tertiary",
             lookback_sec=lookback_sec,
             notional_fraction=TERTIARY_NOTIONAL_FRACTION,
-            market_buy_max_price=cheap_max,
         ),
     )
 
