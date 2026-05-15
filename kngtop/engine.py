@@ -510,6 +510,9 @@ def _run_iteration(
                     1.0,
                     fallback_usd * (float(rule.notional_fraction) / BALANCE_NOTIONAL_FRACTION),
                 )
+        if clob is not None:
+            clob.prewarm_market_metadata(rv.contract.up)
+            clob.prewarm_market_metadata(rv.contract.down)
 
     asset_ids: list[str] = []
     for rv in runners.values():

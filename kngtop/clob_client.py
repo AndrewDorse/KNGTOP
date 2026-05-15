@@ -101,6 +101,12 @@ class KngtopClob:
             LOGGER.debug("Allowance sync elapsed_ms=%.1f", (time.perf_counter() - t1) * 1000.0)
         except Exception as exc:  # noqa: BLE001
             LOGGER.debug("Collateral allowance sync: %s", exc)
+        try:
+            resolve_version = getattr(self.client, "_ClobClient__resolve_version", None)
+            if callable(resolve_version):
+                resolve_version()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Version prewarm failed: %s", exc)
         LOGGER.debug("clob_client_ready elapsed_ms=%.1f", (time.perf_counter() - t0) * 1000.0)
 
     def available_balance_usdc(self) -> float | None:
@@ -157,6 +163,20 @@ class KngtopClob:
             tick_size=tick,
             neg_risk=bool(neg) if neg is not None else None,
         )
+
+    def prewarm_market_metadata(self, token: TokenMarket) -> None:
+        tid = (token.token_id or "").strip()
+        if not tid:
+            return
+        try:
+            ensure_market_info = getattr(self.client, "_ClobClient__ensure_market_info_cached", None)
+            if callable(ensure_market_info):
+                ensure_market_info(tid)
+            resolve_version = getattr(self.client, "_ClobClient__resolve_version", None)
+            if callable(resolve_version):
+                resolve_version()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Token metadata prewarm failed for %s: %s", tid[:16], exc)
 
     def _create_and_post_market_order(
         self, margs: MarketOrderArgs, options: PartialCreateOrderOptions | None

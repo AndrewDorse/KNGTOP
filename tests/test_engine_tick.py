@@ -21,6 +21,7 @@ from kngtop.engine import (
     _planned_window_notional_usd,
     _rule_notional_usd,
     _runner_matches_current_window,
+    _run_iteration,
     _should_discover_contract,
     _tick_runner,
     _window_elapsed_ready,
@@ -81,6 +82,15 @@ class _FakeClobExec(_FakeClobBalance):
     def limit_buy(self, token: TokenMarket, *, price: float, usdc: float):  # noqa: ANN201
         self.limit_calls += 1
         return {"ok": True}
+
+
+class _FakeClobPrewarm(_FakeClobBalance):
+    def __init__(self, balance: float | None) -> None:
+        super().__init__(balance)
+        self.prewarmed: list[str] = []
+
+    def prewarm_market_metadata(self, token: TokenMarket) -> None:
+        self.prewarmed.append(token.token_id)
 
 
 def _contract(*, slug: str = "btc-updown-5m-1777900500") -> ActiveContract:
@@ -289,3 +299,37 @@ def test_finalize_runner_window_logs_result(monkeypatch: pytest.MonkeyPatch) -> 
     event_mock.assert_called_once()
     assert event_mock.call_args.args[0] == "DEAL_WINDOW_CLOSED"
     assert event_mock.call_args.kwargs["result"] == "RIGHT"
+
+
+def test_run_iteration_prewarms_token_metadata_for_new_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+
+    class _FakeFeed:
+        def set_assets(self, asset_ids):  # noqa: ANN201
+            self.asset_ids = list(asset_ids)
+
+    class _FakeBinance:
+        def last_price(self, symbol: str, max_age_sec: float = 6.0) -> float | None:
+            return None
+
+    start = _current_window_start_sec(int(datetime.now(timezone.utc).timestamp()), 5)
+    contract = _contract(slug=f"btc-updown-5m-{start}")
+    clob = _FakeClobPrewarm(100.0)
+    with (
+        patch("kngtop.engine.discover_active_btc_window", return_value=contract),
+        patch.object(WindowRunner, "refresh_start_px", lambda self, cfg: setattr(self, "start_px", 100_000.0)),
+    ):
+        runners: dict[tuple[str, int], WindowRunner | None] = {}
+        discovery: dict[tuple[str, int], DiscoveryState] = {}
+        subscribed: set[str] = set()
+        _run_iteration(
+            cfg,
+            runners=runners,
+            discovery=discovery,
+            subscribed_asset_ids=subscribed,
+            poly=_FakeFeed(),
+            binance=_FakeBinance(),
+            clob=clob,
+        )
+    assert contract.up.token_id in clob.prewarmed
+    assert contract.down.token_id in clob.prewarmed
