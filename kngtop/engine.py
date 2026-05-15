@@ -23,10 +23,9 @@ from kngtop.ws_market import MarketWsFeed
 LOGGER = logging.getLogger("kngtop")
 BALANCE_NOTIONAL_FRACTION = 0.10
 ALT_BALANCE_NOTIONAL_FRACTION = 0.05
-WINDOWS_TO_TRADE: tuple[int, ...] = (5, 15)
+WINDOWS_TO_TRADE: tuple[int, ...] = (5,)
 ALT_BALANCE_ASSETS = frozenset({"DOGE", "BNB", "HYPE", "LINK"})
 MIN_WINDOW_PROGRESS_FRACTION = 0.20
-SECONDARY_NOTIONAL_FRACTION = 0.02
 ENTRY_MARKET_FRACTION = 0.50
 ENTRY_LIMIT_FRACTION = 0.50
 ENTRY_LIMIT_PRICE = 0.20
@@ -129,11 +128,14 @@ def _signal_ready(
     mid_up: float | None,
     mid_dn: float | None,
 ) -> tuple[bool, float | None]:
-    if rule.kind == "cheap_up":
+    diff_bps = abs((spot - start_px) / start_px * 10_000.0) if start_px > 0 else 0.0
+    if diff_bps > rule.close_bps:
+        return False, None
+    if rule.kind == "close_up":
         if mid_up is None:
             return False, None
         return spot > start_px and mid_up <= rule.cheap_max, mid_up
-    if rule.kind == "cheap_dn":
+    if rule.kind == "close_dn":
         if mid_dn is None:
             return False, None
         return spot < start_px and mid_dn <= rule.cheap_max, mid_dn
@@ -211,6 +213,7 @@ def _execute_buy(
     spot_px: float,
     pm_trigger_px: float,
     market_buy_max_price: float | None = None,
+    retry_on_error_override: int | None = None,
 ) -> None:
     usdc_f = float(usdc)
     market_usdc = usdc_f * ENTRY_MARKET_FRACTION
@@ -244,7 +247,8 @@ def _execute_buy(
         except Exception as exc:  # noqa: BLE001
             limit_error = exc
             _event("DEAL_FAIL", label=label, attempt=1, leg="limit", error=str(exc))
-    attempts = 1 + int(cfg.order_retry_on_error)
+    retries = cfg.order_retry_on_error if retry_on_error_override is None else int(retry_on_error_override)
+    attempts = 1 + max(0, retries)
     for attempt in range(1, attempts + 1):
         try:
             _ = clob.market_buy_usdc(token, market_usdc, max_price=market_buy_max_price)
@@ -294,28 +298,6 @@ def _tick_runner(
                 mid_up=mid_up,
                 mid_dn=mid_dn,
             )
-            if not ready and rule.kind in {"revert_up", "revert_dn"}:
-                side_px = mid_up if rule.kind == "revert_up" else mid_dn
-                ready = _revert_signal_ready(
-                    rule,
-                    now_ts=now.timestamp(),
-                    spot=spot,
-                    start_px=start,
-                    trigger_px=side_px,
-                    history=runner.spot_history,
-                )
-                trigger_px = side_px
-            if not ready and rule.kind in {"flip_up", "flip_dn"}:
-                side_px = mid_up if rule.kind == "flip_up" else mid_dn
-                ready = _flip_signal_ready(
-                    rule,
-                    now_ts=now.timestamp(),
-                    spot=spot,
-                    start_px=start,
-                    trigger_px=side_px,
-                    history=runner.spot_history,
-                )
-                trigger_px = side_px
             if not ready:
                 continue
             if not elapsed_ready:
@@ -340,6 +322,7 @@ def _tick_runner(
                 spot_px=spot,
                 pm_trigger_px=float(trigger_px),
                 market_buy_max_price=rule.market_buy_max_price,
+                retry_on_error_override=rule.retry_on_error_override,
             )
             runner.traded_rule_keys.add(rule.key)
 

@@ -168,3 +168,22 @@ def test_execute_buy_uses_default_env_market_cap_when_no_override(monkeypatch: p
     assert clob.market_calls == 1
     assert clob.limit_calls == 0
     assert clob.max_price is None
+
+
+def test_execute_buy_obeys_retry_override_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False, retries=2)
+    clob = _FakeClobRetry(fail_times=10)
+    with pytest.raises(RuntimeError, match="simulated order error"):
+        _execute_buy(
+            clob,
+            cfg,
+            1.0,
+            _FakeToken(),
+            "5m/close_buy_up/UP",
+            start_px=100_000.0,
+            spot_px=100_001.0,
+            pm_trigger_px=0.15,
+            market_buy_max_price=0.15,
+            retry_on_error_override=0,
+        )
+    assert clob.market_calls == 1
