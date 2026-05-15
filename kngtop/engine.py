@@ -33,6 +33,7 @@ BOOT_WARMUP_DELAY_SEC = 0.0
 MAX_SPOT_HISTORY_SEC = 180
 MIN_MARKET_BUY_USDC = 1.0
 MIN_LIMIT_SHARES = 5.0
+DISCOVERY_RETRY_SEC_WHEN_MISSING = 15.0
 
 
 @dataclass
@@ -63,6 +64,12 @@ class WindowRunner:
         )
 
 
+@dataclass
+class DiscoveryState:
+    last_window_start_sec: int | None = None
+    last_checked_monotonic: float = 0.0
+
+
 def _planned_window_notional_usd(
     cfg: KngtopConfig,
     *,
@@ -83,6 +90,38 @@ def _rule_notional_usd(rule: MispriceRule, runner: WindowRunner) -> float:
     if rule.key in runner.rule_notional_usd:
         return float(runner.rule_notional_usd[rule.key])
     return float(runner.trade_notional_usd or 1.0)
+
+
+def _current_window_start_sec(now_ts: int, window_minutes: int) -> int:
+    window_sec = max(60, int(window_minutes) * 60)
+    return (int(now_ts) // window_sec) * window_sec
+
+
+def _runner_matches_current_window(runner: WindowRunner | None, *, now_ts: int, window_minutes: int) -> bool:
+    if runner is None:
+        return False
+    start_ts = window_start_ts_from_slug(runner.contract.slug)
+    if start_ts is None:
+        return False
+    return int(start_ts) == _current_window_start_sec(now_ts, window_minutes)
+
+
+def _should_discover_contract(
+    runner: WindowRunner | None,
+    state: DiscoveryState,
+    *,
+    now_ts: int,
+    now_monotonic: float,
+    window_minutes: int,
+) -> bool:
+    current_start = _current_window_start_sec(now_ts, window_minutes)
+    if _runner_matches_current_window(runner, now_ts=now_ts, window_minutes=window_minutes):
+        return False
+    if state.last_window_start_sec != current_start:
+        return True
+    if runner is None and (now_monotonic - state.last_checked_monotonic) >= DISCOVERY_RETRY_SEC_WHEN_MISSING:
+        return True
+    return False
 
 
 def _setup_logging(level: str) -> None:
@@ -338,26 +377,36 @@ def _run_iteration(
     cfg: KngtopConfig,
     *,
     runners: dict[tuple[str, int], WindowRunner | None],
+    discovery: dict[tuple[str, int], DiscoveryState],
+    subscribed_asset_ids: set[str],
     poly: MarketWsFeed,
     binance: BinanceCombinedTradeFeed,
     clob: KngtopClob | None,
 ) -> None:
     timeout = cfg.request_timeout_sec
     sym_for_pair = dict(cfg.trading_pairs)
-    available_balance_usdc: float | None = None
-    if clob is not None:
-        t0 = time.perf_counter()
-        available_balance_usdc = clob.available_balance_usdc()
-        _timing(
-            "balance_fetch",
-            elapsed_ms=f"{(time.perf_counter() - t0) * 1000.0:.1f}",
-            available_balance="none" if available_balance_usdc is None else f"{available_balance_usdc:.6f}",
-        )
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    now_monotonic = time.perf_counter()
+    refreshed_keys: list[tuple[str, int]] = []
 
     for pair_key in sym_for_pair:
         gamma_sym = pair_key.lower()
         bs_sym = sym_for_pair[pair_key]
         for wm in WINDOWS_TO_TRADE:
+            rk = (pair_key, wm)
+            state = discovery.setdefault(rk, DiscoveryState())
+            cur = runners.get(rk)
+            current_start = _current_window_start_sec(now_ts, wm)
+            if not _should_discover_contract(
+                cur,
+                state,
+                now_ts=now_ts,
+                now_monotonic=now_monotonic,
+                window_minutes=wm,
+            ):
+                continue
+            state.last_window_start_sec = current_start
+            state.last_checked_monotonic = now_monotonic
             t0 = time.perf_counter()
             c = discover_active_btc_window(market_symbol=gamma_sym, window_minutes=wm, timeout=timeout)
             _timing(
@@ -367,11 +416,9 @@ def _run_iteration(
                 elapsed_ms=f"{(time.perf_counter() - t0) * 1000.0:.1f}",
                 found=str(c is not None).lower(),
             )
-            rk = (pair_key, wm)
             if c is None:
                 runners[rk] = None
                 continue
-            cur = runners.get(rk)
             if cur is None or cur.contract.slug != c.slug:
                 runners[rk] = WindowRunner(
                     pair_key=pair_key,
@@ -379,30 +426,48 @@ def _run_iteration(
                     contract=c,
                     window_minutes=wm,
                     rules=rules_for_asset(pair_key, wm),
-                    trade_notional_usd=_planned_window_notional_usd(
-                        cfg,
-                        pair_key=pair_key,
-                        window_minutes=wm,
-                        available_balance_usdc=available_balance_usdc,
-                    ),
                 )
-                rv = runners[rk]
-                if rv is not None:
-                    fallback_usd = float(rv.trade_notional_usd or max(1.0, float(cfg.notional_usd)))
-                    for rule in rv.rules:
-                        if rule.notional_fraction is None:
-                            rv.rule_notional_usd[rule.key] = fallback_usd
-                        else:
-                            rv.rule_notional_usd[rule.key] = max(
-                                1.0,
-                                fallback_usd * (float(rule.notional_fraction) / BALANCE_NOTIONAL_FRACTION),
-                            )
+                refreshed_keys.append(rk)
+
+    available_balance_usdc: float | None = None
+    if refreshed_keys and clob is not None:
+        t0 = time.perf_counter()
+        available_balance_usdc = clob.available_balance_usdc()
+        _timing(
+            "balance_fetch",
+            elapsed_ms=f"{(time.perf_counter() - t0) * 1000.0:.1f}",
+            available_balance="none" if available_balance_usdc is None else f"{available_balance_usdc:.6f}",
+        )
+    for rk in refreshed_keys:
+        rv = runners.get(rk)
+        if rv is None:
+            continue
+        rv.trade_notional_usd = _planned_window_notional_usd(
+            cfg,
+            pair_key=rv.pair_key,
+            window_minutes=rv.window_minutes,
+            available_balance_usdc=available_balance_usdc,
+        )
+        fallback_usd = float(rv.trade_notional_usd or max(1.0, float(cfg.notional_usd)))
+        rv.rule_notional_usd.clear()
+        for rule in rv.rules:
+            if rule.notional_fraction is None:
+                rv.rule_notional_usd[rule.key] = fallback_usd
+            else:
+                rv.rule_notional_usd[rule.key] = max(
+                    1.0,
+                    fallback_usd * (float(rule.notional_fraction) / BALANCE_NOTIONAL_FRACTION),
+                )
 
     asset_ids: list[str] = []
-    for rk, rv in runners.items():
+    for rv in runners.values():
         if rv is not None:
             asset_ids.extend([rv.contract.up.token_id, rv.contract.down.token_id])
-    poly.set_assets(asset_ids)
+    next_asset_ids = set(asset_ids)
+    if next_asset_ids != subscribed_asset_ids:
+        poly.set_assets(asset_ids)
+        subscribed_asset_ids.clear()
+        subscribed_asset_ids.update(next_asset_ids)
 
     for rv in runners.values():
         if rv is not None:
@@ -465,6 +530,8 @@ def main() -> None:
         _timing("clob_init", elapsed_ms=f"{(time.perf_counter() - t0) * 1000.0:.1f}")
 
     runners: dict[tuple[str, int], WindowRunner | None] = {}
+    discovery: dict[tuple[str, int], DiscoveryState] = {}
+    subscribed_asset_ids: set[str] = set()
 
     _event(
         "INIT",
@@ -485,7 +552,15 @@ def main() -> None:
     while True:
         try:
             coord.wait_for_turn()
-            _run_iteration(cfg, runners=runners, poly=poly, binance=binance, clob=clob)
+            _run_iteration(
+                cfg,
+                runners=runners,
+                discovery=discovery,
+                subscribed_asset_ids=subscribed_asset_ids,
+                poly=poly,
+                binance=binance,
+                clob=clob,
+            )
         except Exception as exc:  # noqa: BLE001
             _event("ERROR", stage="main_loop", error=str(exc))
 

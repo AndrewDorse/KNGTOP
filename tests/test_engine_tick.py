@@ -12,10 +12,15 @@ from kngtop.config import KngtopConfig
 from kngtop.engine import (
     ALT_BALANCE_NOTIONAL_FRACTION,
     BALANCE_NOTIONAL_FRACTION,
+    DISCOVERY_RETRY_SEC_WHEN_MISSING,
+    DiscoveryState,
     MIN_WINDOW_PROGRESS_FRACTION,
     WindowRunner,
+    _current_window_start_sec,
     _planned_window_notional_usd,
     _rule_notional_usd,
+    _runner_matches_current_window,
+    _should_discover_contract,
     _tick_runner,
     _window_elapsed_ready,
 )
@@ -214,3 +219,36 @@ def test_tick_does_not_mark_rule_traded_on_buy_error(monkeypatch: pytest.MonkeyP
     with pytest.raises(RuntimeError, match="market failed"):
         _tick_runner(runner, poly=_FakePoly(mid_up=0.15, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=_FailingClob(100.0), cfg=cfg)
     assert "close_buy_up" not in runner.traded_rule_keys
+
+
+def test_runner_matches_current_window() -> None:
+    now_ts = 1_777_900_589
+    start = _current_window_start_sec(now_ts, 5)
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
+    assert _runner_matches_current_window(runner, now_ts=now_ts, window_minutes=5)
+
+
+def test_should_not_rediscover_when_runner_matches_current_window() -> None:
+    now_ts = 1_777_900_589
+    now_mono = 100.0
+    start = _current_window_start_sec(now_ts, 5)
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
+    state = DiscoveryState(last_window_start_sec=start, last_checked_monotonic=95.0)
+    assert not _should_discover_contract(runner, state, now_ts=now_ts, now_monotonic=now_mono, window_minutes=5)
+
+
+def test_should_retry_missing_discovery_only_after_interval() -> None:
+    now_ts = 1_777_900_589
+    start = _current_window_start_sec(now_ts, 5)
+    state = DiscoveryState(last_window_start_sec=start, last_checked_monotonic=100.0)
+    assert not _should_discover_contract(None, state, now_ts=now_ts, now_monotonic=100.0 + DISCOVERY_RETRY_SEC_WHEN_MISSING - 0.1, window_minutes=5)
+    assert _should_discover_contract(None, state, now_ts=now_ts, now_monotonic=100.0 + DISCOVERY_RETRY_SEC_WHEN_MISSING, window_minutes=5)
+
+
+def test_should_discover_on_new_window_even_with_previous_runner() -> None:
+    now_ts = 1_777_900_589
+    current_start = _current_window_start_sec(now_ts, 5)
+    previous_start = current_start - 300
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{previous_start}"), 5, RULES_5M)
+    state = DiscoveryState(last_window_start_sec=previous_start, last_checked_monotonic=50.0)
+    assert _should_discover_contract(runner, state, now_ts=now_ts, now_monotonic=55.0, window_minutes=5)
