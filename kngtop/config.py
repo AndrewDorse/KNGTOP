@@ -88,7 +88,7 @@ class KngtopConfig:
             dry_run=_env_bool("POLY_DRY_RUN", True),
             poll_interval_sec=float(os.environ.get("KNGTOP_POLL_INTERVAL_SECONDS") or "0.2"),
             eval_debounce_sec=float(os.environ.get("KNGTOP_EVAL_DEBOUNCE_SECONDS") or "0.025"),
-            request_timeout_sec=float(os.environ.get("KNGTOP_REQUEST_TIMEOUT_SECONDS") or "12.0"),
+            request_timeout_sec=float(os.environ.get("KNGTOP_REQUEST_TIMEOUT_SECONDS") or "5.0"),
             notional_usd=float(os.environ.get("KNGTOP_NOTIONAL_USD") or "1.0"),
             trading_pairs=pairs,
             log_level=(os.environ.get("KNGTOP_LOG_LEVEL") or "INFO").strip().upper(),

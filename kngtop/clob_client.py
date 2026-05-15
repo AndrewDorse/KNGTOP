@@ -69,6 +69,7 @@ class KngtopClob:
         self._buy = Side.BUY
         self._market_buy_max_price = float(market_buy_max_price)
         self._taker_lock = threading.Lock()
+        t0 = time.perf_counter()
         self.client = ClobClient(
             HOST,
             chain_id=CHAIN_ID,
@@ -90,16 +91,28 @@ class KngtopClob:
                 creds = self.client.create_api_key(int(time.time() * 1000))
             self.client.set_api_creds(creds)
         try:
+            t1 = time.perf_counter()
             self.client.update_balance_allowance(
                 BalanceAllowanceParams(
                     asset_type=AssetType.COLLATERAL,
                     signature_type=signature_type,
                 )
             )
+            print(
+                "TIMING stage=allowance_sync elapsed_ms="
+                f"{(time.perf_counter() - t1) * 1000.0:.1f}",
+                flush=True,
+            )
         except Exception as exc:  # noqa: BLE001
             LOGGER.debug("Collateral allowance sync: %s", exc)
+        print(
+            "TIMING stage=clob_client_ready elapsed_ms="
+            f"{(time.perf_counter() - t0) * 1000.0:.1f}",
+            flush=True,
+        )
 
     def available_balance_usdc(self) -> float | None:
+        t0 = time.perf_counter()
         try:
             payload = self.client.get_balance_allowance(
                 BalanceAllowanceParams(
@@ -109,9 +122,19 @@ class KngtopClob:
             )
         except Exception as exc:  # noqa: BLE001
             LOGGER.debug("Balance fetch failed: %s", exc)
+            print(
+                "TIMING stage=balance_fetch_client elapsed_ms="
+                f"{(time.perf_counter() - t0) * 1000.0:.1f} ok=false",
+                flush=True,
+            )
             return None
 
         if not isinstance(payload, dict):
+            print(
+                "TIMING stage=balance_fetch_client elapsed_ms="
+                f"{(time.perf_counter() - t0) * 1000.0:.1f} ok=false",
+                flush=True,
+            )
             return None
 
         direct_keys = (
@@ -124,6 +147,11 @@ class KngtopClob:
         for key in direct_keys:
             val = _normalize_usdc_balance(payload.get(key))
             if val is not None:
+                print(
+                    "TIMING stage=balance_fetch_client elapsed_ms="
+                    f"{(time.perf_counter() - t0) * 1000.0:.1f} ok=true",
+                    flush=True,
+                )
                 return val
 
         nested = payload.get("balanceAllowance")
@@ -131,7 +159,17 @@ class KngtopClob:
             for key in direct_keys:
                 val = _normalize_usdc_balance(nested.get(key))
                 if val is not None:
+                    print(
+                        "TIMING stage=balance_fetch_client elapsed_ms="
+                        f"{(time.perf_counter() - t0) * 1000.0:.1f} ok=true",
+                        flush=True,
+                    )
                     return val
+        print(
+            "TIMING stage=balance_fetch_client elapsed_ms="
+            f"{(time.perf_counter() - t0) * 1000.0:.1f} ok=false",
+            flush=True,
+        )
         return None
 
     def _book_opts(self, token: TokenMarket) -> PartialCreateOrderOptions | None:

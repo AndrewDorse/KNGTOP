@@ -21,15 +21,15 @@ from kngtop.rest_poll import run_ws_rest_fallback_loop
 from kngtop.ws_market import MarketWsFeed
 
 LOGGER = logging.getLogger("kngtop")
-BALANCE_NOTIONAL_FRACTION = 0.10
-ALT_BALANCE_NOTIONAL_FRACTION = 0.05
+BALANCE_NOTIONAL_FRACTION = 0.07
+ALT_BALANCE_NOTIONAL_FRACTION = 0.07
 WINDOWS_TO_TRADE: tuple[int, ...] = (5,)
 ALT_BALANCE_ASSETS = frozenset({"DOGE", "BNB", "HYPE", "LINK"})
 MIN_WINDOW_PROGRESS_FRACTION = 0.20
 ENTRY_MARKET_FRACTION = 0.50
 ENTRY_LIMIT_FRACTION = 0.50
 ENTRY_LIMIT_PRICE = 0.20
-BOOT_WARMUP_DELAY_SEC = 60.0
+BOOT_WARMUP_DELAY_SEC = 0.0
 MAX_SPOT_HISTORY_SEC = 180
 MIN_MARKET_BUY_USDC = 1.0
 MIN_LIMIT_SHARES = 5.0
@@ -65,21 +65,18 @@ class WindowRunner:
 
 def _planned_window_notional_usd(
     cfg: KngtopConfig,
-    clob: KngtopClob | None,
     *,
     pair_key: str,
     window_minutes: int,
+    available_balance_usdc: float | None,
 ) -> float:
     floor_usd = max(1.0, float(cfg.notional_usd))
     if int(window_minutes) >= 60:
         return floor_usd
-    if clob is None:
-        return floor_usd
-    avail = clob.available_balance_usdc()
-    if avail is None:
+    if available_balance_usdc is None:
         return floor_usd
     frac = ALT_BALANCE_NOTIONAL_FRACTION if pair_key.upper() in ALT_BALANCE_ASSETS else BALANCE_NOTIONAL_FRACTION
-    return max(floor_usd, avail * frac)
+    return max(floor_usd, available_balance_usdc * frac)
 
 
 def _rule_notional_usd(rule: MispriceRule, runner: WindowRunner) -> float:
@@ -101,6 +98,10 @@ def _setup_logging(level: str) -> None:
 def _event(kind: str, **fields: object) -> None:
     parts = [f"{k}={v}" for k, v in fields.items()]
     print(f"{kind} " + " ".join(parts), flush=True)
+
+
+def _timing(stage: str, **fields: object) -> None:
+    _event("TIMING", stage=stage, **fields)
 
 
 def _ws_reconnected_event(feed: str, downtime_sec: float) -> None:
@@ -341,12 +342,29 @@ def _run_iteration(
 ) -> None:
     timeout = cfg.request_timeout_sec
     sym_for_pair = dict(cfg.trading_pairs)
+    available_balance_usdc: float | None = None
+    if clob is not None:
+        t0 = time.perf_counter()
+        available_balance_usdc = clob.available_balance_usdc()
+        _timing(
+            "balance_fetch",
+            elapsed_ms=f"{(time.perf_counter() - t0) * 1000.0:.1f}",
+            available_balance="none" if available_balance_usdc is None else f"{available_balance_usdc:.6f}",
+        )
 
     for pair_key in sym_for_pair:
         gamma_sym = pair_key.lower()
         bs_sym = sym_for_pair[pair_key]
         for wm in WINDOWS_TO_TRADE:
+            t0 = time.perf_counter()
             c = discover_active_btc_window(market_symbol=gamma_sym, window_minutes=wm, timeout=timeout)
+            _timing(
+                "gamma_discovery",
+                pair=pair_key,
+                window_minutes=str(wm),
+                elapsed_ms=f"{(time.perf_counter() - t0) * 1000.0:.1f}",
+                found=str(c is not None).lower(),
+            )
             rk = (pair_key, wm)
             if c is None:
                 runners[rk] = None
@@ -361,9 +379,9 @@ def _run_iteration(
                     rules=rules_for_asset(pair_key, wm),
                     trade_notional_usd=_planned_window_notional_usd(
                         cfg,
-                        clob,
                         pair_key=pair_key,
                         window_minutes=wm,
+                        available_balance_usdc=available_balance_usdc,
                     ),
                 )
                 rv = runners[rk]
@@ -432,6 +450,7 @@ def main() -> None:
 
     clob: KngtopClob | None = None
     if not cfg.dry_run:
+        t0 = time.perf_counter()
         clob = KngtopClob(
             private_key=cfg.private_key,
             funder=cfg.funder,
@@ -441,6 +460,7 @@ def main() -> None:
             relayer_passphrase=cfg.relayer_passphrase,
             market_buy_max_price=cfg.market_buy_max_price,
         )
+        _timing("clob_init", elapsed_ms=f"{(time.perf_counter() - t0) * 1000.0:.1f}")
 
     runners: dict[tuple[str, int], WindowRunner | None] = {}
 
@@ -457,7 +477,8 @@ def main() -> None:
         ws_rest_poll_interval_sec=str(cfg.ws_rest_poll_interval_sec),
     )
     _event("BOOT_DELAY", seconds=str(int(BOOT_WARMUP_DELAY_SEC)))
-    time.sleep(BOOT_WARMUP_DELAY_SEC)
+    if BOOT_WARMUP_DELAY_SEC > 0:
+        time.sleep(BOOT_WARMUP_DELAY_SEC)
 
     while True:
         try:

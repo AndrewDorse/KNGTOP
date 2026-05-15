@@ -131,20 +131,17 @@ def test_tick_fires_when_only_needed_pm_side_is_present(monkeypatch: pytest.Monk
 
 def test_planned_window_notional_uses_balance_fraction(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
-    clob = _FakeClobBalance(50.0)
-    assert _planned_window_notional_usd(cfg, clob, pair_key="BTC", window_minutes=5) == 50.0 * BALANCE_NOTIONAL_FRACTION
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=50.0) == 50.0 * BALANCE_NOTIONAL_FRACTION
 
 
 def test_planned_window_notional_uses_five_percent_for_new_assets(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
-    clob = _FakeClobBalance(50.0)
-    assert _planned_window_notional_usd(cfg, clob, pair_key="DOGE", window_minutes=5) == 50.0 * ALT_BALANCE_NOTIONAL_FRACTION
+    assert _planned_window_notional_usd(cfg, pair_key="DOGE", window_minutes=5, available_balance_usdc=50.0) == 50.0 * ALT_BALANCE_NOTIONAL_FRACTION
 
 
 def test_planned_window_notional_has_one_dollar_floor(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
-    clob = _FakeClobBalance(5.0)
-    assert _planned_window_notional_usd(cfg, clob, pair_key="BTC", window_minutes=5) == 1.0
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=5.0) == 1.0
 
 
 def test_normalize_usdc_balance_converts_base_units() -> None:

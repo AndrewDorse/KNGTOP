@@ -74,3 +74,11 @@ def test_ws_rest_poll_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = KngtopConfig.from_env()
     assert cfg.ws_rest_poll_enabled is True
     assert cfg.ws_rest_poll_interval_sec == 1.0
+
+
+def test_request_timeout_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
+    monkeypatch.delenv("KNGTOP_REQUEST_TIMEOUT_SECONDS", raising=False)
+    cfg = KngtopConfig.from_env()
+    assert cfg.request_timeout_sec == 5.0
