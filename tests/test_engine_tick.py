@@ -40,6 +40,13 @@ class _FakePoly:
             return self._dn
         return None
 
+    def best_bid_ask_for(self, token_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+        if token_id == "tid_up" and self._up is not None:
+            return (max(0.0, self._up - 0.01), self._up)
+        if token_id == "tid_dn" and self._dn is not None:
+            return (max(0.0, self._dn - 0.01), self._dn)
+        return None
+
 
 class _FakeBinanceCombo:
     def __init__(self, px: float, symbol: str = "BTCUSDT") -> None:
@@ -200,7 +207,7 @@ def test_tick_executes_full_fak_with_rule_cap(monkeypatch: pytest.MonkeyPatch) -
     clob = _FakeClobExec(100.0)
     _tick_runner(runner, poly=_FakePoly(mid_up=0.15, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=clob, cfg=cfg)
     assert "close_buy_up" in runner.traded_rule_keys
-    assert clob.market_calls == [(1.0, 0.15)]
+    assert clob.market_calls == [(1.0, 0.20)]
     assert clob.limit_calls == 0
 
 
@@ -218,6 +225,23 @@ def test_tick_does_not_mark_rule_traded_on_buy_error(monkeypatch: pytest.MonkeyP
 
     with pytest.raises(RuntimeError, match="market failed"):
         _tick_runner(runner, poly=_FakePoly(mid_up=0.15, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=_FailingClob(100.0), cfg=cfg)
+    assert "close_buy_up" not in runner.traded_rule_keys
+
+
+def test_tick_uses_best_ask_not_mid_for_trigger(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=True)
+    start = int(datetime.now(timezone.utc).timestamp()) - 90
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
+    runner.start_px = 100_000.0
+    runner.trade_notional_usd = 1.0
+
+    class _AskPoly(_FakePoly):
+        def best_bid_ask_for(self, token_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            if token_id == "tid_up":
+                return (0.01, 0.21)
+            return None
+
+    _tick_runner(runner, poly=_AskPoly(mid_up=0.15, mid_dn=None), binance=_FakeBinanceCombo(100_001.0), clob=None, cfg=cfg)
     assert "close_buy_up" not in runner.traded_rule_keys
 
 

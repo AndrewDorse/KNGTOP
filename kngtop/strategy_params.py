@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-CHEAP_PRICE_MAX = 0.15
+CHEAP_PRICE_MAX = 0.20
 CLOSE_TO_START_BPS = 10.0
 
 

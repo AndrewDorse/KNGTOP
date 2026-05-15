@@ -18,7 +18,7 @@ def test_rule_fires_close_up() -> None:
     assert rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.15, mid_dn=0.85)
     assert not rule_fires(r, btc=100_101.0, start_btc=100_000.0, mid_up=0.15, mid_dn=0.85)
     assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.15, mid_dn=0.85)
-    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.16, mid_dn=0.84)
+    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.21, mid_dn=0.79)
 
 
 def test_rule_fires_close_down() -> None:
@@ -26,7 +26,7 @@ def test_rule_fires_close_down() -> None:
     assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.85, mid_dn=0.15)
     assert not rule_fires(r, btc=99_899.0, start_btc=100_000.0, mid_up=0.85, mid_dn=0.15)
     assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.85, mid_dn=0.15)
-    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.84, mid_dn=0.16)
+    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.79, mid_dn=0.21)
 
 
 def test_rules_count_per_window() -> None:
