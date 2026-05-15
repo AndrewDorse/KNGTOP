@@ -96,6 +96,8 @@ def _setup_logging(level: str) -> None:
 
 
 def _event(kind: str, **fields: object) -> None:
+    if kind != "DEAL_START":
+        return
     parts = [f"{k}={v}" for k, v in fields.items()]
     print(f"{kind} " + " ".join(parts), flush=True)
 
