@@ -17,6 +17,7 @@ from kngtop.engine import (
     MIN_WINDOW_PROGRESS_FRACTION,
     WindowRunner,
     _current_window_start_sec,
+    _finalize_runner_window,
     _planned_window_notional_usd,
     _rule_notional_usd,
     _runner_matches_current_window,
@@ -276,3 +277,15 @@ def test_should_discover_on_new_window_even_with_previous_runner() -> None:
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{previous_start}"), 5, RULES_5M)
     state = DiscoveryState(last_window_start_sec=previous_start, last_checked_monotonic=50.0)
     assert _should_discover_contract(runner, state, now_ts=now_ts, now_monotonic=55.0, window_minutes=5)
+
+
+def test_finalize_runner_window_logs_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=True)
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(), 5, RULES_5M)
+    runner.start_px = 100_000.0
+    runner.executed_rule_sides["close_buy_up"] = "UP"
+    with patch("kngtop.engine._event") as event_mock:
+        _finalize_runner_window(runner, binance=_FakeBinanceCombo(100_010.0), cfg=cfg)
+    event_mock.assert_called_once()
+    assert event_mock.call_args.args[0] == "DEAL_WINDOW_CLOSED"
+    assert event_mock.call_args.kwargs["result"] == "RIGHT"

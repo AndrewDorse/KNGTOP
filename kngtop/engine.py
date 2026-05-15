@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from kngtop.binance_multi_ws import BinanceCombinedTradeFeed
-from kngtop.binance_rest import fetch_binance_window_open_px
+from kngtop.binance_rest import fetch_binance_spot_price, fetch_binance_window_open_px
 from kngtop.clob_client import KngtopClob
 from kngtop.config import KngtopConfig
 from kngtop.eval_coordinator import EvalCoordinator
@@ -47,6 +47,7 @@ class WindowRunner:
     trade_notional_usd: float | None = None
     rule_notional_usd: dict[str, float] = field(default_factory=dict)
     traded_rule_keys: set[str] = field(default_factory=set)
+    executed_rule_sides: dict[str, str] = field(default_factory=dict)
     spot_history: deque[tuple[float, float]] = field(default_factory=deque)
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -132,10 +133,21 @@ def _setup_logging(level: str) -> None:
         datefmt="%Y-%m-%dT%H:%M:%S",
         stream=sys.stdout,
     )
+    for noisy_name in (
+        "httpx",
+        "httpcore",
+        "websocket",
+        "websocket-client",
+        "py_clob_client_v2",
+        "py_clob_client_v2.http_helpers.helpers",
+    ):
+        noisy = logging.getLogger(noisy_name)
+        noisy.setLevel(logging.CRITICAL)
+        noisy.propagate = False
 
 
 def _event(kind: str, **fields: object) -> None:
-    if kind != "DEAL_START":
+    if kind not in {"DEAL_START", "DEAL_WINDOW_CLOSED"}:
         return
     parts = [f"{k}={v}" for k, v in fields.items()]
     print(f"{kind} " + " ".join(parts), flush=True)
@@ -182,6 +194,41 @@ def _signal_ready(
             return False, None
         return spot < start_px and mid_dn <= rule.cheap_max, mid_dn
     return False, None
+
+
+def _window_result(side: str, *, start_px: float, final_spot_px: float) -> str:
+    if final_spot_px > start_px:
+        return "RIGHT" if side.upper() == "UP" else "WRONG"
+    if final_spot_px < start_px:
+        return "RIGHT" if side.upper() == "DOWN" else "WRONG"
+    return "TIE"
+
+
+def _finalize_runner_window(
+    runner: WindowRunner | None,
+    *,
+    binance: BinanceCombinedTradeFeed,
+    cfg: KngtopConfig,
+) -> None:
+    if runner is None or runner.start_px is None or not runner.executed_rule_sides:
+        return
+    final_spot = binance.last_price(runner.binance_symbol, max_age_sec=max(cfg.binance_max_age_sec, 30.0))
+    if final_spot is None:
+        final_spot = fetch_binance_spot_price(symbol=runner.binance_symbol, timeout=cfg.request_timeout_sec)
+    if final_spot is None:
+        return
+    start_px = float(runner.start_px)
+    for rule in runner.rules:
+        side = runner.executed_rule_sides.get(rule.key)
+        if side is None:
+            continue
+        _event(
+            "DEAL_WINDOW_CLOSED",
+            label=f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{side}",
+            result=_window_result(side, start_px=start_px, final_spot_px=float(final_spot)),
+            start_px=f"{start_px:.10f}",
+            final_spot_px=f"{float(final_spot):.10f}",
+        )
 
 
 def _append_spot_history(runner: WindowRunner, *, now_ts: float, spot: float) -> None:
@@ -326,8 +373,10 @@ def _tick_runner(
         _append_spot_history(runner, now_ts=now.timestamp(), spot=spot)
         up_id = runner.contract.up.token_id
         dn_id = runner.contract.down.token_id
-        mid_up = poly.mid_for(up_id, max_age_sec=cfg.poly_mid_max_age_sec)
-        mid_dn = poly.mid_for(dn_id, max_age_sec=cfg.poly_mid_max_age_sec)
+        quote_up = poly.best_bid_ask_for(up_id, max_age_sec=cfg.poly_mid_max_age_sec)
+        quote_dn = poly.best_bid_ask_for(dn_id, max_age_sec=cfg.poly_mid_max_age_sec)
+        ask_up = quote_up[1] if quote_up is not None else None
+        ask_dn = quote_dn[1] if quote_dn is not None else None
         start = float(runner.start_px)
         elapsed_ready = _window_elapsed_ready(runner, now)
         for rule in runner.rules:
@@ -337,8 +386,8 @@ def _tick_runner(
                 rule,
                 spot=spot,
                 start_px=start,
-                mid_up=mid_up,
-                mid_dn=mid_dn,
+                mid_up=ask_up,
+                mid_dn=ask_dn,
             )
             if not ready:
                 continue
@@ -367,6 +416,7 @@ def _tick_runner(
                 retry_on_error_override=rule.retry_on_error_override,
             )
             runner.traded_rule_keys.add(rule.key)
+            runner.executed_rule_sides[rule.key] = rule.side
 
 
 def _pairs_summary(cfg: KngtopConfig) -> str:
@@ -408,6 +458,8 @@ def _run_iteration(
             state.last_window_start_sec = current_start
             state.last_checked_monotonic = now_monotonic
             t0 = time.perf_counter()
+            if cur is not None and not _runner_matches_current_window(cur, now_ts=now_ts, window_minutes=wm):
+                _finalize_runner_window(cur, binance=binance, cfg=cfg)
             c = discover_active_btc_window(market_symbol=gamma_sym, window_minutes=wm, timeout=timeout)
             _timing(
                 "gamma_discovery",
