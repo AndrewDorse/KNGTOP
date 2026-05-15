@@ -17,7 +17,7 @@ def test_dry_run_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
     monkeypatch.delenv("POLY_DRY_RUN", raising=False)
     cfg = KngtopConfig.from_env()
-    assert cfg.dry_run is True
+    assert cfg.dry_run is False
 
 
 def test_pairs_default_includes_all_assets(monkeypatch: pytest.MonkeyPatch) -> None:

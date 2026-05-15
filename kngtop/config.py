@@ -85,7 +85,7 @@ class KngtopConfig:
             relayer_api_key=(os.environ.get("RELAYER_API_KEY") or "").strip(),
             relayer_secret=(os.environ.get("RELAYER_SECRET") or "").strip(),
             relayer_passphrase=(os.environ.get("RELAYER_PASSPHRASE") or "").strip(),
-            dry_run=_env_bool("POLY_DRY_RUN", True),
+            dry_run=_env_bool("POLY_DRY_RUN", False),
             poll_interval_sec=float(os.environ.get("KNGTOP_POLL_INTERVAL_SECONDS") or "0.2"),
             eval_debounce_sec=float(os.environ.get("KNGTOP_EVAL_DEBOUNCE_SECONDS") or "0.025"),
             request_timeout_sec=float(os.environ.get("KNGTOP_REQUEST_TIMEOUT_SECONDS") or "5.0"),
