@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from kngtop.binance_multi_ws import BinanceCombinedTradeFeed
 from kngtop.binance_rest import fetch_binance_spot_price, fetch_binance_window_open_px
+from kngtop.btc_confirm import BtcConfirmFeed
 from kngtop.clob_client import KngtopClob
 from kngtop.config import KngtopConfig
 from kngtop.eval_coordinator import EvalCoordinator
@@ -34,6 +35,8 @@ MAX_SPOT_HISTORY_SEC = 180
 MIN_MARKET_BUY_USDC = 1.0
 MIN_LIMIT_SHARES = 5.0
 DISCOVERY_RETRY_SEC_WHEN_MISSING = 15.0
+FAILED_RETRY_COOLDOWN_SEC = 2.0
+BTC_CONFIRM_MAX_AGE_SEC = 4.0
 
 
 @dataclass
@@ -48,6 +51,7 @@ class WindowRunner:
     rule_notional_usd: dict[str, float] = field(default_factory=dict)
     traded_rule_keys: set[str] = field(default_factory=set)
     executed_rule_sides: dict[str, str] = field(default_factory=dict)
+    rule_retry_not_before: dict[str, float] = field(default_factory=dict)
     spot_history: deque[tuple[float, float]] = field(default_factory=deque)
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -147,7 +151,7 @@ def _setup_logging(level: str) -> None:
 
 
 def _event(kind: str, **fields: object) -> None:
-    if kind not in {"DEAL_START", "DEAL_WINDOW_CLOSED"}:
+    if kind not in {"DEAL_START", "DEAL_FILLED", "DEAL_NOT_FILLED", "DEAL_WINDOW_CLOSED"}:
         return
     parts = [f"{k}={v}" for k, v in fields.items()]
     print(f"{kind} " + " ".join(parts), flush=True)
@@ -303,54 +307,41 @@ def _execute_buy(
     pm_trigger_px: float,
     market_buy_max_price: float | None = None,
     retry_on_error_override: int | None = None,
-) -> None:
+) -> bool:
     usdc_f = float(usdc)
-    market_usdc = usdc_f * ENTRY_MARKET_FRACTION
-    limit_usdc = usdc_f * ENTRY_LIMIT_FRACTION
-    if market_buy_max_price is not None:
-        market_usdc = usdc_f
-        limit_usdc = 0.0
-    elif market_usdc < MIN_MARKET_BUY_USDC or (limit_usdc / ENTRY_LIMIT_PRICE) < MIN_LIMIT_SHARES:
-        market_usdc = usdc_f
-        limit_usdc = 0.0
+    market_usdc = usdc_f
     _event(
         "DEAL_START",
         label=label,
         notional=str(usdc_f),
-        token=token.token_id[:16],
         start_px=f"{start_px:.10f}",
         spot_px=f"{spot_px:.10f}",
         pm_trigger_px=f"{pm_trigger_px:.10f}",
-        market_notional=f"{market_usdc:.10f}",
-        limit_notional=f"{limit_usdc:.10f}",
-        limit_px=f"{ENTRY_LIMIT_PRICE:.2f}",
         market_px_cap=f"{float(market_buy_max_price):.2f}" if market_buy_max_price is not None else "default",
     )
     if cfg.dry_run:
-        return
+        _event("DEAL_FILLED", label=label, elapsed_ms="0.0", mode="dry_run")
+        return True
     assert clob is not None
-    limit_error: Exception | None = None
-    if limit_usdc > 0.0:
-        try:
-            _ = clob.limit_buy(token, price=ENTRY_LIMIT_PRICE, usdc=limit_usdc)
-        except Exception as exc:  # noqa: BLE001
-            limit_error = exc
-            _event("DEAL_FAIL", label=label, attempt=1, leg="limit", error=str(exc))
-    retries = cfg.order_retry_on_error if retry_on_error_override is None else int(retry_on_error_override)
-    attempts = 1 + max(0, retries)
-    for attempt in range(1, attempts + 1):
-        try:
-            _ = clob.market_buy_usdc(token, market_usdc, max_price=market_buy_max_price)
-        except Exception as exc:  # noqa: BLE001
-            _event("DEAL_FAIL", label=label, attempt=attempt, leg="market", error=str(exc))
-            if attempt >= attempts:
-                raise
-            _event("DEAL_RETRY", label=label, attempt=attempt, error=str(exc))
-            time.sleep(0.35)
-            continue
-        if limit_error is None:
-            return
-        raise RuntimeError(str(limit_error))
+    started = time.perf_counter()
+    try:
+        _ = clob.market_buy_usdc(token, market_usdc, max_price=market_buy_max_price)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        reason = "no_match" if "no orders found to match" in msg.lower() else "error"
+        _event(
+            "DEAL_NOT_FILLED",
+            label=label,
+            elapsed_ms=f"{(time.perf_counter() - started) * 1000.0:.1f}",
+            reason=reason,
+        )
+        return False
+    _event(
+        "DEAL_FILLED",
+        label=label,
+        elapsed_ms=f"{(time.perf_counter() - started) * 1000.0:.1f}",
+    )
+    return True
 
 
 def _tick_runner(
@@ -358,6 +349,7 @@ def _tick_runner(
     *,
     poly: MarketWsFeed,
     binance: BinanceCombinedTradeFeed,
+    btc_confirm: BtcConfirmFeed | None = None,
     clob: KngtopClob | None,
     cfg: KngtopConfig,
 ) -> None:
@@ -379,8 +371,14 @@ def _tick_runner(
         ask_dn = quote_dn[1] if quote_dn is not None else None
         start = float(runner.start_px)
         elapsed_ready = _window_elapsed_ready(runner, now)
+        now_monotonic = time.perf_counter()
+        if runner.pair_key == "BTC" and btc_confirm is not None:
+            if not btc_confirm.side_matches(start_px=start, binance_spot=spot, max_age_sec=BTC_CONFIRM_MAX_AGE_SEC):
+                return
         for rule in runner.rules:
             if rule.key in runner.traded_rule_keys:
+                continue
+            if now_monotonic < runner.rule_retry_not_before.get(rule.key, 0.0):
                 continue
             ready, trigger_px = _signal_ready(
                 rule,
@@ -403,7 +401,7 @@ def _tick_runner(
                 continue
             tok = _pick_token(runner.contract, rule.side)
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
-            _execute_buy(
+            executed = _execute_buy(
                 clob,
                 cfg,
                 _rule_notional_usd(rule, runner),
@@ -415,6 +413,9 @@ def _tick_runner(
                 market_buy_max_price=rule.market_buy_max_price,
                 retry_on_error_override=rule.retry_on_error_override,
             )
+            if not executed:
+                runner.rule_retry_not_before[rule.key] = time.perf_counter() + FAILED_RETRY_COOLDOWN_SEC
+                continue
             runner.traded_rule_keys.add(rule.key)
             runner.executed_rule_sides[rule.key] = rule.side
 
@@ -431,6 +432,7 @@ def _run_iteration(
     subscribed_asset_ids: set[str],
     poly: MarketWsFeed,
     binance: BinanceCombinedTradeFeed,
+    btc_confirm: BtcConfirmFeed | None = None,
     clob: KngtopClob | None,
 ) -> None:
     timeout = cfg.request_timeout_sec
@@ -535,6 +537,7 @@ def _run_iteration(
                     runners.get((pair_key, wm)),
                     poly=poly,
                     binance=binance,
+                    btc_confirm=btc_confirm,
                     clob=clob,
                     cfg=cfg,
                 )
@@ -560,6 +563,8 @@ def main() -> None:
     )
     poly.start()
     binance.start()
+    btc_confirm = BtcConfirmFeed()
+    btc_confirm.start()
 
     rest_poll_stop = threading.Event()
     if cfg.ws_rest_poll_enabled:
@@ -614,6 +619,7 @@ def main() -> None:
                 subscribed_asset_ids=subscribed_asset_ids,
                 poly=poly,
                 binance=binance,
+                btc_confirm=btc_confirm,
                 clob=clob,
             )
         except Exception as exc:  # noqa: BLE001

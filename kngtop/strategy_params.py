@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-CHEAP_PRICE_MAX = 0.20
-CLOSE_TO_START_BPS = 10.0
+CHEAP_PRICE_MAX = 0.14
+MARKET_BUY_MAX_PRICE = 0.16
+CLOSE_TO_START_BPS = 5.0
 
 
 RuleKind = Literal["close_up", "close_dn"]
@@ -25,7 +26,7 @@ class MispriceRule:
     group: RuleGroup = "quaternary"
     close_bps: float = CLOSE_TO_START_BPS
     notional_fraction: float | None = None
-    market_buy_max_price: float | None = CHEAP_PRICE_MAX
+    market_buy_max_price: float | None = MARKET_BUY_MAX_PRICE
     retry_on_error_override: int | None = 0
 
 

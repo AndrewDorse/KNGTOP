@@ -15,17 +15,17 @@ from kngtop.strategy_params import (
 
 def test_rule_fires_close_up() -> None:
     r = MispriceRule("close_buy_up", cheap_max=CHEAP_PRICE_MAX, side="UP", kind="close_up")
-    assert rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.15, mid_dn=0.85)
-    assert not rule_fires(r, btc=100_101.0, start_btc=100_000.0, mid_up=0.15, mid_dn=0.85)
-    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.15, mid_dn=0.85)
+    assert rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.14, mid_dn=0.85)
+    assert not rule_fires(r, btc=100_101.0, start_btc=100_000.0, mid_up=0.14, mid_dn=0.85)
+    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.14, mid_dn=0.85)
     assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.21, mid_dn=0.79)
 
 
 def test_rule_fires_close_down() -> None:
     r = MispriceRule("close_buy_down", cheap_max=CHEAP_PRICE_MAX, side="DOWN", kind="close_dn")
-    assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.85, mid_dn=0.15)
-    assert not rule_fires(r, btc=99_899.0, start_btc=100_000.0, mid_up=0.85, mid_dn=0.15)
-    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.85, mid_dn=0.15)
+    assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.85, mid_dn=0.14)
+    assert not rule_fires(r, btc=99_899.0, start_btc=100_000.0, mid_up=0.85, mid_dn=0.14)
+    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.85, mid_dn=0.14)
     assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.79, mid_dn=0.21)
 
 
