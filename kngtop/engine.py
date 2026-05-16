@@ -151,7 +151,7 @@ def _setup_logging(level: str) -> None:
 
 
 def _event(kind: str, **fields: object) -> None:
-    if kind not in {"DEAL_START", "DEAL_FILLED", "DEAL_NOT_FILLED", "DEAL_WINDOW_CLOSED"}:
+    if kind not in {"INIT", "DEAL_START", "DEAL_FILLED", "DEAL_NOT_FILLED", "DEAL_WINDOW_CLOSED", "ERROR"}:
         return
     parts = [f"{k}={v}" for k, v in fields.items()]
     print(f"{kind} " + " ".join(parts), flush=True)
