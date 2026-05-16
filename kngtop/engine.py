@@ -187,17 +187,14 @@ def _signal_ready(
     mid_up: float | None,
     mid_dn: float | None,
 ) -> tuple[bool, float | None]:
-    diff_bps = abs((spot - start_px) / start_px * 10_000.0) if start_px > 0 else 0.0
-    if diff_bps > rule.close_bps:
-        return False, None
     if rule.kind == "lose_up":
         if mid_up is None:
             return False, None
-        return spot < start_px and mid_up <= rule.cheap_max, mid_up
+        return spot >= start_px and mid_up <= rule.cheap_max, mid_up
     if rule.kind == "lose_dn":
         if mid_dn is None:
             return False, None
-        return spot > start_px and mid_dn <= rule.cheap_max, mid_dn
+        return spot <= start_px and mid_dn <= rule.cheap_max, mid_dn
     return False, None
 
 

@@ -8,7 +8,7 @@ from typing import Literal
 
 CHEAP_PRICE_MAX = 0.25
 MARKET_BUY_MAX_PRICE = 0.27
-CLOSE_TO_START_BPS = 5.0
+CLOSE_TO_START_BPS = 999999.0
 
 
 RuleKind = Literal["lose_up", "lose_dn"]
@@ -58,7 +58,7 @@ def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
 
 def rule_fires(rule: MispriceRule, *, btc: float, start_btc: float, mid_up: float, mid_dn: float) -> bool:
     if rule.kind == "lose_up":
-        return btc < start_btc and mid_up <= rule.cheap_max
+        return btc >= start_btc and mid_up <= rule.cheap_max
     if rule.kind == "lose_dn":
-        return btc > start_btc and mid_dn <= rule.cheap_max
+        return btc <= start_btc and mid_dn <= rule.cheap_max
     return False
