@@ -20,6 +20,4 @@ RUN mkdir -p /app/logs
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-ENV POLY_DRY_RUN=true
-
 CMD ["python", "-m", "kngtop"]

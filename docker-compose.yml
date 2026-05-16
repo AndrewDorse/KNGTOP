@@ -2,7 +2,6 @@
 services:
   kngtop:
     build: .
-    image: kngtop:local
     restart: unless-stopped
     env_file:
       - .env

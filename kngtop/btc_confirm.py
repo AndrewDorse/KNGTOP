@@ -52,7 +52,7 @@ class BtcConfirmFeed:
     def side_matches(self, *, start_px: float, binance_spot: float, max_age_sec: float = 4.0) -> bool:
         px = self.median_price(binance_spot=binance_spot, max_age_sec=max_age_sec)
         if px is None:
-            return False
+            return True
         binance_side = 1 if binance_spot > start_px else -1 if binance_spot < start_px else 0
         median_side = 1 if px > start_px else -1 if px < start_px else 0
         return binance_side != 0 and binance_side == median_side
