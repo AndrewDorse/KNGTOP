@@ -39,6 +39,7 @@ INSUFFICIENT_BALANCE_BACKOFF_SEC = 30.0
 TP_MULTIPLIER = 2.5
 TP_MAX_PRICE = 0.50
 TP_RETRY_SEC = 0.5
+NO_ENTRY_LAST_SEC = 20.0
 
 
 @dataclass
@@ -178,8 +179,10 @@ def _window_elapsed_ready(runner: WindowRunner, now: datetime) -> bool:
     if start_ts is None:
         return False
     elapsed = now.timestamp() - float(start_ts)
-    min_elapsed = float(runner.window_minutes) * 60.0 * MIN_WINDOW_PROGRESS_FRACTION
-    return elapsed >= min_elapsed
+    window_sec = float(runner.window_minutes) * 60.0
+    min_elapsed = window_sec * MIN_WINDOW_PROGRESS_FRACTION
+    max_elapsed = max(0.0, window_sec - NO_ENTRY_LAST_SEC)
+    return elapsed >= min_elapsed and elapsed < max_elapsed
 
 
 def _signal_ready(
