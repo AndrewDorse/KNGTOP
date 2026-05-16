@@ -73,15 +73,24 @@ class _FakeClobExec(_FakeClobBalance):
     def __init__(self, balance: float | None) -> None:
         super().__init__(balance)
         self.market_calls: list[tuple[float, float | None]] = []
-        self.limit_calls = 0
+        self.limit_calls: list[tuple[float, float]] = []
 
     def market_buy_usdc(self, token: TokenMarket, usdc: float, *, max_price: float | None = None):  # noqa: ANN201
         self.market_calls.append((usdc, max_price))
-        return {"ok": True}
+        return {"ok": True, "orderID": "buy123"}
 
-    def limit_buy(self, token: TokenMarket, *, price: float, usdc: float):  # noqa: ANN201
-        self.limit_calls += 1
-        return {"ok": True}
+    def get_recent_trades(self, token: TokenMarket, *, after_ts: int):  # noqa: ANN201
+        return [{"price": 0.20, "size": 5.0}]
+
+    def limit_sell_shares(self, token: TokenMarket, *, price: float, shares: float):  # noqa: ANN201
+        self.limit_calls.append((price, shares))
+        return {"orderID": "tp123"}
+
+    def get_order(self, order_id: str):  # noqa: ANN201
+        return {"orderID": order_id, "status": "open"}
+
+    def get_open_orders_for_asset(self, token: TokenMarket):  # noqa: ANN201
+        return [{"orderID": "tp123"}]
 
 
 class _FakeClobPrewarm(_FakeClobBalance):
@@ -117,8 +126,8 @@ def test_tick_fires_close_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     start = int(datetime.now(timezone.utc).timestamp()) - 90
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = 1.0
-    _tick_runner(runner, poly=_FakePoly(mid_up=0.25, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=None, cfg=cfg, runtime_state={})
+    runner.trade_notional_usd = 1.25
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.21, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=None, cfg=cfg, runtime_state={})
     assert "close_buy_up" in runner.traded_rule_keys
 
 
@@ -127,8 +136,8 @@ def test_tick_fires_close_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     start = int(datetime.now(timezone.utc).timestamp()) - 90
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = 1.0
-    _tick_runner(runner, poly=_FakePoly(mid_up=0.85, mid_dn=0.25), binance=_FakeBinanceCombo(99_999.0), clob=None, cfg=cfg, runtime_state={})
+    runner.trade_notional_usd = 1.25
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.85, mid_dn=0.21), binance=_FakeBinanceCombo(99_999.0), clob=None, cfg=cfg, runtime_state={})
     assert "close_buy_down" in runner.traded_rule_keys
 
 
@@ -137,8 +146,8 @@ def test_tick_fires_even_when_spot_far_from_start_under_current_rule(monkeypatch
     start = int(datetime.now(timezone.utc).timestamp()) - 90
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = 1.0
-    _tick_runner(runner, poly=_FakePoly(mid_up=0.25, mid_dn=0.85), binance=_FakeBinanceCombo(100_101.0), clob=None, cfg=cfg, runtime_state={})
+    runner.trade_notional_usd = 1.25
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.21, mid_dn=0.85), binance=_FakeBinanceCombo(100_101.0), clob=None, cfg=cfg, runtime_state={})
     assert "close_buy_up" in runner.traded_rule_keys
 
 
@@ -147,8 +156,8 @@ def test_tick_fires_when_only_needed_pm_side_is_present(monkeypatch: pytest.Monk
     start = int(datetime.now(timezone.utc).timestamp()) - 90
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = 1.0
-    _tick_runner(runner, poly=_FakePoly(mid_up=0.25, mid_dn=None), binance=_FakeBinanceCombo(100_001.0), clob=None, cfg=cfg, runtime_state={})
+    runner.trade_notional_usd = 1.25
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.21, mid_dn=None), binance=_FakeBinanceCombo(100_001.0), clob=None, cfg=cfg, runtime_state={})
     assert "close_buy_up" in runner.traded_rule_keys
 
 
@@ -164,7 +173,7 @@ def test_planned_window_notional_uses_five_percent_for_new_assets(monkeypatch: p
 
 def test_planned_window_notional_has_one_dollar_floor(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
-    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=5.0) == 1.0
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=5.0) == 1.25
 
 
 def test_planned_window_notional_skips_when_balance_below_one_dollar(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -198,9 +207,9 @@ def test_tick_logs_signal_blocked_before_min_window_progress(monkeypatch: pytest
     start = int(datetime.now(timezone.utc).timestamp()) - 30
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = 1.0
+    runner.trade_notional_usd = 1.25
     with patch("kngtop.engine._event") as event_mock:
-        _tick_runner(runner, poly=_FakePoly(mid_up=0.25, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=None, cfg=cfg, runtime_state={})
+        _tick_runner(runner, poly=_FakePoly(mid_up=0.21, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=None, cfg=cfg, runtime_state={})
     assert not runner.traded_rule_keys
     assert any(call.args and call.args[0] == "SIGNAL_BLOCKED" for call in event_mock.call_args_list)
 
@@ -221,10 +230,10 @@ def test_tick_executes_full_fak_with_rule_cap(monkeypatch: pytest.MonkeyPatch) -
     runner.trade_notional_usd = 5.0
     runner.rule_notional_usd["close_buy_up"] = 1.0
     clob = _FakeClobExec(100.0)
-    _tick_runner(runner, poly=_FakePoly(mid_up=0.25, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=clob, cfg=cfg, runtime_state={})
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.21, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=clob, cfg=cfg, runtime_state={})
     assert "close_buy_up" in runner.traded_rule_keys
-    assert clob.market_calls == [(1.0, 0.27)]
-    assert clob.limit_calls == 0
+    assert clob.market_calls == [(1.0, 0.23)]
+    assert clob.limit_calls == [(0.5, 5.0)]
 
 
 def test_tick_does_not_mark_rule_traded_on_buy_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -239,7 +248,7 @@ def test_tick_does_not_mark_rule_traded_on_buy_error(monkeypatch: pytest.MonkeyP
         def market_buy_usdc(self, token: TokenMarket, usdc: float, *, max_price: float | None = None):  # noqa: ANN201
             raise RuntimeError("market failed")
 
-    _tick_runner(runner, poly=_FakePoly(mid_up=0.25, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=_FailingClob(100.0), cfg=cfg, runtime_state={})
+    _tick_runner(runner, poly=_FakePoly(mid_up=0.21, mid_dn=0.85), binance=_FakeBinanceCombo(100_001.0), clob=_FailingClob(100.0), cfg=cfg, runtime_state={})
     assert "close_buy_up" not in runner.traded_rule_keys
     assert runner.rule_retry_not_before["close_buy_up"] > 0.0
 
@@ -254,7 +263,7 @@ def test_tick_uses_best_ask_not_mid_for_trigger(monkeypatch: pytest.MonkeyPatch)
     class _AskPoly(_FakePoly):
         def best_bid_ask_for(self, token_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
             if token_id == "tid_up":
-                return (0.01, 0.26)
+                return (0.01, 0.22)
             return None
 
     _tick_runner(runner, poly=_AskPoly(mid_up=0.25, mid_dn=None), binance=_FakeBinanceCombo(99_999.0), clob=None, cfg=cfg, runtime_state={})

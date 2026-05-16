@@ -31,11 +31,14 @@ ENTRY_LIMIT_FRACTION = 0.50
 ENTRY_LIMIT_PRICE = 0.20
 BOOT_WARMUP_DELAY_SEC = 0.0
 MAX_SPOT_HISTORY_SEC = 180
-MIN_MARKET_BUY_USDC = 1.0
+MIN_MARKET_BUY_USDC = 1.25
 MIN_LIMIT_SHARES = 5.0
 DISCOVERY_RETRY_SEC_WHEN_MISSING = 15.0
 FAILED_RETRY_COOLDOWN_SEC = 2.0
 INSUFFICIENT_BALANCE_BACKOFF_SEC = 30.0
+TP_MULTIPLIER = 2.5
+TP_MAX_PRICE = 0.50
+TP_RETRY_SEC = 0.5
 
 
 @dataclass
@@ -81,7 +84,7 @@ def _planned_window_notional_usd(
     window_minutes: int,
     available_balance_usdc: float | None,
 ) -> float:
-    floor_usd = max(1.0, float(cfg.notional_usd))
+    floor_usd = max(MIN_MARKET_BUY_USDC, float(cfg.notional_usd))
     if int(window_minutes) >= 60:
         return floor_usd
     if available_balance_usdc is None:
@@ -152,7 +155,7 @@ def _setup_logging(level: str) -> None:
 
 
 def _event(kind: str, **fields: object) -> None:
-    if kind not in {"INIT", "START_DEAL", "RETRY_BUY", "DEAL_WINDOW_CLOSED", "ERROR"}:
+    if kind not in {"INIT", "START_DEAL", "RETRY_BUY", "DEAL_WINDOW_CLOSED", "ERROR", "DEAL_FILLED", "TP_RETRY", "TP_OPENED"}:
         return
     parts = [f"{k}={v}" for k, v in fields.items()]
     print(f"{kind} " + " ".join(parts), flush=True)
@@ -321,8 +324,9 @@ def _execute_buy(
         return True, None
     assert clob is not None
     started = time.perf_counter()
+    started_wall_ts = int(time.time()) - 1
     try:
-        _ = clob.market_buy_usdc(token, market_usdc, max_price=market_buy_max_price)
+        buy_resp = clob.market_buy_usdc(token, market_usdc, max_price=market_buy_max_price)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         lower_msg = msg.lower()
@@ -341,7 +345,117 @@ def _execute_buy(
         if reason != "no_match":
             _event("ERROR", stage="market_buy", label=label, error=msg)
         return False, reason
+    filled_size, avg_fill_price = _confirm_fill(clob, token, buy_resp, after_ts=started_wall_ts)
+    tp_price = min(TP_MAX_PRICE, round(avg_fill_price * TP_MULTIPLIER, 2))
+    _event(
+        "DEAL_FILLED",
+        label=label,
+        elapsed_ms=f"{(time.perf_counter() - started) * 1000.0:.1f}",
+        filled_size=f"{filled_size:.6f}",
+        avg_fill_px=f"{avg_fill_price:.4f}",
+        tp_price=f"{tp_price:.2f}",
+    )
+    _place_tp_until_confirmed(clob, token, label=label, shares=filled_size, tp_price=tp_price)
     return True, None
+
+
+def _extract_order_id(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("orderID", "id", "order_id", "hash"):
+        raw = payload.get(key)
+        if raw:
+            return str(raw)
+    return None
+
+
+def _as_float(raw: object) -> float | None:
+    try:
+        if raw is None:
+            return None
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_trade_fill(row: dict[str, object]) -> tuple[float | None, float | None]:
+    size = None
+    price = None
+    for key in ("size", "matched_size", "filled_size", "amount", "makerAmountFilled"):
+        size = _as_float(row.get(key))
+        if size is not None and size > 0:
+            break
+    for key in ("price", "matched_price", "fill_price"):
+        price = _as_float(row.get(key))
+        if price is not None and price > 0:
+            break
+    if price is None:
+        maker = _as_float(row.get("makerAmountFilled"))
+        taker = _as_float(row.get("takerAmountFilled"))
+        if maker and taker:
+            price = maker / taker if taker > 0 else None
+            if size is None:
+                size = taker
+    return size, price
+
+
+def _extract_order_fill(row: dict[str, object]) -> tuple[float | None, float | None]:
+    size = None
+    price = None
+    for key in ("size_matched", "matched_size", "filled_size", "filledAmount", "size"):
+        size = _as_float(row.get(key))
+        if size is not None and size > 0:
+            break
+    for key in ("avg_price", "average_price", "price", "filled_price"):
+        price = _as_float(row.get(key))
+        if price is not None and price > 0:
+            break
+    return size, price
+
+
+def _confirm_fill(clob: KngtopClob, token, buy_resp: object, *, after_ts: int) -> tuple[float, float]:
+    order_id = _extract_order_id(buy_resp)
+    while True:
+        trades = clob.get_recent_trades(token, after_ts=after_ts)
+        total_size = 0.0
+        total_notional = 0.0
+        for row in trades:
+            size, price = _extract_trade_fill(row)
+            if size is None or price is None or size <= 0 or price <= 0:
+                continue
+            total_size += size
+            total_notional += size * price
+        if total_size > 0 and total_notional > 0:
+            return total_size, total_notional / total_size
+        if order_id:
+            order_payload = clob.get_order(order_id)
+            size, price = _extract_order_fill(order_payload)
+            if size is not None and price is not None and size > 0 and price > 0:
+                return size, price
+        time.sleep(TP_RETRY_SEC)
+
+
+def _place_tp_until_confirmed(clob: KngtopClob, token, *, label: str, shares: float, tp_price: float) -> None:
+    while True:
+        try:
+            tp_resp = clob.limit_sell_shares(token, price=tp_price, shares=shares)
+            order_id = _extract_order_id(tp_resp)
+            if order_id:
+                order_payload = clob.get_order(order_id)
+                if order_payload:
+                    open_rows = clob.get_open_orders_for_asset(token)
+                    if any(_extract_order_id(row) == order_id for row in open_rows):
+                        _event("TP_OPENED", label=label, tp_price=f"{tp_price:.2f}", shares=f"{shares:.6f}", order_id=order_id)
+                        return
+            open_rows = clob.get_open_orders_for_asset(token)
+            if open_rows:
+                _event("TP_OPENED", label=label, tp_price=f"{tp_price:.2f}", shares=f"{shares:.6f}")
+                return
+            _event("TP_RETRY", label=label, reason="tp_not_confirmed")
+        except Exception as exc:  # noqa: BLE001
+            _event("TP_RETRY", label=label, reason="error")
+            _event("ERROR", stage="tp_limit_sell", label=label, error=str(exc))
+        time.sleep(TP_RETRY_SEC)
 
 
 def _tick_runner(
@@ -505,14 +619,14 @@ def _run_iteration(
             window_minutes=rv.window_minutes,
             available_balance_usdc=available_balance_usdc,
         )
-        fallback_usd = float(rv.trade_notional_usd or max(1.0, float(cfg.notional_usd)))
+        fallback_usd = float(rv.trade_notional_usd or max(MIN_MARKET_BUY_USDC, float(cfg.notional_usd)))
         rv.rule_notional_usd.clear()
         for rule in rv.rules:
             if rule.notional_fraction is None:
                 rv.rule_notional_usd[rule.key] = fallback_usd
             else:
                 rv.rule_notional_usd[rule.key] = max(
-                    1.0,
+                    MIN_MARKET_BUY_USDC,
                     fallback_usd * (float(rule.notional_fraction) / BALANCE_NOTIONAL_FRACTION),
                 )
         if clob is not None:

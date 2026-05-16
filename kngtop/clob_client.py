@@ -20,10 +20,12 @@ from py_clob_client_v2 import (  # noqa: E402
     BalanceAllowanceParams,
     ClobClient,
     MarketOrderArgs,
+    OpenOrderParams,
     OrderArgs,
     OrderType,
     PartialCreateOrderOptions,
     Side,
+    TradeParams,
 )
 
 
@@ -67,6 +69,7 @@ class KngtopClob:
     ) -> None:
         self._signature_type = int(signature_type)
         self._buy = Side.BUY
+        self._sell = Side.SELL
         self._market_buy_max_price = float(market_buy_max_price)
         self._taker_lock = threading.Lock()
         t0 = time.perf_counter()
@@ -237,3 +240,43 @@ class KngtopClob:
                 return create_and_post(order, None, OrderType.GTC)
         signed = self.client.create_order(order)
         return self.client.post_order(signed, OrderType.GTC)
+
+    def limit_sell_shares(self, token: TokenMarket, *, price: float, shares: float) -> dict[str, Any]:
+        sz = float(shares)
+        px = float(price)
+        if sz <= 0:
+            raise ValueError("shares must be > 0")
+        if px <= 0 or px >= 1:
+            raise ValueError("price must be between 0 and 1")
+        order = OrderArgs(
+            token_id=token.token_id,
+            price=round(px, 2),
+            size=sz,
+            side=self._sell,
+        )
+        create_and_post = getattr(self.client, "create_and_post_order", None)
+        if callable(create_and_post):
+            try:
+                return create_and_post(order_args=order, options=None, order_type=OrderType.GTC, post_only=False)
+            except TypeError:
+                return create_and_post(order, None, OrderType.GTC)
+        signed = self.client.create_order(order)
+        return self.client.post_order(signed, OrderType.GTC)
+
+    def get_recent_trades(self, token: TokenMarket, *, after_ts: int) -> list[dict[str, Any]]:
+        rows = self.client.get_trades(
+            TradeParams(asset_id=token.token_id, after=int(after_ts)),
+            only_first_page=True,
+        )
+        return [row for row in rows if isinstance(row, dict)]
+
+    def get_open_orders_for_asset(self, token: TokenMarket) -> list[dict[str, Any]]:
+        rows = self.client.get_open_orders(
+            OpenOrderParams(asset_id=token.token_id),
+            only_first_page=True,
+        )
+        return [row for row in rows if isinstance(row, dict)]
+
+    def get_order(self, order_id: str) -> dict[str, Any]:
+        payload = self.client.get_order(order_id)
+        return payload if isinstance(payload, dict) else {}

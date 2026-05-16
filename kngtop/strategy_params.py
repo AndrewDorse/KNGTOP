@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-CHEAP_PRICE_MAX = 0.25
-MARKET_BUY_MAX_PRICE = 0.27
+CHEAP_PRICE_MAX = 0.21
+MARKET_BUY_MAX_PRICE = 0.23
 CLOSE_TO_START_BPS = 999999.0
 
 
