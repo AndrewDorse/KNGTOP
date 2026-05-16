@@ -35,6 +35,7 @@ MIN_MARKET_BUY_USDC = 1.0
 MIN_LIMIT_SHARES = 5.0
 DISCOVERY_RETRY_SEC_WHEN_MISSING = 15.0
 FAILED_RETRY_COOLDOWN_SEC = 2.0
+INSUFFICIENT_BALANCE_BACKOFF_SEC = 30.0
 
 
 @dataclass
@@ -85,6 +86,8 @@ def _planned_window_notional_usd(
         return floor_usd
     if available_balance_usdc is None:
         return floor_usd
+    if available_balance_usdc < floor_usd:
+        return 0.0
     frac = ALT_BALANCE_NOTIONAL_FRACTION if pair_key.upper() in ALT_BALANCE_ASSETS else BALANCE_NOTIONAL_FRACTION
     return max(floor_usd, available_balance_usdc * frac)
 
@@ -305,7 +308,7 @@ def _execute_buy(
     pm_trigger_px: float,
     market_buy_max_price: float | None = None,
     retry_on_error_override: int | None = None,
-) -> bool:
+) -> tuple[bool, str | None]:
     usdc_f = float(usdc)
     market_usdc = usdc_f
     _event(
@@ -318,14 +321,20 @@ def _execute_buy(
         market_px_cap=f"{float(market_buy_max_price):.2f}" if market_buy_max_price is not None else "default",
     )
     if cfg.dry_run:
-        return True
+        return True, None
     assert clob is not None
     started = time.perf_counter()
     try:
         _ = clob.market_buy_usdc(token, market_usdc, max_price=market_buy_max_price)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
-        reason = "no_match" if "no orders found to match" in msg.lower() else "error"
+        lower_msg = msg.lower()
+        if "no orders found to match" in lower_msg:
+            reason = "no_match"
+        elif "not enough balance / allowance" in lower_msg:
+            reason = "insufficient_balance"
+        else:
+            reason = "error"
         _event(
             "RETRY_BUY",
             label=label,
@@ -334,8 +343,8 @@ def _execute_buy(
         )
         if reason != "no_match":
             _event("ERROR", stage="market_buy", label=label, error=msg)
-        return False
-    return True
+        return False, reason
+    return True, None
 
 
 def _tick_runner(
@@ -345,11 +354,14 @@ def _tick_runner(
     binance: BinanceCombinedTradeFeed,
     clob: KngtopClob | None,
     cfg: KngtopConfig,
+    runtime_state: dict[str, float],
 ) -> None:
     if runner is None:
         return
     with runner._exec_lock:
         if runner.start_px is None or runner.trade_notional_usd is None:
+            return
+        if runner.trade_notional_usd < MIN_MARKET_BUY_USDC:
             return
         now = datetime.now(timezone.utc)
         spot = binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec)
@@ -391,7 +403,7 @@ def _tick_runner(
                 continue
             tok = _pick_token(runner.contract, rule.side)
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
-            executed = _execute_buy(
+            executed, reason = _execute_buy(
                 clob,
                 cfg,
                 _rule_notional_usd(rule, runner),
@@ -404,7 +416,11 @@ def _tick_runner(
                 retry_on_error_override=rule.retry_on_error_override,
             )
             if not executed:
-                runner.rule_retry_not_before[rule.key] = time.perf_counter() + FAILED_RETRY_COOLDOWN_SEC
+                cooldown = FAILED_RETRY_COOLDOWN_SEC
+                if reason == "insufficient_balance":
+                    cooldown = INSUFFICIENT_BALANCE_BACKOFF_SEC
+                    runtime_state["insufficient_balance_not_before"] = time.perf_counter() + cooldown
+                runner.rule_retry_not_before[rule.key] = time.perf_counter() + cooldown
                 continue
             runner.traded_rule_keys.add(rule.key)
             runner.executed_rule_sides[rule.key] = rule.side
@@ -423,6 +439,7 @@ def _run_iteration(
     poly: MarketWsFeed,
     binance: BinanceCombinedTradeFeed,
     clob: KngtopClob | None,
+    runtime_state: dict[str, float],
 ) -> None:
     timeout = cfg.request_timeout_sec
     sym_for_pair = dict(cfg.trading_pairs)
@@ -519,6 +536,9 @@ def _run_iteration(
         if rv is not None:
             rv.refresh_start_px(cfg)
 
+    if now_monotonic < runtime_state.get("insufficient_balance_not_before", 0.0):
+        return
+
     for pair_key in sym_for_pair:
         for wm in WINDOWS_TO_TRADE:
             try:
@@ -528,6 +548,7 @@ def _run_iteration(
                     binance=binance,
                     clob=clob,
                     cfg=cfg,
+                    runtime_state=runtime_state,
                 )
             except Exception as exc:  # noqa: BLE001
                 _event("ERROR", stage="tick", pair=str(pair_key), window_minutes=str(wm), error=str(exc))
@@ -578,6 +599,7 @@ def main() -> None:
     runners: dict[tuple[str, int], WindowRunner | None] = {}
     discovery: dict[tuple[str, int], DiscoveryState] = {}
     subscribed_asset_ids: set[str] = set()
+    runtime_state: dict[str, float] = {}
 
     _event(
         "INIT",
@@ -606,6 +628,7 @@ def main() -> None:
                 poly=poly,
                 binance=binance,
                 clob=clob,
+                runtime_state=runtime_state,
             )
         except Exception as exc:  # noqa: BLE001
             _event("ERROR", stage="main_loop", error=str(exc))

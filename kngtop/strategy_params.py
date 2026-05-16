@@ -8,7 +8,7 @@ from typing import Literal
 
 CHEAP_PRICE_MAX = 0.25
 MARKET_BUY_MAX_PRICE = 0.27
-CLOSE_TO_START_BPS = 999999.0
+CLOSE_TO_START_BPS = 5.0
 
 
 RuleKind = Literal["lose_up", "lose_dn"]
