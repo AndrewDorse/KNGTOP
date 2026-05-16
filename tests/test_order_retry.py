@@ -47,12 +47,12 @@ def test_execute_buy_returns_true_on_success(monkeypatch: pytest.MonkeyPatch) ->
         "5m/close_buy_up/UP",
         start_px=100_000.0,
         spot_px=100_001.0,
-        pm_trigger_px=0.14,
-        market_buy_max_price=0.16,
+        pm_trigger_px=0.25,
+        market_buy_max_price=0.27,
     )
     assert ok is True
     assert clob.market_calls == 1
-    assert clob.max_price == 0.16
+    assert clob.max_price == 0.27
 
 
 def test_execute_buy_returns_false_on_error_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,8 +66,8 @@ def test_execute_buy_returns_false_on_error_without_retry(monkeypatch: pytest.Mo
         "5m/close_buy_up/UP",
         start_px=100_000.0,
         spot_px=100_001.0,
-        pm_trigger_px=0.14,
-        market_buy_max_price=0.16,
+        pm_trigger_px=0.25,
+        market_buy_max_price=0.27,
     )
     assert ok is False
     assert clob.market_calls == 1
@@ -84,7 +84,7 @@ def test_execute_buy_uses_default_env_market_cap_when_no_override(monkeypatch: p
         "5m/close_buy_up/UP",
         start_px=100_000.0,
         spot_px=100_001.0,
-        pm_trigger_px=0.14,
+        pm_trigger_px=0.25,
     )
     assert ok is True
     assert clob.market_calls == 1
@@ -103,12 +103,11 @@ def test_execute_buy_logs_filled_elapsed(monkeypatch: pytest.MonkeyPatch) -> Non
             "5m/close_buy_up/UP",
             start_px=100_000.0,
             spot_px=100_001.0,
-            pm_trigger_px=0.14,
-            market_buy_max_price=0.16,
+            pm_trigger_px=0.25,
+            market_buy_max_price=0.27,
         )
     kinds = [call.args[0] for call in event_mock.call_args_list]
-    assert "DEAL_START" in kinds
-    assert "DEAL_FILLED" in kinds
+    assert "START_DEAL" in kinds
 
 
 def test_execute_buy_logs_not_filled_elapsed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -123,9 +122,9 @@ def test_execute_buy_logs_not_filled_elapsed(monkeypatch: pytest.MonkeyPatch) ->
             "5m/close_buy_up/UP",
             start_px=100_000.0,
             spot_px=100_001.0,
-            pm_trigger_px=0.14,
-            market_buy_max_price=0.16,
+            pm_trigger_px=0.25,
+            market_buy_max_price=0.27,
         )
     kinds = [call.args[0] for call in event_mock.call_args_list]
-    assert "DEAL_START" in kinds
-    assert "DEAL_NOT_FILLED" in kinds
+    assert "START_DEAL" in kinds
+    assert "RETRY_BUY" in kinds

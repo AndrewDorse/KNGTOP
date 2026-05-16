@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-CHEAP_PRICE_MAX = 0.14
-MARKET_BUY_MAX_PRICE = 0.16
-CLOSE_TO_START_BPS = 5.0
+CHEAP_PRICE_MAX = 0.25
+MARKET_BUY_MAX_PRICE = 0.27
+CLOSE_TO_START_BPS = 999999.0
 
 
-RuleKind = Literal["close_up", "close_dn"]
+RuleKind = Literal["lose_up", "lose_dn"]
 RuleGroup = Literal["quaternary"]
 
 
@@ -35,13 +35,13 @@ RULES_5M: tuple[MispriceRule, ...] = (
         "close_buy_up",
         cheap_max=CHEAP_PRICE_MAX,
         side="UP",
-        kind="close_up",
+        kind="lose_up",
     ),
     MispriceRule(
         "close_buy_down",
         cheap_max=CHEAP_PRICE_MAX,
         side="DOWN",
-        kind="close_dn",
+        kind="lose_dn",
     ),
 )
 
@@ -57,11 +57,8 @@ def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
 
 
 def rule_fires(rule: MispriceRule, *, btc: float, start_btc: float, mid_up: float, mid_dn: float) -> bool:
-    diff_bps = abs((btc - start_btc) / start_btc * 10_000.0) if start_btc > 0 else 0.0
-    if diff_bps > rule.close_bps:
-        return False
-    if rule.kind == "close_up":
-        return btc > start_btc and mid_up <= rule.cheap_max
-    if rule.kind == "close_dn":
-        return btc < start_btc and mid_dn <= rule.cheap_max
+    if rule.kind == "lose_up":
+        return btc < start_btc and mid_up <= rule.cheap_max
+    if rule.kind == "lose_dn":
+        return btc > start_btc and mid_dn <= rule.cheap_max
     return False

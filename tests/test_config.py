@@ -20,7 +20,7 @@ def test_dry_run_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.dry_run is False
 
 
-def test_pairs_default_is_btc_eth_only(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pairs_default_includes_all_assets(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
     monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
     monkeypatch.delenv("KNGTOP_PAIRS", raising=False)
@@ -28,6 +28,12 @@ def test_pairs_default_is_btc_eth_only(monkeypatch: pytest.MonkeyPatch) -> None:
     assert tuple(cfg.trading_pairs) == (
         ("BTC", "BTCUSDT"),
         ("ETH", "ETHUSDT"),
+        ("XRP", "XRPUSDT"),
+        ("SOL", "SOLUSDT"),
+        ("DOGE", "DOGEUSDT"),
+        ("BNB", "BNBUSDT"),
+        ("HYPE", "HYPEUSDT"),
+        ("LINK", "LINKUSDT"),
     )
 
 
