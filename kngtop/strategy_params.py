@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-ENTRY_PRICE_MIN = 0.28
+ENTRY_PRICE_MIN = 0.29
 ENTRY_PRICE_MAX = 0.42
 MARKET_BUY_MAX_PRICE = 0.42
 CLOSE_TO_START_BPS = 14.0

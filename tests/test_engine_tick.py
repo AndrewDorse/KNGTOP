@@ -218,6 +218,26 @@ def test_tick_executes_full_fak_with_hedge(monkeypatch: pytest.MonkeyPatch) -> N
     assert clob.limit_calls == [(0.53, 5.0)]
 
 
+def test_tick_trades_only_once_per_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    start = int(datetime.now(timezone.utc).timestamp()) - 90
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
+    runner.start_px = 100_000.0
+    runner.trade_notional_usd = 4.15
+    runner.traded_rule_keys.add("close_buy_up")
+    clob = _FakeClobExec(100.0)
+    _tick_runner(
+        runner,
+        poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
+        binance=_FakeBinanceCombo(99_999.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state={},
+    )
+    assert clob.market_calls == []
+    assert clob.limit_calls == []
+
+
 def test_tick_does_not_mark_rule_traded_on_buy_error(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=False)
     start = int(datetime.now(timezone.utc).timestamp()) - 90

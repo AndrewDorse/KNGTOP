@@ -365,6 +365,8 @@ def _tick_runner(
             return
         if runner.trade_notional_usd <= 0:
             return
+        if runner.traded_rule_keys:
+            return
         now = datetime.now(timezone.utc)
         spot = binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec)
         if spot is None:
@@ -422,6 +424,7 @@ def _tick_runner(
                 continue
             runner.traded_rule_keys.add(rule.key)
             runner.executed_rule_sides[rule.key] = rule.side
+            break
 
 
 def _pairs_summary(cfg: KngtopConfig) -> str:
