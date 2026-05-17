@@ -57,7 +57,7 @@ def test_execute_buy_returns_true_on_success(monkeypatch: pytest.MonkeyPatch) ->
         hedge_price=0.53,
         market_buy_max_price=0.42,
     )
-    assert ok == (True, None)
+    assert ok == (True, None, "hedge123")
     assert clob.market_calls == 1
     assert clob.max_price == 0.42
     assert clob.hedge_orders == [(0.53, 5.0)]
@@ -77,7 +77,7 @@ def test_execute_buy_returns_false_on_error_without_retry(monkeypatch: pytest.Mo
         pm_trigger_px=0.30,
         market_buy_max_price=0.42,
     )
-    assert ok == (False, "error")
+    assert ok == (False, "error", None)
     assert clob.market_calls == 1
 
 
@@ -94,7 +94,7 @@ def test_execute_buy_uses_default_env_market_cap_when_no_override(monkeypatch: p
         spot_px=100_001.0,
         pm_trigger_px=0.30,
     )
-    assert ok == (True, None)
+    assert ok == (True, None, None)
     assert clob.market_calls == 1
     assert clob.max_price is None
 

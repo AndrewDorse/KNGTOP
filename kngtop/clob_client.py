@@ -27,6 +27,7 @@ from py_clob_client_v2 import (  # noqa: E402
     Side,
     TradeParams,
 )
+from py_clob_client_v2.clob_types import OrderPayload  # noqa: E402
 
 
 def _norm_tick(raw: str | None) -> str | None:
@@ -295,6 +296,10 @@ class KngtopClob:
         signed = self.client.create_order(order)
         return self.client.post_order(signed, OrderType.GTC)
 
+    def cancel_order_by_id(self, order_id: str) -> dict[str, Any]:
+        payload = self.client.cancel_order(OrderPayload(orderID=str(order_id)))
+        return payload if isinstance(payload, dict) else {}
+
     def limit_sell_shares(self, token: TokenMarket, *, price: float, shares: float) -> dict[str, Any]:
         sz = float(shares)
         px = float(price)
@@ -334,3 +339,11 @@ class KngtopClob:
     def get_order(self, order_id: str) -> dict[str, Any]:
         payload = self.client.get_order(order_id)
         return payload if isinstance(payload, dict) else {}
+
+    def is_order_open_for_asset(self, token: TokenMarket, order_id: str) -> bool:
+        oid = str(order_id)
+        for row in self.get_open_orders_for_asset(token):
+            row_id = str(row.get("id") or row.get("orderID") or row.get("order_id") or "")
+            if row_id == oid:
+                return True
+        return False

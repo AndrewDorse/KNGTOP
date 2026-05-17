@@ -12,6 +12,7 @@ from kngtop.config import KngtopConfig
 from kngtop.engine import (
     DISCOVERY_RETRY_SEC_WHEN_MISSING,
     ENTRY_SHARES,
+    FORCE_HEDGE_AGGRESSIVE_LIMIT_PRICE,
     HEDGE_SHARES,
     DiscoveryState,
     WindowRunner,
@@ -65,6 +66,8 @@ class _FakeClobExec(_FakeClobBalance):
         super().__init__(balance)
         self.market_calls: list[tuple[float, float | None]] = []
         self.limit_calls: list[tuple[float, float]] = []
+        self.canceled: list[str] = []
+        self.open_ids: set[str] = set()
 
     def market_buy_shares_fak(self, token: TokenMarket, *, shares: float, max_price: float | None = None):  # noqa: ANN201
         self.market_calls.append((shares, max_price))
@@ -72,7 +75,17 @@ class _FakeClobExec(_FakeClobBalance):
 
     def limit_buy_shares(self, token: TokenMarket, *, price: float, shares: float):  # noqa: ANN201
         self.limit_calls.append((price, shares))
-        return {"ok": True, "orderID": "hedge123"}
+        oid = f"hedge{len(self.limit_calls)}"
+        self.open_ids.add(oid)
+        return {"ok": True, "orderID": oid}
+
+    def cancel_order_by_id(self, order_id: str):  # noqa: ANN201
+        self.canceled.append(order_id)
+        self.open_ids.discard(order_id)
+        return {"canceled": order_id}
+
+    def is_order_open_for_asset(self, token: TokenMarket, order_id: str) -> bool:
+        return order_id in self.open_ids
 
 
 class _FakeClobPrewarm(_FakeClobBalance):
@@ -216,6 +229,7 @@ def test_tick_executes_full_fak_with_hedge(monkeypatch: pytest.MonkeyPatch) -> N
     assert "close_buy_up" in runner.traded_rule_keys
     assert clob.market_calls == [(5.0, 0.42)]
     assert clob.limit_calls == [(0.53, 5.0)]
+    assert runner.hedge_order_ids["close_buy_up"] == "hedge1"
 
 
 def test_tick_trades_only_once_per_window(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -236,6 +250,30 @@ def test_tick_trades_only_once_per_window(monkeypatch: pytest.MonkeyPatch) -> No
     )
     assert clob.market_calls == []
     assert clob.limit_calls == []
+
+
+def test_tick_forces_hedge_when_opposite_ask_hits_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    start = int(datetime.now(timezone.utc).timestamp()) - 90
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
+    runner.start_px = 100_000.0
+    runner.trade_notional_usd = 4.15
+    runner.traded_rule_keys.add("close_buy_up")
+    runner.executed_rule_sides["close_buy_up"] = "UP"
+    runner.hedge_order_ids["close_buy_up"] = "hedge-open"
+    clob = _FakeClobExec(100.0)
+    clob.open_ids.add("hedge-open")
+    _tick_runner(
+        runner,
+        poly=_FakePoly(ask_up=0.70, ask_dn=0.60),
+        binance=_FakeBinanceCombo(100_001.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state={},
+    )
+    assert clob.canceled == ["hedge-open"]
+    assert clob.limit_calls == [(FORCE_HEDGE_AGGRESSIVE_LIMIT_PRICE, 5.0)]
+    assert "close_buy_up" in runner.hedge_fallback_submitted
 
 
 def test_tick_does_not_mark_rule_traded_on_buy_error(monkeypatch: pytest.MonkeyPatch) -> None:
