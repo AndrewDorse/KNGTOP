@@ -6,16 +6,15 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-ENTRY_PRICE_MIN = 0.29
-ENTRY_PRICE_MAX = 0.42
-MARKET_BUY_MAX_PRICE = 0.44
-CLOSE_TO_START_BPS = 14.0
-HEDGE_PRICE_SUM = 0.83
-MIN_ELAPSED_SEC = 8
+ENTRY_PRICE_MIN = 0.28
+ENTRY_PRICE_MAX = 0.45
+MARKET_BUY_MAX_PRICE = 0.45
+MIN_ELAPSED_SEC = 30
+MAX_ELAPSED_SEC = 300
+RECLAIM_LOOKBACK_SEC = 40
 
 
-RuleKind = Literal["win_up", "win_dn"]
-RuleGroup = Literal["hedge"]
+RuleKind = Literal["reclaim_up", "reclaim_dn"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,29 +26,27 @@ class MispriceRule:
     cheap_max: float
     side: Literal["UP", "DOWN"]
     kind: RuleKind
-    group: RuleGroup = "hedge"
-    close_bps: float = CLOSE_TO_START_BPS
-    hedge_price_sum: float = HEDGE_PRICE_SUM
     min_elapsed_sec: int = MIN_ELAPSED_SEC
-    notional_fraction: float | None = None
+    max_elapsed_sec: int = MAX_ELAPSED_SEC
+    lookback_sec: int = RECLAIM_LOOKBACK_SEC
     market_buy_max_price: float | None = MARKET_BUY_MAX_PRICE
     retry_on_error_override: int | None = 0
 
 
 RULES_5M: tuple[MispriceRule, ...] = (
     MispriceRule(
-        "close_buy_up",
+        "reclaim_buy_up",
         price_min=ENTRY_PRICE_MIN,
         cheap_max=ENTRY_PRICE_MAX,
         side="UP",
-        kind="win_up",
+        kind="reclaim_up",
     ),
     MispriceRule(
-        "close_buy_down",
+        "reclaim_buy_down",
         price_min=ENTRY_PRICE_MIN,
         cheap_max=ENTRY_PRICE_MAX,
         side="DOWN",
-        kind="win_dn",
+        kind="reclaim_dn",
     ),
 )
 
@@ -67,8 +64,8 @@ def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
 
 
 def rule_fires(rule: MispriceRule, *, btc: float, start_btc: float, mid_up: float, mid_dn: float) -> bool:
-    if rule.kind == "win_up":
+    if rule.kind == "reclaim_up":
         return btc > start_btc and rule.price_min <= mid_up <= rule.cheap_max
-    if rule.kind == "win_dn":
+    if rule.kind == "reclaim_dn":
         return btc < start_btc and rule.price_min <= mid_dn <= rule.cheap_max
     return False

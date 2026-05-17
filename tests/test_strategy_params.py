@@ -5,11 +5,11 @@ from __future__ import annotations
 import pytest
 
 from kngtop.strategy_params import (
-    CLOSE_TO_START_BPS,
     ENTRY_PRICE_MAX,
     ENTRY_PRICE_MIN,
-    HEDGE_PRICE_SUM,
+    MAX_ELAPSED_SEC,
     MIN_ELAPSED_SEC,
+    RECLAIM_LOOKBACK_SEC,
     RULES_15M,
     RULES_5M,
     MispriceRule,
@@ -18,27 +18,27 @@ from kngtop.strategy_params import (
 )
 
 
-def test_rule_fires_win_up() -> None:
+def test_rule_fires_reclaim_up() -> None:
     r = MispriceRule(
-        "close_buy_up",
+        "reclaim_buy_up",
         price_min=ENTRY_PRICE_MIN,
         cheap_max=ENTRY_PRICE_MAX,
         side="UP",
-        kind="win_up",
+        kind="reclaim_up",
     )
     assert rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.35, mid_dn=0.70)
     assert not rule_fires(r, btc=100_000.0, start_btc=100_000.0, mid_up=0.35, mid_dn=0.70)
     assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.35, mid_dn=0.70)
-    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.45, mid_dn=0.70)
+    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.46, mid_dn=0.70)
 
 
-def test_rule_fires_win_down() -> None:
+def test_rule_fires_reclaim_down() -> None:
     r = MispriceRule(
-        "close_buy_down",
+        "reclaim_buy_down",
         price_min=ENTRY_PRICE_MIN,
         cheap_max=ENTRY_PRICE_MAX,
         side="DOWN",
-        kind="win_dn",
+        kind="reclaim_dn",
     )
     assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.35)
     assert not rule_fires(r, btc=100_000.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.35)
@@ -49,9 +49,9 @@ def test_rule_fires_win_down() -> None:
 def test_rules_count_and_defaults() -> None:
     assert len(RULES_5M) == 2
     assert len(RULES_15M) == 0
-    assert all(rule.close_bps == CLOSE_TO_START_BPS for rule in RULES_5M)
-    assert all(rule.hedge_price_sum == HEDGE_PRICE_SUM for rule in RULES_5M)
     assert all(rule.min_elapsed_sec == MIN_ELAPSED_SEC for rule in RULES_5M)
+    assert all(rule.max_elapsed_sec == MAX_ELAPSED_SEC for rule in RULES_5M)
+    assert all(rule.lookback_sec == RECLAIM_LOOKBACK_SEC for rule in RULES_5M)
 
 
 def test_rules_are_selected_for_btc_only() -> None:

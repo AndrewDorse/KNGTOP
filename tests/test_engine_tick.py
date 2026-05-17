@@ -14,23 +14,19 @@ from kngtop.engine import (
     ENTRY_BALANCE_FRACTION,
     ENTRY_MAX_NOTIONAL_USD,
     ENTRY_MIN_NOTIONAL_USD,
-    ENTRY_MIN_SHARES,
-    FINAL_FORCE_HEDGE_ELAPSED_SEC,
-    FORCE_HEDGE_DELAY_SEC,
     DiscoveryState,
     WindowRunner,
     _current_window_start_sec,
     _finalize_runner_window,
-    _maybe_manage_hedges,
     _planned_window_notional_usd,
     _run_iteration,
     _runner_matches_current_window,
+    _shares_for_budget,
     _should_discover_contract,
     _tick_runner,
-    _window_elapsed_ready,
 )
 from kngtop.gamma import ActiveContract, TokenMarket
-from kngtop.strategy_params import MIN_ELAPSED_SEC, RULES_5M
+from kngtop.strategy_params import MARKET_BUY_MAX_PRICE, MIN_ELAPSED_SEC, RULES_5M
 
 
 class _FakePoly:
@@ -69,28 +65,10 @@ class _FakeClobExec(_FakeClobBalance):
     def __init__(self, balance: float | None) -> None:
         super().__init__(balance)
         self.market_calls: list[tuple[float, float | None]] = []
-        self.limit_buy_calls: list[tuple[str, float, float]] = []
-        self.cancel_calls: list[str] = []
-        self.open_orders: dict[str, list[dict[str, str]]] = {}
 
     def market_buy_usdc(self, token: TokenMarket, *, usdc: float, max_price: float | None = None):  # noqa: ANN201
         self.market_calls.append((usdc, max_price))
         return {"ok": True, "orderID": "buy123"}
-
-    def limit_buy_shares(self, token: TokenMarket, *, price: float, shares: float):  # noqa: ANN201
-        self.limit_buy_calls.append((token.token_id, price, shares))
-        order_id = f"hedge_{len(self.limit_buy_calls)}"
-        self.open_orders.setdefault(token.token_id, []).append({"id": order_id})
-        return {"ok": True, "orderID": order_id}
-
-    def cancel_order_by_id(self, order_id: str):  # noqa: ANN201
-        self.cancel_calls.append(order_id)
-        for asset_id, rows in self.open_orders.items():
-            self.open_orders[asset_id] = [row for row in rows if row.get("id") != order_id]
-        return {"ok": True}
-
-    def get_open_orders_for_asset(self, token: TokenMarket):  # noqa: ANN201
-        return list(self.open_orders.get(token.token_id, []))
 
 
 class _FakeClobPrewarm(_FakeClobBalance):
@@ -121,12 +99,23 @@ def _cfg(monkeypatch: pytest.MonkeyPatch, *, dry_run: bool = True) -> KngtopConf
     return KngtopConfig.from_env()
 
 
-def test_tick_fires_winning_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg(monkeypatch, dry_run=True)
-    start = int(datetime.now(timezone.utc).timestamp()) - 90
+def _runner_for_start(start_offset_sec: int) -> WindowRunner:
+    start = int(datetime.now(timezone.utc).timestamp()) - start_offset_sec
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
     runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
+    return runner
+
+
+def test_tick_fires_reclaim_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=True)
+    runner = _runner_for_start(90)
+    runner.spot_history.extend(
+        [
+            (datetime.now(timezone.utc).timestamp() - 20, 99_999.0),
+            (datetime.now(timezone.utc).timestamp() - 10, 100_001.0),
+        ]
+    )
     _tick_runner(
         runner,
         poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
@@ -135,15 +124,18 @@ def test_tick_fires_winning_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
         cfg=cfg,
         runtime_state={},
     )
-    assert "close_buy_up" in runner.traded_rule_keys
+    assert "reclaim_buy_up" in runner.traded_rule_keys
 
 
-def test_tick_fires_winning_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_fires_reclaim_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
-    start = int(datetime.now(timezone.utc).timestamp()) - 90
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    runner.start_px = 100_000.0
-    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
+    runner = _runner_for_start(90)
+    runner.spot_history.extend(
+        [
+            (datetime.now(timezone.utc).timestamp() - 20, 100_001.0),
+            (datetime.now(timezone.utc).timestamp() - 10, 99_999.0),
+        ]
+    )
     _tick_runner(
         runner,
         poly=_FakePoly(ask_up=0.70, ask_dn=0.30),
@@ -152,35 +144,21 @@ def test_tick_fires_winning_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> Non
         cfg=cfg,
         runtime_state={},
     )
-    assert "close_buy_down" in runner.traded_rule_keys
+    assert "reclaim_buy_down" in runner.traded_rule_keys
 
 
-def test_tick_does_not_fire_when_spot_far_from_start(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_does_not_fire_without_prior_opposite_side(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
-    start = int(datetime.now(timezone.utc).timestamp()) - 90
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    runner.start_px = 100_000.0
-    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
+    runner = _runner_for_start(90)
+    runner.spot_history.extend(
+        [
+            (datetime.now(timezone.utc).timestamp() - 20, 100_000.5),
+            (datetime.now(timezone.utc).timestamp() - 10, 100_000.8),
+        ]
+    )
     _tick_runner(
         runner,
         poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
-        binance=_FakeBinanceCombo(100_300.0),
-        clob=None,
-        cfg=cfg,
-        runtime_state={},
-    )
-    assert not runner.traded_rule_keys
-
-
-def test_tick_does_not_fire_when_price_outside_band(monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg(monkeypatch, dry_run=True)
-    start = int(datetime.now(timezone.utc).timestamp()) - 90
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    runner.start_px = 100_000.0
-    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
-    _tick_runner(
-        runner,
-        poly=_FakePoly(ask_up=0.45, ask_dn=0.70),
         binance=_FakeBinanceCombo(100_001.0),
         clob=None,
         cfg=cfg,
@@ -189,162 +167,89 @@ def test_tick_does_not_fire_when_price_outside_band(monkeypatch: pytest.MonkeyPa
     assert not runner.traded_rule_keys
 
 
+def test_tick_does_not_fire_before_min_elapsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=True)
+    runner = _runner_for_start(MIN_ELAPSED_SEC - 1)
+    runner.spot_history.extend(
+        [
+            (datetime.now(timezone.utc).timestamp() - 20, 99_999.0),
+            (datetime.now(timezone.utc).timestamp() - 10, 100_001.0),
+        ]
+    )
+    _tick_runner(
+        runner,
+        poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
+        binance=_FakeBinanceCombo(100_001.0),
+        clob=None,
+        cfg=cfg,
+        runtime_state={},
+    )
+    assert not runner.traded_rule_keys
+
+
+def test_tick_executes_first_leg_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    runner = _runner_for_start(90)
+    runner.trade_notional_usd = 5.0
+    runner.spot_history.extend(
+        [
+            (datetime.now(timezone.utc).timestamp() - 20, 99_999.0),
+            (datetime.now(timezone.utc).timestamp() - 10, 100_001.0),
+        ]
+    )
+    clob = _FakeClobExec(100.0)
+    _tick_runner(
+        runner,
+        poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
+        binance=_FakeBinanceCombo(100_001.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state={},
+    )
+    assert "reclaim_buy_up" in runner.traded_rule_keys
+    assert clob.market_calls == [(5.0, MARKET_BUY_MAX_PRICE)]
+
+
+def test_tick_does_not_open_after_five_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    runner = _runner_for_start(301)
+    runner.trade_notional_usd = 5.0
+    runner.spot_history.extend(
+        [
+            (datetime.now(timezone.utc).timestamp() - 20, 99_999.0),
+            (datetime.now(timezone.utc).timestamp() - 10, 100_001.0),
+        ]
+    )
+    clob = _FakeClobExec(100.0)
+    _tick_runner(
+        runner,
+        poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
+        binance=_FakeBinanceCombo(100_001.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state={},
+    )
+    assert clob.market_calls == []
+
+
 def test_planned_window_notional_clamps_to_fraction_min_and_max(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
     assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=0.99) == 0.0
-    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=2.19) == 0.0
-    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10.0) == pytest.approx(ENTRY_MIN_SHARES * 0.44)
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=1.0) == pytest.approx(1.0)
     assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=100.0) == pytest.approx(100.0 * ENTRY_BALANCE_FRACTION)
     assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10_000.0) == pytest.approx(ENTRY_MAX_NOTIONAL_USD)
     assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=10.0) == 0.0
+
+
+def test_shares_for_budget_is_quantized_without_share_floor() -> None:
+    shares = _shares_for_budget(RULES_5M[0], budget_usd=1.0)
+    assert shares == pytest.approx(2.22)
 
 
 def test_normalize_usdc_balance_converts_base_units() -> None:
     assert _normalize_usdc_balance(28_812_657) == 28.812657
     assert _normalize_usdc_balance("28812657") == 28.812657
     assert _normalize_usdc_balance(50.25) == 50.25
-
-
-def test_window_elapsed_ready_blocks_early_window() -> None:
-    now = datetime.now(timezone.utc)
-    start = int(now.timestamp()) - (MIN_ELAPSED_SEC - 1)
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    assert not _window_elapsed_ready(runner, now)
-
-
-def test_window_elapsed_ready_allows_after_rule_min_elapsed() -> None:
-    now = datetime.now(timezone.utc)
-    start = int(now.timestamp()) - MIN_ELAPSED_SEC
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    assert _window_elapsed_ready(runner, now)
-
-
-def test_tick_executes_first_leg_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg(monkeypatch, dry_run=False)
-    start = int(datetime.now(timezone.utc).timestamp()) - 90
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    runner.start_px = 100_000.0
-    runner.trade_notional_usd = ENTRY_MIN_SHARES * 0.44
-    clob = _FakeClobExec(100.0)
-    _tick_runner(
-        runner,
-        poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
-        binance=_FakeBinanceCombo(100_001.0),
-        clob=clob,
-        cfg=cfg,
-        runtime_state={},
-    )
-    assert "close_buy_up" in runner.traded_rule_keys
-    assert clob.market_calls == [(ENTRY_MIN_SHARES * 0.44, 0.44)]
-    assert clob.limit_buy_calls == [("tid_dn", 0.53, ENTRY_MIN_SHARES)]
-
-
-def test_tick_trades_only_once_per_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg(monkeypatch, dry_run=False)
-    start = int(datetime.now(timezone.utc).timestamp()) - 90
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    runner.start_px = 100_000.0
-    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
-    runner.traded_rule_keys.add("close_buy_up")
-    clob = _FakeClobExec(100.0)
-    _tick_runner(
-        runner,
-        poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
-        binance=_FakeBinanceCombo(99_999.0),
-        clob=clob,
-        cfg=cfg,
-        runtime_state={},
-    )
-    assert clob.market_calls == []
-
-
-def test_tick_does_not_open_after_four_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg(monkeypatch, dry_run=False)
-    start = int(datetime.now(timezone.utc).timestamp()) - 241
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    runner.start_px = 100_000.0
-    runner.trade_notional_usd = ENTRY_MIN_SHARES * 0.44
-    clob = _FakeClobExec(100.0)
-    _tick_runner(
-        runner,
-        poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
-        binance=_FakeBinanceCombo(100_001.0),
-        clob=clob,
-        cfg=cfg,
-        runtime_state={},
-    )
-    assert clob.market_calls == []
-
-
-def test_force_hedge_after_180s_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg(monkeypatch, dry_run=False)
-    start = int(datetime.now(timezone.utc).timestamp()) - 250
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    rule = RULES_5M[0]
-    runner.traded_rule_keys.add(rule.key)
-    runner.executed_rule_sides[rule.key] = "UP"
-    runner.hedge_order_ids[rule.key] = "hedge_1"
-    runner.hedge_shares[rule.key] = ENTRY_MIN_SHARES
-    runner.hedge_entry_ts[rule.key] = datetime.now(timezone.utc).timestamp() - FORCE_HEDGE_DELAY_SEC
-    clob = _FakeClobExec(100.0)
-    clob.open_orders["tid_dn"] = [{"id": "hedge_1"}]
-    _maybe_manage_hedges(
-        runner,
-        clob=clob,
-        cfg=cfg,
-        now=datetime.now(timezone.utc),
-        ask_up=0.30,
-        ask_dn=0.60,
-    )
-    assert clob.cancel_calls == ["hedge_1"]
-    assert clob.limit_buy_calls[-1] == ("tid_dn", 0.99, ENTRY_MIN_SHARES)
-
-
-def test_force_hedge_thirty_seconds_before_end(monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg(monkeypatch, dry_run=False)
-    start = int(datetime.now(timezone.utc).timestamp()) - FINAL_FORCE_HEDGE_ELAPSED_SEC
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    rule = RULES_5M[0]
-    runner.traded_rule_keys.add(rule.key)
-    runner.executed_rule_sides[rule.key] = "UP"
-    runner.hedge_order_ids[rule.key] = "hedge_1"
-    runner.hedge_shares[rule.key] = ENTRY_MIN_SHARES
-    runner.hedge_entry_ts[rule.key] = datetime.now(timezone.utc).timestamp()
-    clob = _FakeClobExec(100.0)
-    clob.open_orders["tid_dn"] = [{"id": "hedge_1"}]
-    _maybe_manage_hedges(
-        runner,
-        clob=clob,
-        cfg=cfg,
-        now=datetime.now(timezone.utc),
-        ask_up=0.30,
-        ask_dn=0.40,
-    )
-    assert clob.cancel_calls == ["hedge_1"]
-    assert clob.limit_buy_calls[-1] == ("tid_dn", 0.99, ENTRY_MIN_SHARES)
-
-
-def test_tick_does_not_mark_rule_traded_on_buy_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg(monkeypatch, dry_run=False)
-    start = int(datetime.now(timezone.utc).timestamp()) - 90
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    runner.start_px = 100_000.0
-    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
-
-    class _FailingClob(_FakeClobBalance):
-        def market_buy_usdc(self, token: TokenMarket, *, usdc: float, max_price: float | None = None):  # noqa: ANN201
-            raise RuntimeError("market failed")
-
-    _tick_runner(
-        runner,
-        poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
-        binance=_FakeBinanceCombo(100_001.0),
-        clob=_FailingClob(100.0),
-        cfg=cfg,
-        runtime_state={},
-    )
-    assert "close_buy_up" not in runner.traded_rule_keys
-    assert runner.rule_retry_not_before["close_buy_up"] > 0.0
 
 
 def test_runner_matches_current_window() -> None:
@@ -396,7 +301,7 @@ def test_finalize_runner_window_logs_result(monkeypatch: pytest.MonkeyPatch) -> 
     cfg = _cfg(monkeypatch, dry_run=True)
     runner = WindowRunner("BTC", "BTCUSDT", _contract(), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.executed_rule_sides["close_buy_up"] = "UP"
+    runner.executed_rule_sides["reclaim_buy_up"] = "UP"
     with patch("kngtop.engine._event") as event_mock:
         _finalize_runner_window(runner, binance=_FakeBinanceCombo(100_010.0), cfg=cfg)
     event_mock.assert_called_once()
@@ -410,6 +315,9 @@ def test_run_iteration_prewarms_token_metadata_for_new_runner(monkeypatch: pytes
     class _FakeFeed:
         def set_assets(self, asset_ids):  # noqa: ANN201
             self.asset_ids = list(asset_ids)
+
+        def best_bid_ask_for(self, token_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            return None
 
     class _FakeBinance:
         def last_price(self, symbol: str, max_age_sec: float = 6.0) -> float | None:

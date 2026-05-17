@@ -28,15 +28,9 @@ MAX_SPOT_HISTORY_SEC = 180
 ENTRY_BALANCE_FRACTION = 0.05
 ENTRY_MIN_NOTIONAL_USD = 1.0
 ENTRY_MAX_NOTIONAL_USD = 200.0
-ENTRY_MIN_SHARES = 5.0
 DISCOVERY_RETRY_SEC_WHEN_MISSING = 15.0
 FAILED_RETRY_COOLDOWN_SEC = 2.0
 INSUFFICIENT_BALANCE_BACKOFF_SEC = 30.0
-MAX_ENTRY_ELAPSED_SEC = 240
-FORCE_HEDGE_DELAY_SEC = 180
-FORCE_HEDGE_THRESHOLD_PRICE = 0.60
-FINAL_FORCE_HEDGE_ELAPSED_SEC = 270
-FORCE_HEDGE_LIMIT_PRICE = 0.99
 
 
 @dataclass
@@ -52,10 +46,6 @@ class WindowRunner:
     traded_rule_keys: set[str] = field(default_factory=set)
     executed_rule_sides: dict[str, str] = field(default_factory=dict)
     rule_retry_not_before: dict[str, float] = field(default_factory=dict)
-    hedge_order_ids: dict[str, str] = field(default_factory=dict)
-    hedge_shares: dict[str, float] = field(default_factory=dict)
-    hedge_entry_ts: dict[str, float] = field(default_factory=dict)
-    hedge_done_rule_keys: set[str] = field(default_factory=set)
     spot_history: deque[tuple[float, float]] = field(default_factory=deque)
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -89,10 +79,7 @@ def _planned_window_notional_usd(
     rules = rules_for_asset(pair_key, window_minutes)
     if not rules:
         return 0.0
-    min_required_budget = max(
-        ENTRY_MIN_NOTIONAL_USD,
-        max(float(rule.market_buy_max_price or 0.0) for rule in rules) * ENTRY_MIN_SHARES,
-    )
+    min_required_budget = ENTRY_MIN_NOTIONAL_USD
     if available_balance_usdc is None:
         return min_required_budget
     if available_balance_usdc < min_required_budget:
@@ -116,7 +103,6 @@ def _shares_for_budget(rule: MispriceRule, *, budget_usd: float) -> float:
     raw_shares = float(budget_usd) / max_price
     # Keep order size within the budget while matching Polymarket amount precision.
     quantized = math.floor(raw_shares * 100.0) / 100.0
-    quantized = max(ENTRY_MIN_SHARES, quantized)
     return quantized if quantized >= 0.01 else 0.0
 
 
@@ -215,24 +201,31 @@ def _window_elapsed_sec(runner: WindowRunner, now: datetime) -> float | None:
 def _signal_ready(
     rule: MispriceRule,
     *,
+    now_ts: float,
     spot: float,
     start_px: float,
-    mid_up: float | None,
-    mid_dn: float | None,
+    ask_up: float | None,
+    ask_dn: float | None,
+    history: deque[tuple[float, float]],
 ) -> tuple[bool, float | None]:
     if start_px <= 0:
         return False, None
-    diff_bps = abs((spot - start_px) / start_px * 10_000.0)
-    if diff_bps > rule.close_bps:
-        return False, None
-    if rule.kind == "win_up":
-        if mid_up is None:
+    if rule.kind == "reclaim_up":
+        if ask_up is None or spot <= start_px:
             return False, None
-        return spot > start_px and rule.price_min <= mid_up <= rule.cheap_max, mid_up
-    if rule.kind == "win_dn":
-        if mid_dn is None:
+        reclaimed = any(
+            ts < now_ts and (now_ts - ts) <= rule.lookback_sec and hist_spot < start_px
+            for ts, hist_spot in history
+        )
+        return reclaimed and rule.price_min <= ask_up <= rule.cheap_max, ask_up
+    if rule.kind == "reclaim_dn":
+        if ask_dn is None or spot >= start_px:
             return False, None
-        return spot < start_px and rule.price_min <= mid_dn <= rule.cheap_max, mid_dn
+        reclaimed = any(
+            ts < now_ts and (now_ts - ts) <= rule.lookback_sec and hist_spot > start_px
+            for ts, hist_spot in history
+        )
+        return reclaimed and rule.price_min <= ask_dn <= rule.cheap_max, ask_dn
     return False, None
 
 
@@ -276,59 +269,6 @@ def _append_spot_history(runner: WindowRunner, *, now_ts: float, spot: float) ->
     cutoff = now_ts - MAX_SPOT_HISTORY_SEC
     while runner.spot_history and runner.spot_history[0][0] < cutoff:
         runner.spot_history.popleft()
-
-
-def _revert_signal_ready(
-    rule: MispriceRule,
-    *,
-    now_ts: float,
-    spot: float,
-    start_px: float,
-    trigger_px: float | None,
-    history: deque[tuple[float, float]],
-) -> bool:
-    if trigger_px is None or trigger_px > rule.cheap_max:
-        return False
-    if start_px <= 0:
-        return False
-    diff_bps = (spot - start_px) / start_px * 10_000.0
-    if rule.kind == "revert_up":
-        if diff_bps < 0.0 or diff_bps > rule.close_bps:
-            return False
-        return any(
-            ts < now_ts and now_ts - ts <= rule.lookback_sec and (hist_spot - start_px) / start_px * 10_000.0 >= rule.lead_bps
-            for ts, hist_spot in history
-        )
-    if rule.kind == "revert_dn":
-        if diff_bps > 0.0 or -diff_bps > rule.close_bps:
-            return False
-        return any(
-            ts < now_ts and now_ts - ts <= rule.lookback_sec and (hist_spot - start_px) / start_px * 10_000.0 <= -rule.lead_bps
-            for ts, hist_spot in history
-        )
-    return False
-
-
-def _flip_signal_ready(
-    rule: MispriceRule,
-    *,
-    now_ts: float,
-    spot: float,
-    start_px: float,
-    trigger_px: float | None,
-    history: deque[tuple[float, float]],
-) -> bool:
-    if trigger_px is None or trigger_px > rule.cheap_max or start_px <= 0:
-        return False
-    if rule.kind == "flip_up":
-        if spot <= start_px:
-            return False
-        return any(ts < now_ts and now_ts - ts <= rule.lookback_sec and hist_spot < start_px for ts, hist_spot in history)
-    if rule.kind == "flip_dn":
-        if spot >= start_px:
-            return False
-        return any(ts < now_ts and now_ts - ts <= rule.lookback_sec and hist_spot > start_px for ts, hist_spot in history)
-    return False
 
 
 def _execute_buy(
@@ -383,120 +323,6 @@ def _execute_buy(
     return True, None
 
 
-def _extract_order_id(payload: object) -> str | None:
-    if not isinstance(payload, dict):
-        return None
-    for key in ("orderID", "orderId", "id"):
-        value = payload.get(key)
-        if value:
-            return str(value)
-    return None
-
-
-def _post_natural_hedge(
-    clob: KngtopClob | None,
-    cfg: KngtopConfig,
-    runner: WindowRunner,
-    rule: MispriceRule,
-    *,
-    trigger_px: float,
-    shares: float,
-    now: datetime,
-) -> None:
-    if cfg.dry_run or clob is None:
-        runner.hedge_entry_ts[rule.key] = now.timestamp()
-        runner.hedge_shares[rule.key] = shares
-        return
-    hedge_side = _opposite_side(rule.side)
-    hedge_token = _pick_token(runner.contract, hedge_side)
-    hedge_price = min(max(float(rule.hedge_price_sum) - float(trigger_px), 0.01), 0.99)
-    hedge_price = round(hedge_price, 2)
-    payload = clob.limit_buy_shares(hedge_token, price=hedge_price, shares=shares)
-    hedge_order_id = _extract_order_id(payload)
-    if hedge_order_id is not None:
-        runner.hedge_order_ids[rule.key] = hedge_order_id
-    runner.hedge_entry_ts[rule.key] = now.timestamp()
-    runner.hedge_shares[rule.key] = shares
-
-
-def _hedge_order_still_open(clob: KngtopClob, runner: WindowRunner, rule: MispriceRule) -> bool:
-    order_id = runner.hedge_order_ids.get(rule.key)
-    if not order_id:
-        return False
-    hedge_side = _opposite_side(rule.side)
-    hedge_token = _pick_token(runner.contract, hedge_side)
-    try:
-        open_orders = clob.get_open_orders_for_asset(hedge_token)
-    except Exception as exc:  # noqa: BLE001
-        _event("ERROR", stage="hedge_open_orders", label=f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{hedge_side}", error=str(exc))
-        return True
-    for row in open_orders:
-        if str(row.get("id") or row.get("orderID") or row.get("orderId") or "") == order_id:
-            return True
-    return False
-
-
-def _force_hedge(
-    clob: KngtopClob,
-    runner: WindowRunner,
-    rule: MispriceRule,
-    *,
-    mark_done: bool = True,
-) -> None:
-    hedge_side = _opposite_side(rule.side)
-    hedge_token = _pick_token(runner.contract, hedge_side)
-    order_id = runner.hedge_order_ids.get(rule.key)
-    if order_id and _hedge_order_still_open(clob, runner, rule):
-        clob.cancel_order_by_id(order_id)
-    shares = runner.hedge_shares.get(rule.key, 0.0)
-    if shares <= 0:
-        return
-    clob.limit_buy_shares(hedge_token, price=FORCE_HEDGE_LIMIT_PRICE, shares=shares)
-    if mark_done:
-        runner.hedge_done_rule_keys.add(rule.key)
-
-
-def _maybe_manage_hedges(
-    runner: WindowRunner,
-    *,
-    clob: KngtopClob | None,
-    cfg: KngtopConfig,
-    now: datetime,
-    ask_up: float | None,
-    ask_dn: float | None,
-) -> None:
-    if cfg.dry_run or clob is None:
-        return
-    window_elapsed = _window_elapsed_sec(runner, now)
-    if window_elapsed is None:
-        return
-    for rule in runner.rules:
-        if rule.key not in runner.traded_rule_keys:
-            continue
-        if rule.key in runner.hedge_done_rule_keys:
-            continue
-        entry_ts = runner.hedge_entry_ts.get(rule.key)
-        if entry_ts is None:
-            continue
-        if runner.hedge_order_ids.get(rule.key):
-            if not _hedge_order_still_open(clob, runner, rule):
-                runner.hedge_done_rule_keys.add(rule.key)
-                continue
-        entry_elapsed = now.timestamp() - float(entry_ts)
-        opposite_ask = ask_dn if rule.side == "UP" else ask_up
-        should_force = False
-        if entry_elapsed >= FORCE_HEDGE_DELAY_SEC and opposite_ask is not None and float(opposite_ask) >= FORCE_HEDGE_THRESHOLD_PRICE:
-            should_force = True
-        if window_elapsed >= FINAL_FORCE_HEDGE_ELAPSED_SEC:
-            should_force = True
-        if not should_force:
-            continue
-        try:
-            _force_hedge(clob, runner, rule)
-        except Exception as exc:  # noqa: BLE001
-            _event("ERROR", stage="force_hedge", label=f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{_opposite_side(rule.side)}", error=str(exc))
-
-
 def _tick_runner(
     runner: WindowRunner | None,
     *,
@@ -524,18 +350,9 @@ def _tick_runner(
         quote_dn = poly.best_bid_ask_for(dn_id, max_age_sec=cfg.poly_mid_max_age_sec)
         ask_up = quote_up[1] if quote_up is not None else None
         ask_dn = quote_dn[1] if quote_dn is not None else None
-        _maybe_manage_hedges(
-            runner,
-            clob=clob,
-            cfg=cfg,
-            now=now,
-            ask_up=ask_up,
-            ask_dn=ask_dn,
-        )
         if runner.traded_rule_keys:
             return
         start = float(runner.start_px)
-        elapsed_ready = _window_elapsed_ready(runner, now)
         window_elapsed = _window_elapsed_sec(runner, now)
         now_monotonic = time.perf_counter()
         for rule in runner.rules:
@@ -545,16 +362,18 @@ def _tick_runner(
                 continue
             ready, trigger_px = _signal_ready(
                 rule,
+                now_ts=now.timestamp(),
                 spot=spot,
                 start_px=start,
-                mid_up=ask_up,
-                mid_dn=ask_dn,
+                ask_up=ask_up,
+                ask_dn=ask_dn,
+                history=runner.spot_history,
             )
             if not ready:
                 continue
-            if not elapsed_ready:
+            if window_elapsed is None:
                 continue
-            if window_elapsed is not None and window_elapsed > MAX_ENTRY_ELAPSED_SEC:
+            if window_elapsed < rule.min_elapsed_sec or window_elapsed > rule.max_elapsed_sec:
                 continue
             budget_usd = _rule_notional_usd(rule, runner)
             shares = _shares_for_budget(rule, budget_usd=budget_usd)
@@ -584,18 +403,6 @@ def _tick_runner(
                 continue
             runner.traded_rule_keys.add(rule.key)
             runner.executed_rule_sides[rule.key] = rule.side
-            try:
-                _post_natural_hedge(
-                    clob,
-                    cfg,
-                    runner,
-                    rule,
-                    trigger_px=float(trigger_px),
-                    shares=shares,
-                    now=now,
-                )
-            except Exception as exc:  # noqa: BLE001
-                _event("ERROR", stage="natural_hedge", label=label, error=str(exc))
             break
 
 
