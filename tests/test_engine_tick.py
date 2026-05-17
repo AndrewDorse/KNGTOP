@@ -11,7 +11,9 @@ from kngtop.clob_client import _normalize_usdc_balance
 from kngtop.config import KngtopConfig
 from kngtop.engine import (
     DISCOVERY_RETRY_SEC_WHEN_MISSING,
-    ENTRY_SHARES,
+    ENTRY_BALANCE_FRACTION,
+    ENTRY_MAX_NOTIONAL_USD,
+    ENTRY_MIN_NOTIONAL_USD,
     DiscoveryState,
     WindowRunner,
     _current_window_start_sec,
@@ -102,7 +104,7 @@ def test_tick_fires_winning_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     start = int(datetime.now(timezone.utc).timestamp()) - 90
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = ENTRY_SHARES * 0.42
+    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
     _tick_runner(
         runner,
         poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
@@ -119,7 +121,7 @@ def test_tick_fires_winning_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> Non
     start = int(datetime.now(timezone.utc).timestamp()) - 90
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = ENTRY_SHARES * 0.42
+    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
     _tick_runner(
         runner,
         poly=_FakePoly(ask_up=0.70, ask_dn=0.30),
@@ -136,7 +138,7 @@ def test_tick_does_not_fire_when_spot_far_from_start(monkeypatch: pytest.MonkeyP
     start = int(datetime.now(timezone.utc).timestamp()) - 90
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = ENTRY_SHARES * 0.42
+    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
     _tick_runner(
         runner,
         poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
@@ -153,7 +155,7 @@ def test_tick_does_not_fire_when_price_outside_band(monkeypatch: pytest.MonkeyPa
     start = int(datetime.now(timezone.utc).timestamp()) - 90
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = ENTRY_SHARES * 0.42
+    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
     _tick_runner(
         runner,
         poly=_FakePoly(ask_up=0.45, ask_dn=0.70),
@@ -165,10 +167,12 @@ def test_tick_does_not_fire_when_price_outside_band(monkeypatch: pytest.MonkeyPa
     assert not runner.traded_rule_keys
 
 
-def test_planned_window_notional_requires_first_leg_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_planned_window_notional_clamps_to_fraction_min_and_max(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
-    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10.0) == pytest.approx(2.10)
-    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=2.09) == 0.0
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=0.99) == 0.0
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10.0) == pytest.approx(ENTRY_MIN_NOTIONAL_USD)
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=100.0) == pytest.approx(100.0 * ENTRY_BALANCE_FRACTION)
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10_000.0) == pytest.approx(ENTRY_MAX_NOTIONAL_USD)
     assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=10.0) == 0.0
 
 
@@ -197,7 +201,7 @@ def test_tick_executes_first_leg_only(monkeypatch: pytest.MonkeyPatch) -> None:
     start = int(datetime.now(timezone.utc).timestamp()) - 90
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = 2.10
+    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
     clob = _FakeClobExec(100.0)
     _tick_runner(
         runner,
@@ -208,7 +212,7 @@ def test_tick_executes_first_leg_only(monkeypatch: pytest.MonkeyPatch) -> None:
         runtime_state={},
     )
     assert "close_buy_up" in runner.traded_rule_keys
-    assert clob.market_calls == [(5.0, 0.42)]
+    assert clob.market_calls == [(ENTRY_MIN_NOTIONAL_USD / 0.42, 0.42)]
 
 
 def test_tick_trades_only_once_per_window(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -216,7 +220,7 @@ def test_tick_trades_only_once_per_window(monkeypatch: pytest.MonkeyPatch) -> No
     start = int(datetime.now(timezone.utc).timestamp()) - 90
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = 2.10
+    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
     runner.traded_rule_keys.add("close_buy_up")
     clob = _FakeClobExec(100.0)
     _tick_runner(
@@ -235,7 +239,7 @@ def test_tick_does_not_mark_rule_traded_on_buy_error(monkeypatch: pytest.MonkeyP
     start = int(datetime.now(timezone.utc).timestamp()) - 90
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.trade_notional_usd = 2.10
+    runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
 
     class _FailingClob(_FakeClobBalance):
         def market_buy_shares_fak(self, token: TokenMarket, *, shares: float, max_price: float | None = None):  # noqa: ANN201
@@ -344,4 +348,4 @@ def test_run_iteration_prewarms_token_metadata_for_new_runner(monkeypatch: pytes
     assert contract.up.token_id in clob.prewarmed
     assert contract.down.token_id in clob.prewarmed
     assert runners[("BTC", 5)] is not None
-    assert runners[("BTC", 5)].trade_notional_usd == pytest.approx(2.10)
+    assert runners[("BTC", 5)].trade_notional_usd == pytest.approx(5.0)

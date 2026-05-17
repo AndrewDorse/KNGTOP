@@ -24,7 +24,9 @@ LOGGER = logging.getLogger("kngtop")
 WINDOWS_TO_TRADE: tuple[int, ...] = (5,)
 BOOT_WARMUP_DELAY_SEC = 0.0
 MAX_SPOT_HISTORY_SEC = 180
-ENTRY_SHARES = 5.0
+ENTRY_BALANCE_FRACTION = 0.05
+ENTRY_MIN_NOTIONAL_USD = 1.0
+ENTRY_MAX_NOTIONAL_USD = 200.0
 DISCOVERY_RETRY_SEC_WHEN_MISSING = 15.0
 FAILED_RETRY_COOLDOWN_SEC = 2.0
 INSUFFICIENT_BALANCE_BACKOFF_SEC = 30.0
@@ -76,18 +78,27 @@ def _planned_window_notional_usd(
     rules = rules_for_asset(pair_key, window_minutes)
     if not rules:
         return 0.0
-    floor_usd = ENTRY_SHARES * max(rule.market_buy_max_price for rule in rules)
     if available_balance_usdc is None:
-        return floor_usd
-    if available_balance_usdc < floor_usd:
+        return ENTRY_MIN_NOTIONAL_USD
+    if available_balance_usdc < ENTRY_MIN_NOTIONAL_USD:
         return 0.0
-    return floor_usd
+    budget_usd = available_balance_usdc * ENTRY_BALANCE_FRACTION
+    budget_usd = max(ENTRY_MIN_NOTIONAL_USD, budget_usd)
+    budget_usd = min(ENTRY_MAX_NOTIONAL_USD, budget_usd)
+    return float(budget_usd)
 
 
 def _rule_notional_usd(rule: MispriceRule, runner: WindowRunner) -> float:
     if rule.key in runner.rule_notional_usd:
         return float(runner.rule_notional_usd[rule.key])
     return float(runner.trade_notional_usd or 1.0)
+
+
+def _shares_for_budget(rule: MispriceRule, *, budget_usd: float) -> float:
+    max_price = float(rule.market_buy_max_price or 0.0)
+    if max_price <= 0:
+        return 0.0
+    return float(budget_usd) / max_price
 
 
 def _current_window_start_sec(now_ts: int, window_minutes: int) -> int:
@@ -388,12 +399,16 @@ def _tick_runner(
                 continue
             if not elapsed_ready:
                 continue
+            budget_usd = _rule_notional_usd(rule, runner)
+            shares = _shares_for_budget(rule, budget_usd=budget_usd)
+            if shares <= 0:
+                continue
             tok = _pick_token(runner.contract, rule.side)
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
             executed, reason = _execute_buy(
                 clob,
                 cfg,
-                ENTRY_SHARES,
+                shares,
                 tok,
                 label,
                 start_px=start,
