@@ -50,12 +50,12 @@ def test_execute_buy_returns_true_on_success(monkeypatch: pytest.MonkeyPatch) ->
         start_px=100_000.0,
         spot_px=100_001.0,
         pm_trigger_px=0.30,
-        market_buy_max_price=0.42,
+        market_buy_max_price=0.44,
     )
     assert ok == (True, None)
     assert clob.market_calls == 1
     assert clob.usdc == 1.0
-    assert clob.max_price == 0.42
+    assert clob.max_price == 0.44
 
 
 def test_execute_buy_returns_false_on_error_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -71,7 +71,7 @@ def test_execute_buy_returns_false_on_error_without_retry(monkeypatch: pytest.Mo
         start_px=100_000.0,
         spot_px=100_001.0,
         pm_trigger_px=0.30,
-        market_buy_max_price=0.42,
+        market_buy_max_price=0.44,
     )
     assert ok == (False, "error")
     assert clob.market_calls == 1
@@ -110,7 +110,7 @@ def test_execute_buy_logs_filled_elapsed(monkeypatch: pytest.MonkeyPatch) -> Non
             start_px=100_000.0,
             spot_px=100_001.0,
             pm_trigger_px=0.30,
-            market_buy_max_price=0.42,
+            market_buy_max_price=0.44,
         )
     kinds = [call.args[0] for call in event_mock.call_args_list]
     assert "START_DEAL" in kinds
@@ -130,7 +130,7 @@ def test_execute_buy_logs_not_filled_elapsed(monkeypatch: pytest.MonkeyPatch) ->
             start_px=100_000.0,
             spot_px=100_001.0,
             pm_trigger_px=0.30,
-            market_buy_max_price=0.42,
+            market_buy_max_price=0.44,
         )
     kinds = [call.args[0] for call in event_mock.call_args_list]
     assert "START_DEAL" in kinds
