@@ -19,13 +19,15 @@ class _FakeClobRetry:
         self.fail_times = fail_times
         self.market_calls = 0
         self.max_price: float | None = None
+        self.usdc: float | None = None
 
-    def market_buy_shares_fak(self, token: _FakeToken, *, shares: float, max_price: float | None = None):  # noqa: ANN201
+    def market_buy_usdc(self, token: _FakeToken, *, usdc: float, max_price: float | None = None):  # noqa: ANN201
         self.market_calls += 1
+        self.usdc = usdc
         self.max_price = max_price
         if self.market_calls <= self.fail_times:
             raise RuntimeError("simulated order error")
-        return {"ok": True, "orderID": "buy123", "calls": self.market_calls, "shares": shares, "token": token.token_id, "max_price": max_price}
+        return {"ok": True, "orderID": "buy123", "calls": self.market_calls, "usdc": usdc, "token": token.token_id, "max_price": max_price}
 
 def _cfg(monkeypatch: pytest.MonkeyPatch, *, dry_run: bool = False, retries: int = 2) -> KngtopConfig:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
@@ -42,6 +44,7 @@ def test_execute_buy_returns_true_on_success(monkeypatch: pytest.MonkeyPatch) ->
         clob,
         cfg,
         5.0,
+        1.0,
         _FakeToken(),
         "5m/close_buy_up/UP",
         start_px=100_000.0,
@@ -51,6 +54,7 @@ def test_execute_buy_returns_true_on_success(monkeypatch: pytest.MonkeyPatch) ->
     )
     assert ok == (True, None)
     assert clob.market_calls == 1
+    assert clob.usdc == 1.0
     assert clob.max_price == 0.42
 
 
@@ -61,6 +65,7 @@ def test_execute_buy_returns_false_on_error_without_retry(monkeypatch: pytest.Mo
         clob,
         cfg,
         5.0,
+        1.0,
         _FakeToken(),
         "5m/close_buy_up/UP",
         start_px=100_000.0,
@@ -79,6 +84,7 @@ def test_execute_buy_uses_default_env_market_cap_when_no_override(monkeypatch: p
         clob,
         cfg,
         5.0,
+        1.0,
         _FakeToken(),
         "5m/close_buy_up/UP",
         start_px=100_000.0,
@@ -98,6 +104,7 @@ def test_execute_buy_logs_filled_elapsed(monkeypatch: pytest.MonkeyPatch) -> Non
             clob,
             cfg,
             5.0,
+            1.0,
             _FakeToken(),
             "5m/close_buy_up/UP",
             start_px=100_000.0,
@@ -117,6 +124,7 @@ def test_execute_buy_logs_not_filled_elapsed(monkeypatch: pytest.MonkeyPatch) ->
             clob,
             cfg,
             5.0,
+            1.0,
             _FakeToken(),
             "5m/close_buy_up/UP",
             start_px=100_000.0,

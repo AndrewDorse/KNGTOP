@@ -66,8 +66,8 @@ class _FakeClobExec(_FakeClobBalance):
         super().__init__(balance)
         self.market_calls: list[tuple[float, float | None]] = []
 
-    def market_buy_shares_fak(self, token: TokenMarket, *, shares: float, max_price: float | None = None):  # noqa: ANN201
-        self.market_calls.append((shares, max_price))
+    def market_buy_usdc(self, token: TokenMarket, *, usdc: float, max_price: float | None = None):  # noqa: ANN201
+        self.market_calls.append((usdc, max_price))
         return {"ok": True, "orderID": "buy123"}
 
 
@@ -212,7 +212,7 @@ def test_tick_executes_first_leg_only(monkeypatch: pytest.MonkeyPatch) -> None:
         runtime_state={},
     )
     assert "close_buy_up" in runner.traded_rule_keys
-    assert clob.market_calls == [(2.38, 0.42)]
+    assert clob.market_calls == [(ENTRY_MIN_NOTIONAL_USD, 0.42)]
 
 
 def test_tick_trades_only_once_per_window(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -242,7 +242,7 @@ def test_tick_does_not_mark_rule_traded_on_buy_error(monkeypatch: pytest.MonkeyP
     runner.trade_notional_usd = ENTRY_MIN_NOTIONAL_USD
 
     class _FailingClob(_FakeClobBalance):
-        def market_buy_shares_fak(self, token: TokenMarket, *, shares: float, max_price: float | None = None):  # noqa: ANN201
+        def market_buy_usdc(self, token: TokenMarket, *, usdc: float, max_price: float | None = None):  # noqa: ANN201
             raise RuntimeError("market failed")
 
     _tick_runner(

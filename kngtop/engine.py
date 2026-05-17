@@ -309,6 +309,7 @@ def _execute_buy(
     clob: KngtopClob | None,
     cfg: KngtopConfig,
     shares: float,
+    budget_usd: float,
     token,
     label: str,
     *,
@@ -323,6 +324,7 @@ def _execute_buy(
         "START_DEAL",
         label=label,
         shares=str(shares_f),
+        budget_usd=f"{float(budget_usd):.10f}",
         start_px=f"{start_px:.10f}",
         spot_px=f"{spot_px:.10f}",
         pm_trigger_px=f"{pm_trigger_px:.10f}",
@@ -333,7 +335,7 @@ def _execute_buy(
     assert clob is not None
     started = time.perf_counter()
     try:
-        _ = clob.market_buy_shares_fak(token, shares=shares_f, max_price=market_buy_max_price)
+        _ = clob.market_buy_usdc(token, usdc=float(budget_usd), max_price=market_buy_max_price)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         lower_msg = msg.lower()
@@ -413,6 +415,7 @@ def _tick_runner(
                 clob,
                 cfg,
                 shares,
+                budget_usd,
                 tok,
                 label,
                 start_px=start,
