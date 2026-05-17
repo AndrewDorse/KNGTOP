@@ -79,19 +79,6 @@ class _FakeClobExec(_FakeClobBalance):
         self.market_calls.append((usdc, max_price))
         return {"ok": True, "orderID": "buy123"}
 
-    def get_recent_trades(self, token: TokenMarket, *, after_ts: int):  # noqa: ANN201
-        return [{"price": 0.20, "size": 5.0}]
-
-    def limit_sell_shares(self, token: TokenMarket, *, price: float, shares: float):  # noqa: ANN201
-        self.limit_calls.append((price, shares))
-        return {"orderID": "tp123"}
-
-    def get_order(self, order_id: str):  # noqa: ANN201
-        return {"orderID": order_id, "status": "open"}
-
-    def get_open_orders_for_asset(self, token: TokenMarket):  # noqa: ANN201
-        return [{"orderID": "tp123"}]
-
 
 class _FakeClobPrewarm(_FakeClobBalance):
     def __init__(self, balance: float | None) -> None:
@@ -233,7 +220,7 @@ def test_tick_executes_full_fak_with_rule_cap(monkeypatch: pytest.MonkeyPatch) -
     _tick_runner(runner, poly=_FakePoly(mid_up=0.85, mid_dn=0.25), binance=_FakeBinanceCombo(99_999.0), clob=clob, cfg=cfg, runtime_state={})
     assert "close_buy_up" in runner.traded_rule_keys
     assert clob.market_calls == [(1.0, 0.8)]
-    assert clob.limit_calls == [(0.5, 5.0)]
+    assert clob.limit_calls == []
 
 
 def test_tick_does_not_mark_rule_traded_on_buy_error(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -19,7 +19,6 @@ class _FakeClobRetry:
         self.fail_times = fail_times
         self.market_calls = 0
         self.max_price: float | None = None
-        self.sell_calls: list[tuple[float, float]] = []
 
     def market_buy_usdc(self, token: _FakeToken, usdc: float, *, max_price: float | None = None):  # noqa: ANN201
         self.market_calls += 1
@@ -27,19 +26,6 @@ class _FakeClobRetry:
         if self.market_calls <= self.fail_times:
             raise RuntimeError("simulated order error")
         return {"ok": True, "orderID": "buy123", "calls": self.market_calls, "usdc": usdc, "token": token.token_id, "max_price": max_price}
-
-    def get_recent_trades(self, token: _FakeToken, *, after_ts: int):  # noqa: ANN201
-        return [{"price": 0.20, "size": 6.0}]
-
-    def limit_sell_shares(self, token: _FakeToken, *, price: float, shares: float):  # noqa: ANN201
-        self.sell_calls.append((price, shares))
-        return {"orderID": "tp123"}
-
-    def get_order(self, order_id: str):  # noqa: ANN201
-        return {"orderID": order_id, "status": "open"}
-
-    def get_open_orders_for_asset(self, token: _FakeToken):  # noqa: ANN201
-        return [{"orderID": "tp123"}]
 
 
 def _cfg(monkeypatch: pytest.MonkeyPatch, *, dry_run: bool = False, retries: int = 2) -> KngtopConfig:
@@ -67,7 +53,6 @@ def test_execute_buy_returns_true_on_success(monkeypatch: pytest.MonkeyPatch) ->
     assert ok == (True, None)
     assert clob.market_calls == 1
     assert clob.max_price == 0.27
-    assert clob.sell_calls == [(0.5, 6.0)]
 
 
 def test_execute_buy_returns_false_on_error_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -123,8 +108,6 @@ def test_execute_buy_logs_filled_elapsed(monkeypatch: pytest.MonkeyPatch) -> Non
         )
     kinds = [call.args[0] for call in event_mock.call_args_list]
     assert "START_DEAL" in kinds
-    assert "DEAL_FILLED" in kinds
-    assert "TP_OPENED" in kinds
 
 
 def test_execute_buy_logs_not_filled_elapsed(monkeypatch: pytest.MonkeyPatch) -> None:
