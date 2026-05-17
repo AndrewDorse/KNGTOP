@@ -25,9 +25,6 @@ WINDOWS_TO_TRADE: tuple[int, ...] = (5,)
 BOOT_WARMUP_DELAY_SEC = 0.0
 MAX_SPOT_HISTORY_SEC = 180
 ENTRY_SHARES = 5.0
-HEDGE_SHARES = 5.0
-FORCE_HEDGE_CAP_PRICE = 0.60
-FORCE_HEDGE_AGGRESSIVE_LIMIT_PRICE = 0.99
 DISCOVERY_RETRY_SEC_WHEN_MISSING = 15.0
 FAILED_RETRY_COOLDOWN_SEC = 2.0
 INSUFFICIENT_BALANCE_BACKOFF_SEC = 30.0
@@ -46,9 +43,6 @@ class WindowRunner:
     traded_rule_keys: set[str] = field(default_factory=set)
     executed_rule_sides: dict[str, str] = field(default_factory=dict)
     rule_retry_not_before: dict[str, float] = field(default_factory=dict)
-    hedge_order_ids: dict[str, str] = field(default_factory=dict)
-    hedge_completion_noted: set[str] = field(default_factory=set)
-    hedge_fallback_submitted: set[str] = field(default_factory=set)
     spot_history: deque[tuple[float, float]] = field(default_factory=deque)
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -82,7 +76,7 @@ def _planned_window_notional_usd(
     rules = rules_for_asset(pair_key, window_minutes)
     if not rules:
         return 0.0
-    floor_usd = ENTRY_SHARES * max(rule.hedge_price_sum for rule in rules)
+    floor_usd = ENTRY_SHARES * max(rule.market_buy_max_price for rule in rules)
     if available_balance_usdc is None:
         return floor_usd
     if available_balance_usdc < floor_usd:
@@ -306,11 +300,9 @@ def _execute_buy(
     start_px: float,
     spot_px: float,
     pm_trigger_px: float,
-    hedge_token=None,
-    hedge_price: float | None = None,
     market_buy_max_price: float | None = None,
     retry_on_error_override: int | None = None,
-) -> tuple[bool, str | None, str | None]:
+) -> tuple[bool, str | None]:
     shares_f = float(shares)
     _event(
         "START_DEAL",
@@ -319,11 +311,10 @@ def _execute_buy(
         start_px=f"{start_px:.10f}",
         spot_px=f"{spot_px:.10f}",
         pm_trigger_px=f"{pm_trigger_px:.10f}",
-        hedge_px="none" if hedge_price is None else f"{float(hedge_price):.10f}",
         market_px_cap=f"{float(market_buy_max_price):.2f}" if market_buy_max_price is not None else "default",
     )
     if cfg.dry_run:
-        return True, None, None
+        return True, None
     assert clob is not None
     started = time.perf_counter()
     try:
@@ -345,56 +336,8 @@ def _execute_buy(
         )
         if reason != "no_match":
             _event("ERROR", stage="market_buy", label=label, error=msg)
-        return False, reason, None
-    hedge_order_id: str | None = None
-    if hedge_token is not None and hedge_price is not None:
-        try:
-            hedge_resp = clob.limit_buy_shares(hedge_token, price=float(hedge_price), shares=HEDGE_SHARES)
-            hedge_order_id = str(hedge_resp.get("orderID") or hedge_resp.get("id") or hedge_resp.get("order_id") or "")
-            if not hedge_order_id:
-                hedge_order_id = None
-        except Exception as exc:  # noqa: BLE001
-            _event("ERROR", stage="hedge_limit_buy", label=label, error=str(exc))
-    return True, None, hedge_order_id
-
-
-def _maybe_force_hedge(
-    runner: WindowRunner,
-    *,
-    clob: KngtopClob | None,
-    ask_up: float | None,
-    ask_dn: float | None,
-) -> None:
-    if clob is None:
-        return
-    for rule in runner.rules:
-        if rule.key not in runner.traded_rule_keys:
-            continue
-        if rule.key in runner.hedge_completion_noted or rule.key in runner.hedge_fallback_submitted:
-            continue
-        hedge_order_id = runner.hedge_order_ids.get(rule.key)
-        if not hedge_order_id:
-            continue
-        hedge_token = runner.contract.down if rule.side == "UP" else runner.contract.up
-        hedge_ask = ask_dn if rule.side == "UP" else ask_up
-        try:
-            is_open = clob.is_order_open_for_asset(hedge_token, hedge_order_id)
-        except Exception as exc:  # noqa: BLE001
-            _event("ERROR", stage="hedge_order_check", label=f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}", error=str(exc))
-            continue
-        if not is_open:
-            runner.hedge_completion_noted.add(rule.key)
-            continue
-        if hedge_ask is None or float(hedge_ask) > FORCE_HEDGE_CAP_PRICE:
-            continue
-        label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
-        try:
-            clob.cancel_order_by_id(hedge_order_id)
-            clob.limit_buy_shares(hedge_token, price=FORCE_HEDGE_AGGRESSIVE_LIMIT_PRICE, shares=HEDGE_SHARES)
-            runner.hedge_fallback_submitted.add(rule.key)
-            _event("RETRY_BUY", label=label, reason=f"force_hedge_cap_{FORCE_HEDGE_CAP_PRICE:.2f}")
-        except Exception as exc:  # noqa: BLE001
-            _event("ERROR", stage="force_hedge", label=label, error=str(exc))
+        return False, reason
+    return True, None
 
 
 def _tick_runner(
@@ -425,7 +368,6 @@ def _tick_runner(
         ask_up = quote_up[1] if quote_up is not None else None
         ask_dn = quote_dn[1] if quote_dn is not None else None
         if runner.traded_rule_keys:
-            _maybe_force_hedge(runner, clob=clob, ask_up=ask_up, ask_dn=ask_dn)
             return
         start = float(runner.start_px)
         elapsed_ready = _window_elapsed_ready(runner, now)
@@ -447,10 +389,8 @@ def _tick_runner(
             if not elapsed_ready:
                 continue
             tok = _pick_token(runner.contract, rule.side)
-            hedge_tok = runner.contract.down if rule.side == "UP" else runner.contract.up
-            hedge_price = max(0.01, min(0.99, round(rule.hedge_price_sum - float(trigger_px), 2)))
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
-            executed, reason, hedge_order_id = _execute_buy(
+            executed, reason = _execute_buy(
                 clob,
                 cfg,
                 ENTRY_SHARES,
@@ -459,8 +399,6 @@ def _tick_runner(
                 start_px=start,
                 spot_px=spot,
                 pm_trigger_px=float(trigger_px),
-                hedge_token=hedge_tok,
-                hedge_price=hedge_price,
                 market_buy_max_price=rule.market_buy_max_price,
                 retry_on_error_override=rule.retry_on_error_override,
             )
@@ -473,8 +411,6 @@ def _tick_runner(
                 continue
             runner.traded_rule_keys.add(rule.key)
             runner.executed_rule_sides[rule.key] = rule.side
-            if hedge_order_id:
-                runner.hedge_order_ids[rule.key] = hedge_order_id
             break
 
 
