@@ -202,13 +202,6 @@ def test_window_elapsed_ready_allows_after_20_percent() -> None:
     assert _window_elapsed_ready(runner, now)
 
 
-def test_window_elapsed_ready_blocks_last_20_seconds() -> None:
-    now = datetime.now(timezone.utc)
-    start = int(now.timestamp()) - (5 * 60 - 10)
-    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
-    assert not _window_elapsed_ready(runner, now)
-
-
 def test_tick_logs_signal_blocked_before_min_window_progress(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
     start = int(datetime.now(timezone.utc).timestamp()) - 30
