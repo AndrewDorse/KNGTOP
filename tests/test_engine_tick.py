@@ -212,7 +212,7 @@ def test_tick_executes_first_leg_only(monkeypatch: pytest.MonkeyPatch) -> None:
         runtime_state={},
     )
     assert "close_buy_up" in runner.traded_rule_keys
-    assert clob.market_calls == [(ENTRY_MIN_NOTIONAL_USD / 0.42, 0.42)]
+    assert clob.market_calls == [(2.38, 0.42)]
 
 
 def test_tick_trades_only_once_per_window(monkeypatch: pytest.MonkeyPatch) -> None:

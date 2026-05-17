@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import threading
 import time
@@ -98,7 +99,10 @@ def _shares_for_budget(rule: MispriceRule, *, budget_usd: float) -> float:
     max_price = float(rule.market_buy_max_price or 0.0)
     if max_price <= 0:
         return 0.0
-    return float(budget_usd) / max_price
+    raw_shares = float(budget_usd) / max_price
+    # Keep order size within the budget while matching Polymarket amount precision.
+    quantized = math.floor(raw_shares * 100.0) / 100.0
+    return quantized if quantized >= 0.01 else 0.0
 
 
 def _current_window_start_sec(now_ts: int, window_minutes: int) -> int:
