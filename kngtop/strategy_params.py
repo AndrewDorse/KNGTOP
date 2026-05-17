@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-CHEAP_PRICE_MAX = 0.21
-MARKET_BUY_MAX_PRICE = 0.23
+CHEAP_PRICE_MAX = 0.25
+MARKET_BUY_MAX_PRICE = 0.80
 CLOSE_TO_START_BPS = 999999.0
 
 
@@ -35,13 +35,13 @@ RULES_5M: tuple[MispriceRule, ...] = (
         "close_buy_up",
         cheap_max=CHEAP_PRICE_MAX,
         side="UP",
-        kind="lose_up",
+        kind="lose_dn",
     ),
     MispriceRule(
         "close_buy_down",
         cheap_max=CHEAP_PRICE_MAX,
         side="DOWN",
-        kind="lose_dn",
+        kind="lose_up",
     ),
 )
 
