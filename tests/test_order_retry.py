@@ -19,13 +19,18 @@ class _FakeClobRetry:
         self.fail_times = fail_times
         self.market_calls = 0
         self.max_price: float | None = None
+        self.hedge_orders: list[tuple[float, float]] = []
 
-    def market_buy_usdc(self, token: _FakeToken, usdc: float, *, max_price: float | None = None):  # noqa: ANN201
+    def market_buy_shares_fak(self, token: _FakeToken, *, shares: float, max_price: float | None = None):  # noqa: ANN201
         self.market_calls += 1
         self.max_price = max_price
         if self.market_calls <= self.fail_times:
             raise RuntimeError("simulated order error")
-        return {"ok": True, "orderID": "buy123", "calls": self.market_calls, "usdc": usdc, "token": token.token_id, "max_price": max_price}
+        return {"ok": True, "orderID": "buy123", "calls": self.market_calls, "shares": shares, "token": token.token_id, "max_price": max_price}
+
+    def limit_buy_shares(self, token: _FakeToken, *, price: float, shares: float):  # noqa: ANN201
+        self.hedge_orders.append((price, shares))
+        return {"ok": True, "orderID": "hedge123"}
 
 
 def _cfg(monkeypatch: pytest.MonkeyPatch, *, dry_run: bool = False, retries: int = 2) -> KngtopConfig:
@@ -42,17 +47,20 @@ def test_execute_buy_returns_true_on_success(monkeypatch: pytest.MonkeyPatch) ->
     ok = _execute_buy(
         clob,
         cfg,
-        1.0,
+        5.0,
         _FakeToken(),
         "5m/close_buy_up/UP",
         start_px=100_000.0,
         spot_px=100_001.0,
-        pm_trigger_px=0.25,
-        market_buy_max_price=0.27,
+        pm_trigger_px=0.30,
+        hedge_token=_FakeToken(),
+        hedge_price=0.53,
+        market_buy_max_price=0.42,
     )
     assert ok == (True, None)
     assert clob.market_calls == 1
-    assert clob.max_price == 0.27
+    assert clob.max_price == 0.42
+    assert clob.hedge_orders == [(0.53, 5.0)]
 
 
 def test_execute_buy_returns_false_on_error_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -61,13 +69,13 @@ def test_execute_buy_returns_false_on_error_without_retry(monkeypatch: pytest.Mo
     ok = _execute_buy(
         clob,
         cfg,
-        1.0,
+        5.0,
         _FakeToken(),
         "5m/close_buy_up/UP",
         start_px=100_000.0,
         spot_px=100_001.0,
-        pm_trigger_px=0.25,
-        market_buy_max_price=0.27,
+        pm_trigger_px=0.30,
+        market_buy_max_price=0.42,
     )
     assert ok == (False, "error")
     assert clob.market_calls == 1
@@ -79,12 +87,12 @@ def test_execute_buy_uses_default_env_market_cap_when_no_override(monkeypatch: p
     ok = _execute_buy(
         clob,
         cfg,
-        1.0,
+        5.0,
         _FakeToken(),
         "5m/close_buy_up/UP",
         start_px=100_000.0,
         spot_px=100_001.0,
-        pm_trigger_px=0.25,
+        pm_trigger_px=0.30,
     )
     assert ok == (True, None)
     assert clob.market_calls == 1
@@ -98,13 +106,15 @@ def test_execute_buy_logs_filled_elapsed(monkeypatch: pytest.MonkeyPatch) -> Non
         _execute_buy(
             clob,
             cfg,
-            1.0,
+            5.0,
             _FakeToken(),
             "5m/close_buy_up/UP",
             start_px=100_000.0,
             spot_px=100_001.0,
-            pm_trigger_px=0.25,
-            market_buy_max_price=0.27,
+            pm_trigger_px=0.30,
+            hedge_token=_FakeToken(),
+            hedge_price=0.53,
+            market_buy_max_price=0.42,
         )
     kinds = [call.args[0] for call in event_mock.call_args_list]
     assert "START_DEAL" in kinds
@@ -117,13 +127,13 @@ def test_execute_buy_logs_not_filled_elapsed(monkeypatch: pytest.MonkeyPatch) ->
         _execute_buy(
             clob,
             cfg,
-            1.0,
+            5.0,
             _FakeToken(),
             "5m/close_buy_up/UP",
             start_px=100_000.0,
             spot_px=100_001.0,
-            pm_trigger_px=0.25,
-            market_buy_max_price=0.27,
+            pm_trigger_px=0.30,
+            market_buy_max_price=0.42,
         )
     kinds = [call.args[0] for call in event_mock.call_args_list]
     assert "START_DEAL" in kinds

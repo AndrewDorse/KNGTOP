@@ -218,6 +218,38 @@ class KngtopClob:
         with self._taker_lock:
             return self._create_and_post_market_order(margs, options=opts)
 
+    def market_buy_shares_fak(
+        self, token: TokenMarket, *, shares: float, max_price: float | None = None
+    ) -> dict[str, Any]:
+        sz = float(shares)
+        if sz <= 0:
+            raise ValueError("shares must be > 0")
+        opts = self._book_opts(token)
+        tick_raw = (
+            _norm_tick(self.client.get_tick_size(token.token_id))
+            if opts is None or opts.tick_size is None
+            else _norm_tick(opts.tick_size)
+        )
+        tick_f = float(tick_raw or "0.01")
+        hi = 1.0 - tick_f
+        raw_price_cap = self._market_buy_max_price if max_price is None else float(max_price)
+        price_cap = min(max(raw_price_cap, tick_f), hi)
+        order = OrderArgs(
+            token_id=token.token_id,
+            price=round(price_cap, 2),
+            size=sz,
+            side=self._buy,
+        )
+        create_and_post = getattr(self.client, "create_and_post_order", None)
+        with self._taker_lock:
+            if callable(create_and_post):
+                try:
+                    return create_and_post(order_args=order, options=None, order_type=OrderType.FAK, post_only=False)
+                except TypeError:
+                    return create_and_post(order, None, OrderType.FAK)
+            signed = self.client.create_order(order)
+            return self.client.post_order(signed, OrderType.FAK)
+
     def limit_buy(self, token: TokenMarket, *, price: float, usdc: float) -> dict[str, Any]:
         u = float(usdc)
         px = float(price)
@@ -230,6 +262,28 @@ class KngtopClob:
             token_id=token.token_id,
             price=round(px, 2),
             size=float(size),
+            side=self._buy,
+        )
+        create_and_post = getattr(self.client, "create_and_post_order", None)
+        if callable(create_and_post):
+            try:
+                return create_and_post(order_args=order, options=None, order_type=OrderType.GTC, post_only=False)
+            except TypeError:
+                return create_and_post(order, None, OrderType.GTC)
+        signed = self.client.create_order(order)
+        return self.client.post_order(signed, OrderType.GTC)
+
+    def limit_buy_shares(self, token: TokenMarket, *, price: float, shares: float) -> dict[str, Any]:
+        sz = float(shares)
+        px = float(price)
+        if sz <= 0:
+            raise ValueError("shares must be > 0")
+        if px <= 0 or px >= 1:
+            raise ValueError("price must be between 0 and 1")
+        order = OrderArgs(
+            token_id=token.token_id,
+            price=round(px, 2),
+            size=sz,
             side=self._buy,
         )
         create_and_post = getattr(self.client, "create_and_post_order", None)

@@ -21,24 +21,14 @@ from kngtop.rest_poll import run_ws_rest_fallback_loop
 from kngtop.ws_market import MarketWsFeed
 
 LOGGER = logging.getLogger("kngtop")
-BALANCE_NOTIONAL_FRACTION = 0.05
-ALT_BALANCE_NOTIONAL_FRACTION = 0.05
 WINDOWS_TO_TRADE: tuple[int, ...] = (5,)
-ALT_BALANCE_ASSETS = frozenset({"DOGE", "BNB", "HYPE", "LINK"})
-MIN_WINDOW_PROGRESS_FRACTION = 0.20
-ENTRY_MARKET_FRACTION = 0.50
-ENTRY_LIMIT_FRACTION = 0.50
-ENTRY_LIMIT_PRICE = 0.20
 BOOT_WARMUP_DELAY_SEC = 0.0
 MAX_SPOT_HISTORY_SEC = 180
-MIN_MARKET_BUY_USDC = 1.25
-MIN_LIMIT_SHARES = 5.0
+ENTRY_SHARES = 5.0
+HEDGE_SHARES = 5.0
 DISCOVERY_RETRY_SEC_WHEN_MISSING = 15.0
 FAILED_RETRY_COOLDOWN_SEC = 2.0
 INSUFFICIENT_BALANCE_BACKOFF_SEC = 30.0
-TP_MULTIPLIER = 2.5
-TP_MAX_PRICE = 0.50
-TP_RETRY_SEC = 0.5
 
 
 @dataclass
@@ -84,15 +74,15 @@ def _planned_window_notional_usd(
     window_minutes: int,
     available_balance_usdc: float | None,
 ) -> float:
-    floor_usd = max(MIN_MARKET_BUY_USDC, float(cfg.notional_usd))
-    if int(window_minutes) >= 60:
-        return floor_usd
+    rules = rules_for_asset(pair_key, window_minutes)
+    if not rules:
+        return 0.0
+    floor_usd = ENTRY_SHARES * max(rule.hedge_price_sum for rule in rules)
     if available_balance_usdc is None:
         return floor_usd
     if available_balance_usdc < floor_usd:
         return 0.0
-    frac = ALT_BALANCE_NOTIONAL_FRACTION if pair_key.upper() in ALT_BALANCE_ASSETS else BALANCE_NOTIONAL_FRACTION
-    return max(floor_usd, available_balance_usdc * frac)
+    return floor_usd
 
 
 def _rule_notional_usd(rule: MispriceRule, runner: WindowRunner) -> float:
@@ -155,7 +145,7 @@ def _setup_logging(level: str) -> None:
 
 
 def _event(kind: str, **fields: object) -> None:
-    if kind not in {"INIT", "START_DEAL", "RETRY_BUY", "DEAL_WINDOW_CLOSED", "ERROR", "DEAL_FILLED", "TP_RETRY", "TP_OPENED"}:
+    if kind not in {"INIT", "BOOT_DELAY", "START_DEAL", "RETRY_BUY", "DEAL_WINDOW_CLOSED", "ERROR"}:
         return
     parts = [f"{k}={v}" for k, v in fields.items()]
     print(f"{kind} " + " ".join(parts), flush=True)
@@ -178,7 +168,7 @@ def _window_elapsed_ready(runner: WindowRunner, now: datetime) -> bool:
     if start_ts is None:
         return False
     elapsed = now.timestamp() - float(start_ts)
-    min_elapsed = float(runner.window_minutes) * 60.0 * MIN_WINDOW_PROGRESS_FRACTION
+    min_elapsed = min((rule.min_elapsed_sec for rule in runner.rules), default=0)
     return elapsed >= min_elapsed
 
 
@@ -190,14 +180,19 @@ def _signal_ready(
     mid_up: float | None,
     mid_dn: float | None,
 ) -> tuple[bool, float | None]:
-    if rule.kind == "lose_up":
+    if start_px <= 0:
+        return False, None
+    diff_bps = abs((spot - start_px) / start_px * 10_000.0)
+    if diff_bps > rule.close_bps:
+        return False, None
+    if rule.kind == "win_up":
         if mid_up is None:
             return False, None
-        return spot >= start_px and mid_up <= rule.cheap_max, mid_up
-    if rule.kind == "lose_dn":
+        return spot > start_px and rule.price_min <= mid_up <= rule.cheap_max, mid_up
+    if rule.kind == "win_dn":
         if mid_dn is None:
             return False, None
-        return spot <= start_px and mid_dn <= rule.cheap_max, mid_dn
+        return spot < start_px and rule.price_min <= mid_dn <= rule.cheap_max, mid_dn
     return False, None
 
 
@@ -299,25 +294,27 @@ def _flip_signal_ready(
 def _execute_buy(
     clob: KngtopClob | None,
     cfg: KngtopConfig,
-    usdc: float,
+    shares: float,
     token,
     label: str,
     *,
     start_px: float,
     spot_px: float,
     pm_trigger_px: float,
+    hedge_token=None,
+    hedge_price: float | None = None,
     market_buy_max_price: float | None = None,
     retry_on_error_override: int | None = None,
 ) -> tuple[bool, str | None]:
-    usdc_f = float(usdc)
-    market_usdc = usdc_f
+    shares_f = float(shares)
     _event(
         "START_DEAL",
         label=label,
-        notional=str(usdc_f),
+        shares=str(shares_f),
         start_px=f"{start_px:.10f}",
         spot_px=f"{spot_px:.10f}",
         pm_trigger_px=f"{pm_trigger_px:.10f}",
+        hedge_px="none" if hedge_price is None else f"{float(hedge_price):.10f}",
         market_px_cap=f"{float(market_buy_max_price):.2f}" if market_buy_max_price is not None else "default",
     )
     if cfg.dry_run:
@@ -325,7 +322,7 @@ def _execute_buy(
     assert clob is not None
     started = time.perf_counter()
     try:
-        _ = clob.market_buy_usdc(token, market_usdc, max_price=market_buy_max_price)
+        _ = clob.market_buy_shares_fak(token, shares=shares_f, max_price=market_buy_max_price)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         lower_msg = msg.lower()
@@ -344,6 +341,11 @@ def _execute_buy(
         if reason != "no_match":
             _event("ERROR", stage="market_buy", label=label, error=msg)
         return False, reason
+    if hedge_token is not None and hedge_price is not None:
+        try:
+            clob.limit_buy_shares(hedge_token, price=float(hedge_price), shares=HEDGE_SHARES)
+        except Exception as exc:  # noqa: BLE001
+            _event("ERROR", stage="hedge_limit_buy", label=label, error=str(exc))
     return True, None
 
 
@@ -361,7 +363,7 @@ def _tick_runner(
     with runner._exec_lock:
         if runner.start_px is None or runner.trade_notional_usd is None:
             return
-        if runner.trade_notional_usd < MIN_MARKET_BUY_USDC:
+        if runner.trade_notional_usd <= 0:
             return
         now = datetime.now(timezone.utc)
         spot = binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec)
@@ -392,26 +394,22 @@ def _tick_runner(
             if not ready:
                 continue
             if not elapsed_ready:
-                _event(
-                    "SIGNAL_BLOCKED",
-                    label=f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}",
-                    reason="min_window_progress",
-                    start_px=f"{start:.10f}",
-                    spot_px=f"{spot:.10f}",
-                    pm_trigger_px=f"{float(trigger_px):.10f}",
-                )
                 continue
             tok = _pick_token(runner.contract, rule.side)
+            hedge_tok = runner.contract.down if rule.side == "UP" else runner.contract.up
+            hedge_price = max(0.01, min(0.99, round(rule.hedge_price_sum - float(trigger_px), 2)))
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
             executed, reason = _execute_buy(
                 clob,
                 cfg,
-                _rule_notional_usd(rule, runner),
+                ENTRY_SHARES,
                 tok,
                 label,
                 start_px=start,
                 spot_px=spot,
                 pm_trigger_px=float(trigger_px),
+                hedge_token=hedge_tok,
+                hedge_price=hedge_price,
                 market_buy_max_price=rule.market_buy_max_price,
                 retry_on_error_override=rule.retry_on_error_override,
             )
@@ -508,16 +506,6 @@ def _run_iteration(
             window_minutes=rv.window_minutes,
             available_balance_usdc=available_balance_usdc,
         )
-        fallback_usd = float(rv.trade_notional_usd or max(MIN_MARKET_BUY_USDC, float(cfg.notional_usd)))
-        rv.rule_notional_usd.clear()
-        for rule in rv.rules:
-            if rule.notional_fraction is None:
-                rv.rule_notional_usd[rule.key] = fallback_usd
-            else:
-                rv.rule_notional_usd[rule.key] = max(
-                    MIN_MARKET_BUY_USDC,
-                    fallback_usd * (float(rule.notional_fraction) / BALANCE_NOTIONAL_FRACTION),
-                )
         if clob is not None:
             clob.prewarm_market_metadata(rv.contract.up)
             clob.prewarm_market_metadata(rv.contract.down)
