@@ -5,12 +5,17 @@ from __future__ import annotations
 import pytest
 
 from kngtop.strategy_params import (
-    ENTRY_PRICE_MAX,
-    ENTRY_PRICE_MIN,
-    MAX_ELAPSED_SEC,
-    MIN_ELAPSED_SEC,
+    ENTRY_PRICE_MAX_15M,
+    ENTRY_PRICE_MAX_5M,
+    ENTRY_PRICE_MIN_15M,
+    ENTRY_PRICE_MIN_5M,
+    MAX_ELAPSED_SEC_15M,
+    MAX_ELAPSED_SEC_5M,
+    MIN_ELAPSED_SEC_15M,
+    MIN_ELAPSED_SEC_5M,
     RECLAIM_GAP_MIN,
-    RECLAIM_LOOKBACK_SEC,
+    RECLAIM_LOOKBACK_SEC_15M,
+    RECLAIM_LOOKBACK_SEC_5M,
     RULES_15M,
     RULES_5M,
     MispriceRule,
@@ -22,8 +27,8 @@ from kngtop.strategy_params import (
 def test_rule_fires_reclaim_up() -> None:
     r = MispriceRule(
         "reclaim_buy_up",
-        price_min=ENTRY_PRICE_MIN,
-        cheap_max=ENTRY_PRICE_MAX,
+        price_min=ENTRY_PRICE_MIN_5M,
+        cheap_max=ENTRY_PRICE_MAX_5M,
         side="UP",
         kind="reclaim_up",
     )
@@ -37,8 +42,8 @@ def test_rule_fires_reclaim_up() -> None:
 def test_rule_fires_reclaim_down() -> None:
     r = MispriceRule(
         "reclaim_buy_down",
-        price_min=ENTRY_PRICE_MIN,
-        cheap_max=ENTRY_PRICE_MAX,
+        price_min=ENTRY_PRICE_MIN_5M,
+        cheap_max=ENTRY_PRICE_MAX_5M,
         side="DOWN",
         kind="reclaim_dn",
     )
@@ -51,11 +56,19 @@ def test_rule_fires_reclaim_down() -> None:
 
 def test_rules_count_and_defaults() -> None:
     assert len(RULES_5M) == 2
-    assert len(RULES_15M) == 0
-    assert all(rule.min_elapsed_sec == MIN_ELAPSED_SEC for rule in RULES_5M)
-    assert all(rule.max_elapsed_sec == MAX_ELAPSED_SEC for rule in RULES_5M)
-    assert all(rule.lookback_sec == RECLAIM_LOOKBACK_SEC for rule in RULES_5M)
+    assert len(RULES_15M) == 2
+    assert all(rule.min_elapsed_sec == MIN_ELAPSED_SEC_5M for rule in RULES_5M)
+    assert all(rule.max_elapsed_sec == MAX_ELAPSED_SEC_5M for rule in RULES_5M)
+    assert all(rule.lookback_sec == RECLAIM_LOOKBACK_SEC_5M for rule in RULES_5M)
+    assert all(rule.price_min == ENTRY_PRICE_MIN_5M for rule in RULES_5M)
+    assert all(rule.cheap_max == ENTRY_PRICE_MAX_5M for rule in RULES_5M)
+    assert all(rule.min_elapsed_sec == MIN_ELAPSED_SEC_15M for rule in RULES_15M)
+    assert all(rule.max_elapsed_sec == MAX_ELAPSED_SEC_15M for rule in RULES_15M)
+    assert all(rule.lookback_sec == RECLAIM_LOOKBACK_SEC_15M for rule in RULES_15M)
+    assert all(rule.price_min == ENTRY_PRICE_MIN_15M for rule in RULES_15M)
+    assert all(rule.cheap_max == ENTRY_PRICE_MAX_15M for rule in RULES_15M)
     assert all(rule.gap_min == RECLAIM_GAP_MIN for rule in RULES_5M)
+    assert all(rule.gap_min == RECLAIM_GAP_MIN for rule in RULES_15M)
 
 
 def test_rules_are_selected_for_btc_only() -> None:

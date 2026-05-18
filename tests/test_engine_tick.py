@@ -26,7 +26,7 @@ from kngtop.engine import (
     _tick_runner,
 )
 from kngtop.gamma import ActiveContract, TokenMarket
-from kngtop.strategy_params import MARKET_BUY_MAX_PRICE, MIN_ELAPSED_SEC, RULES_5M
+from kngtop.strategy_params import MARKET_BUY_MAX_PRICE, MIN_ELAPSED_SEC_5M, RULES_5M, RULES_15M
 
 
 class _FakePoly:
@@ -189,7 +189,7 @@ def test_tick_does_not_fire_when_gap_too_small(monkeypatch: pytest.MonkeyPatch) 
 
 def test_tick_does_not_fire_before_min_elapsed(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
-    runner = _runner_for_start(MIN_ELAPSED_SEC - 1)
+    runner = _runner_for_start(MIN_ELAPSED_SEC_5M - 1)
     runner.spot_history.extend(
         [
             (datetime.now(timezone.utc).timestamp() - 20, 99_999.0),
@@ -366,4 +366,11 @@ def test_run_iteration_prewarms_token_metadata_for_new_runner(monkeypatch: pytes
     assert contract.up.token_id in clob.prewarmed
     assert contract.down.token_id in clob.prewarmed
     assert runners[("BTC", 5)] is not None
+    assert runners[("BTC", 15)] is not None
     assert runners[("BTC", 5)].trade_notional_usd == pytest.approx(5.0)
+
+
+def test_15m_rules_are_available_for_runner() -> None:
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug="btc-updown-15m-1777900500"), 15, RULES_15M)
+    assert len(runner.rules) == 2
+    assert all(rule.min_elapsed_sec >= 180 for rule in runner.rules)

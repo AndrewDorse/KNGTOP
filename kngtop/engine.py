@@ -22,7 +22,7 @@ from kngtop.rest_poll import run_ws_rest_fallback_loop
 from kngtop.ws_market import MarketWsFeed
 
 LOGGER = logging.getLogger("kngtop")
-WINDOWS_TO_TRADE: tuple[int, ...] = (5,)
+WINDOWS_TO_TRADE: tuple[int, ...] = (5, 15)
 BOOT_WARMUP_DELAY_SEC = 0.0
 MAX_SPOT_HISTORY_SEC = 180
 ENTRY_BALANCE_FRACTION = 0.05
