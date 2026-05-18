@@ -210,8 +210,11 @@ def _signal_ready(
 ) -> tuple[bool, float | None]:
     if start_px <= 0:
         return False, None
+    gap = abs((ask_up or 0.0) - (ask_dn or 0.0)) if ask_up is not None and ask_dn is not None else None
     if rule.kind == "reclaim_up":
         if ask_up is None or spot <= start_px:
+            return False, None
+        if gap is None or gap < rule.gap_min:
             return False, None
         reclaimed = any(
             ts < now_ts and (now_ts - ts) <= rule.lookback_sec and hist_spot < start_px
@@ -220,6 +223,8 @@ def _signal_ready(
         return reclaimed and rule.price_min <= ask_up <= rule.cheap_max, ask_up
     if rule.kind == "reclaim_dn":
         if ask_dn is None or spot >= start_px:
+            return False, None
+        if gap is None or gap < rule.gap_min:
             return False, None
         reclaimed = any(
             ts < now_ts and (now_ts - ts) <= rule.lookback_sec and hist_spot > start_px

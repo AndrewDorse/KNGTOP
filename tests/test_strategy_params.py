@@ -9,6 +9,7 @@ from kngtop.strategy_params import (
     ENTRY_PRICE_MIN,
     MAX_ELAPSED_SEC,
     MIN_ELAPSED_SEC,
+    RECLAIM_GAP_MIN,
     RECLAIM_LOOKBACK_SEC,
     RULES_15M,
     RULES_5M,
@@ -30,6 +31,7 @@ def test_rule_fires_reclaim_up() -> None:
     assert not rule_fires(r, btc=100_000.0, start_btc=100_000.0, mid_up=0.35, mid_dn=0.70)
     assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.35, mid_dn=0.70)
     assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.46, mid_dn=0.70)
+    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.30, mid_dn=0.27)
 
 
 def test_rule_fires_reclaim_down() -> None:
@@ -43,7 +45,8 @@ def test_rule_fires_reclaim_down() -> None:
     assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.35)
     assert not rule_fires(r, btc=100_000.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.35)
     assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.35)
-    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.27)
+    assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.27)
+    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.30, mid_dn=0.27)
 
 
 def test_rules_count_and_defaults() -> None:
@@ -52,6 +55,7 @@ def test_rules_count_and_defaults() -> None:
     assert all(rule.min_elapsed_sec == MIN_ELAPSED_SEC for rule in RULES_5M)
     assert all(rule.max_elapsed_sec == MAX_ELAPSED_SEC for rule in RULES_5M)
     assert all(rule.lookback_sec == RECLAIM_LOOKBACK_SEC for rule in RULES_5M)
+    assert all(rule.gap_min == RECLAIM_GAP_MIN for rule in RULES_5M)
 
 
 def test_rules_are_selected_for_btc_only() -> None:

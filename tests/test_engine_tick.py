@@ -167,6 +167,26 @@ def test_tick_does_not_fire_without_prior_opposite_side(monkeypatch: pytest.Monk
     assert not runner.traded_rule_keys
 
 
+def test_tick_does_not_fire_when_gap_too_small(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=True)
+    runner = _runner_for_start(90)
+    runner.spot_history.extend(
+        [
+            (datetime.now(timezone.utc).timestamp() - 20, 99_999.0),
+            (datetime.now(timezone.utc).timestamp() - 10, 100_001.0),
+        ]
+    )
+    _tick_runner(
+        runner,
+        poly=_FakePoly(ask_up=0.30, ask_dn=0.27),
+        binance=_FakeBinanceCombo(100_001.0),
+        clob=None,
+        cfg=cfg,
+        runtime_state={},
+    )
+    assert not runner.traded_rule_keys
+
+
 def test_tick_does_not_fire_before_min_elapsed(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
     runner = _runner_for_start(MIN_ELAPSED_SEC - 1)
@@ -243,7 +263,7 @@ def test_planned_window_notional_clamps_to_fraction_min_and_max(monkeypatch: pyt
 
 def test_shares_for_budget_is_quantized_without_share_floor() -> None:
     shares = _shares_for_budget(RULES_5M[0], budget_usd=1.0)
-    assert shares == pytest.approx(2.22)
+    assert shares == pytest.approx(2.63)
 
 
 def test_normalize_usdc_balance_converts_base_units() -> None:

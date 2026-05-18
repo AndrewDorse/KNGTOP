@@ -6,12 +6,13 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-ENTRY_PRICE_MIN = 0.28
-ENTRY_PRICE_MAX = 0.45
-MARKET_BUY_MAX_PRICE = 0.45
+ENTRY_PRICE_MIN = 0.01
+ENTRY_PRICE_MAX = 0.36
+MARKET_BUY_MAX_PRICE = 0.38
 MIN_ELAPSED_SEC = 30
 MAX_ELAPSED_SEC = 300
 RECLAIM_LOOKBACK_SEC = 40
+RECLAIM_GAP_MIN = 0.05
 
 
 RuleKind = Literal["reclaim_up", "reclaim_dn"]
@@ -29,6 +30,7 @@ class MispriceRule:
     min_elapsed_sec: int = MIN_ELAPSED_SEC
     max_elapsed_sec: int = MAX_ELAPSED_SEC
     lookback_sec: int = RECLAIM_LOOKBACK_SEC
+    gap_min: float = RECLAIM_GAP_MIN
     market_buy_max_price: float | None = MARKET_BUY_MAX_PRICE
     retry_on_error_override: int | None = 0
 
@@ -64,8 +66,9 @@ def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
 
 
 def rule_fires(rule: MispriceRule, *, btc: float, start_btc: float, mid_up: float, mid_dn: float) -> bool:
+    gap = abs(mid_up - mid_dn)
     if rule.kind == "reclaim_up":
-        return btc > start_btc and rule.price_min <= mid_up <= rule.cheap_max
+        return btc > start_btc and rule.price_min <= mid_up <= rule.cheap_max and gap >= rule.gap_min
     if rule.kind == "reclaim_dn":
-        return btc < start_btc and rule.price_min <= mid_dn <= rule.cheap_max
+        return btc < start_btc and rule.price_min <= mid_dn <= rule.cheap_max and gap >= rule.gap_min
     return False
