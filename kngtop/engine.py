@@ -96,8 +96,8 @@ def _rule_notional_usd(rule: MispriceRule, runner: WindowRunner) -> float:
     return float(runner.trade_notional_usd or 1.0)
 
 
-def _shares_for_budget(rule: MispriceRule, *, budget_usd: float) -> float:
-    max_price = float(rule.market_buy_max_price or 0.0)
+def _shares_for_budget(rule: MispriceRule, *, budget_usd: float, max_price_override: float | None = None) -> float:
+    max_price = float(max_price_override if max_price_override is not None else (rule.market_buy_max_price or 0.0))
     if max_price <= 0:
         return 0.0
     raw_shares = float(budget_usd) / max_price
@@ -196,6 +196,16 @@ def _window_elapsed_sec(runner: WindowRunner, now: datetime) -> float | None:
     if start_ts is None:
         return None
     return now.timestamp() - float(start_ts)
+
+
+def _effective_market_buy_cap(rule: MispriceRule, *, cfg: KngtopConfig, window_elapsed: float | None) -> float | None:
+    base_cap = rule.market_buy_max_price
+    if window_elapsed is None:
+        return base_cap
+    remaining_sec = float(rule.max_elapsed_sec) - float(window_elapsed)
+    if remaining_sec < float(cfg.order_cutoff_remaining_sec):
+        return 0.70
+    return base_cap
 
 
 def _signal_ready(
@@ -381,7 +391,8 @@ def _tick_runner(
             if window_elapsed < rule.min_elapsed_sec or window_elapsed > rule.max_elapsed_sec:
                 continue
             budget_usd = _rule_notional_usd(rule, runner)
-            shares = _shares_for_budget(rule, budget_usd=budget_usd)
+            effective_cap = _effective_market_buy_cap(rule, cfg=cfg, window_elapsed=window_elapsed)
+            shares = _shares_for_budget(rule, budget_usd=budget_usd, max_price_override=effective_cap)
             if shares <= 0:
                 continue
             tok = _pick_token(runner.contract, rule.side)
@@ -396,7 +407,7 @@ def _tick_runner(
                 start_px=start,
                 spot_px=spot,
                 pm_trigger_px=float(trigger_px),
-                market_buy_max_price=rule.market_buy_max_price,
+                market_buy_max_price=effective_cap,
                 retry_on_error_override=rule.retry_on_error_override,
             )
             if not executed:
