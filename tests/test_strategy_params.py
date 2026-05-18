@@ -32,9 +32,9 @@ def test_rule_fires_reclaim_up() -> None:
         side="UP",
         kind="reclaim_up",
     )
-    assert rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.35, mid_dn=0.70)
-    assert not rule_fires(r, btc=100_000.0, start_btc=100_000.0, mid_up=0.35, mid_dn=0.70)
-    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.35, mid_dn=0.70)
+    assert rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.20, mid_dn=0.70)
+    assert not rule_fires(r, btc=100_000.0, start_btc=100_000.0, mid_up=0.20, mid_dn=0.70)
+    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.20, mid_dn=0.70)
     assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.46, mid_dn=0.70)
     assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.30, mid_dn=0.27)
 
@@ -47,10 +47,10 @@ def test_rule_fires_reclaim_down() -> None:
         side="DOWN",
         kind="reclaim_dn",
     )
-    assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.35)
-    assert not rule_fires(r, btc=100_000.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.35)
-    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.35)
-    assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.27)
+    assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.20)
+    assert not rule_fires(r, btc=100_000.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.20)
+    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.20)
+    assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.25)
     assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.30, mid_dn=0.27)
 
 
@@ -71,10 +71,10 @@ def test_rules_count_and_defaults() -> None:
     assert all(rule.gap_min == RECLAIM_GAP_MIN for rule in RULES_15M)
 
 
-def test_rules_are_selected_for_btc_only() -> None:
-    assert rules_for_asset("BTC", 5) == RULES_5M
-    assert rules_for_asset("BTC", 15) == RULES_15M
-    assert rules_for_asset("ETH", 5) == ()
+def test_rules_are_selected_for_eth_only() -> None:
+    assert rules_for_asset("ETH", 5) == RULES_5M
+    assert rules_for_asset("ETH", 15) == RULES_15M
+    assert rules_for_asset("BTC", 5) == ()
     assert rules_for_asset("DOGE", 5) == ()
 
 

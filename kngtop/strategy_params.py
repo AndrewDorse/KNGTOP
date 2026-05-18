@@ -7,16 +7,16 @@ from typing import Literal
 
 
 ENTRY_PRICE_MIN_5M = 0.01
-ENTRY_PRICE_MAX_5M = 0.36
+ENTRY_PRICE_MAX_5M = 0.25
 ENTRY_PRICE_MIN_15M = 0.01
-ENTRY_PRICE_MAX_15M = 0.28
+ENTRY_PRICE_MAX_15M = 0.33
 MARKET_BUY_MAX_PRICE = 0.38
 MIN_ELAPSED_SEC_5M = 30
 MIN_ELAPSED_SEC_15M = 180
 MAX_ELAPSED_SEC_5M = 300
 MAX_ELAPSED_SEC_15M = 900
 RECLAIM_LOOKBACK_SEC_5M = 40
-RECLAIM_LOOKBACK_SEC_15M = 60
+RECLAIM_LOOKBACK_SEC_15M = 40
 RECLAIM_GAP_MIN = 0.05
 
 
@@ -86,7 +86,7 @@ def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
     p = (pair or "").strip().upper()
     if p not in {"BTC", "ETH", "XRP", "SOL", "DOGE", "BNB", "HYPE", "LINK"}:
         raise ValueError(f"unsupported asset pair {pair!r} (expected BTC, ETH, XRP, SOL, DOGE, BNB, HYPE, or LINK)")
-    if p != "BTC":
+    if p != "ETH":
         return ()
     return RULES_5M if int(window_minutes) <= 5 else RULES_15M
 
