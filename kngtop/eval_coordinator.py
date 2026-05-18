@@ -28,5 +28,4 @@ class EvalCoordinator:
         with self._lock:
             dirty = self._dirty
             self._dirty = False
-        if (signaled or dirty) and self.debounce_sec > 0:
-            time.sleep(self.debounce_sec)
+        return
