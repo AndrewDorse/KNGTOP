@@ -16,10 +16,10 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 def parse_trading_pairs(raw: str | None) -> tuple[tuple[str, str], ...]:
-    """``GAMMA_KEY:BINANCE_SYMBOL`` comma list, e.g. ``ETH:ETHUSDT,BTC:BTCUSDT``."""
+    """``GAMMA_KEY:BINANCE_SYMBOL`` comma list, e.g. ``BTC:BTCUSDT,ETH:ETHUSDT``."""
     s = (raw or "").strip()
     if not s:
-        s = "ETH:ETHUSDT"
+        s = "BTC:BTCUSDT,ETH:ETHUSDT"
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
     for part in s.split(","):

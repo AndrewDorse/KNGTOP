@@ -86,7 +86,7 @@ def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
     p = (pair or "").strip().upper()
     if p not in {"BTC", "ETH", "XRP", "SOL", "DOGE", "BNB", "HYPE", "LINK"}:
         raise ValueError(f"unsupported asset pair {pair!r} (expected BTC, ETH, XRP, SOL, DOGE, BNB, HYPE, or LINK)")
-    if p != "ETH":
+    if p not in {"BTC", "ETH"}:
         return ()
     return RULES_5M if int(window_minutes) <= 5 else RULES_15M
 

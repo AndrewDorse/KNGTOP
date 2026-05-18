@@ -71,10 +71,11 @@ def test_rules_count_and_defaults() -> None:
     assert all(rule.gap_min == RECLAIM_GAP_MIN for rule in RULES_15M)
 
 
-def test_rules_are_selected_for_eth_only() -> None:
+def test_rules_are_selected_for_btc_and_eth() -> None:
+    assert rules_for_asset("BTC", 5) == RULES_5M
+    assert rules_for_asset("BTC", 15) == RULES_15M
     assert rules_for_asset("ETH", 5) == RULES_5M
     assert rules_for_asset("ETH", 15) == RULES_15M
-    assert rules_for_asset("BTC", 5) == ()
     assert rules_for_asset("DOGE", 5) == ()
 
 

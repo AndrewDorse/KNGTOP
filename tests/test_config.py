@@ -22,12 +22,12 @@ def test_dry_run_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.dry_run is False
 
 
-def test_pairs_default_to_eth_only(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pairs_default_to_btc_and_eth(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
     monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
     monkeypatch.delenv("KNGTOP_PAIRS", raising=False)
     cfg = KngtopConfig.from_env()
-    assert tuple(cfg.trading_pairs) == (("ETH", "ETHUSDT"),)
+    assert tuple(cfg.trading_pairs) == (("BTC", "BTCUSDT"), ("ETH", "ETHUSDT"))
 
 
 def test_parse_pairs_accepts_multiple_assets() -> None:

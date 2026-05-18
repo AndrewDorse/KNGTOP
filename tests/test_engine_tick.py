@@ -258,7 +258,7 @@ def test_planned_window_notional_clamps_to_fraction_min_and_max(monkeypatch: pyt
     assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=1.0) == pytest.approx(1.0)
     assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=100.0) == pytest.approx(100.0 * ENTRY_BALANCE_FRACTION)
     assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=10_000.0) == pytest.approx(ENTRY_MAX_NOTIONAL_USD)
-    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10.0) == 0.0
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10.0) == pytest.approx(1.0)
 
 
 def test_shares_for_budget_is_quantized_without_share_floor() -> None:
