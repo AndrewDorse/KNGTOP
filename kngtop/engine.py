@@ -199,13 +199,8 @@ def _window_elapsed_sec(runner: WindowRunner, now: datetime) -> float | None:
 
 
 def _effective_market_buy_cap(rule: MispriceRule, *, cfg: KngtopConfig, window_elapsed: float | None) -> float | None:
-    base_cap = rule.market_buy_max_price
-    if window_elapsed is None:
-        return base_cap
-    remaining_sec = float(rule.max_elapsed_sec) - float(window_elapsed)
-    if remaining_sec < float(cfg.order_cutoff_remaining_sec):
-        return 0.70
-    return base_cap
+    del cfg, window_elapsed
+    return rule.market_buy_max_price
 
 
 def _signal_ready(

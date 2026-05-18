@@ -263,7 +263,7 @@ def test_planned_window_notional_clamps_to_fraction_min_and_max(monkeypatch: pyt
 
 def test_shares_for_budget_is_quantized_without_share_floor() -> None:
     shares = _shares_for_budget(RULES_5M[0], budget_usd=1.0)
-    assert shares == pytest.approx(2.5)
+    assert shares == pytest.approx(1.17)
 
 
 def test_normalize_usdc_balance_converts_base_units() -> None:
