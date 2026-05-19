@@ -64,10 +64,10 @@ class _FakeClobBalance:
 class _FakeClobExec(_FakeClobBalance):
     def __init__(self, balance: float | None) -> None:
         super().__init__(balance)
-        self.market_calls: list[tuple[float, float | None]] = []
+        self.limit_calls: list[tuple[float, float]] = []
 
-    def market_buy_usdc(self, token: TokenMarket, *, usdc: float, max_price: float | None = None):  # noqa: ANN201
-        self.market_calls.append((usdc, max_price))
+    def limit_buy_shares(self, token: TokenMarket, *, price: float, shares: float):  # noqa: ANN201
+        self.limit_calls.append((price, shares))
         return {"ok": True, "orderID": "buy123"}
 
 
@@ -227,7 +227,7 @@ def test_tick_executes_first_leg_only(monkeypatch: pytest.MonkeyPatch) -> None:
         runtime_state={},
     )
     assert "reclaim_buy_up" in runner.traded_rule_keys
-    assert clob.market_calls == [(5.0, MARKET_BUY_MAX_PRICE)]
+    assert clob.limit_calls == [(0.23, pytest.approx(21.73))]
 
 
 def test_tick_does_not_open_after_five_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -249,21 +249,29 @@ def test_tick_does_not_open_after_five_minutes(monkeypatch: pytest.MonkeyPatch) 
         cfg=cfg,
         runtime_state={},
     )
-    assert clob.market_calls == []
+    assert clob.limit_calls == []
 
 
 def test_planned_window_notional_clamps_to_fraction_min_and_max(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
     assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=0.99) == 0.0
-    assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=1.0) == pytest.approx(1.0)
+    assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=1.0) == 0.0
+    assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=1.25) == pytest.approx(1.25)
     assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=100.0) == pytest.approx(100.0 * ENTRY_BALANCE_FRACTION)
     assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=10_000.0) == pytest.approx(ENTRY_MAX_NOTIONAL_USD)
-    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10.0) == pytest.approx(1.0)
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10.0) == pytest.approx(1.25)
 
 
 def test_shares_for_budget_is_quantized_without_share_floor() -> None:
-    shares = _shares_for_budget(RULES_5M[0], budget_usd=1.0)
-    assert shares == pytest.approx(1.17)
+    shares, cost = _shares_for_budget(budget_usd=1.25, limit_price=0.25)
+    assert shares == pytest.approx(5.0)
+    assert cost == pytest.approx(1.25)
+
+
+def test_shares_for_budget_raises_budget_to_minimum_five_shares() -> None:
+    shares, cost = _shares_for_budget(budget_usd=1.25, limit_price=0.36)
+    assert shares == pytest.approx(5.0)
+    assert cost == pytest.approx(1.8)
 
 
 def test_normalize_usdc_balance_converts_base_units() -> None:

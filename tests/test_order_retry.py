@@ -1,4 +1,4 @@
-"""Order execution behavior for single-leg FAK buys."""
+"""Order execution behavior for single-leg limit buys."""
 
 from __future__ import annotations
 
@@ -17,17 +17,17 @@ class _FakeToken:
 class _FakeClobRetry:
     def __init__(self, fail_times: int) -> None:
         self.fail_times = fail_times
-        self.market_calls = 0
-        self.max_price: float | None = None
-        self.usdc: float | None = None
+        self.limit_calls = 0
+        self.price: float | None = None
+        self.shares: float | None = None
 
-    def market_buy_usdc(self, token: _FakeToken, *, usdc: float, max_price: float | None = None):  # noqa: ANN201
-        self.market_calls += 1
-        self.usdc = usdc
-        self.max_price = max_price
-        if self.market_calls <= self.fail_times:
+    def limit_buy_shares(self, token: _FakeToken, *, price: float, shares: float):  # noqa: ANN201
+        self.limit_calls += 1
+        self.price = price
+        self.shares = shares
+        if self.limit_calls <= self.fail_times:
             raise RuntimeError("simulated order error")
-        return {"ok": True, "orderID": "buy123", "calls": self.market_calls, "usdc": usdc, "token": token.token_id, "max_price": max_price}
+        return {"ok": True, "orderID": "buy123", "calls": self.limit_calls, "shares": shares, "token": token.token_id, "price": price}
 
 def _cfg(monkeypatch: pytest.MonkeyPatch, *, dry_run: bool = False, retries: int = 2) -> KngtopConfig:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
@@ -44,18 +44,18 @@ def test_execute_buy_returns_true_on_success(monkeypatch: pytest.MonkeyPatch) ->
         clob,
         cfg,
         5.0,
-        1.0,
+        1.25,
         _FakeToken(),
         "5m/close_buy_up/UP",
         start_px=100_000.0,
         spot_px=100_001.0,
         pm_trigger_px=0.30,
-        market_buy_max_price=0.44,
+        limit_price=0.33,
     )
-    assert ok == (True, None)
-    assert clob.market_calls == 1
-    assert clob.usdc == 1.0
-    assert clob.max_price == 0.44
+    assert ok == (True, None, "buy123")
+    assert clob.limit_calls == 1
+    assert clob.shares == 5.0
+    assert clob.price == 0.33
 
 
 def test_execute_buy_returns_false_on_error_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -65,35 +65,36 @@ def test_execute_buy_returns_false_on_error_without_retry(monkeypatch: pytest.Mo
         clob,
         cfg,
         5.0,
-        1.0,
+        1.25,
         _FakeToken(),
         "5m/close_buy_up/UP",
         start_px=100_000.0,
         spot_px=100_001.0,
         pm_trigger_px=0.30,
-        market_buy_max_price=0.44,
+        limit_price=0.33,
     )
-    assert ok == (False, "error")
-    assert clob.market_calls == 1
+    assert ok == (False, "error", None)
+    assert clob.limit_calls == 1
 
 
-def test_execute_buy_uses_default_env_market_cap_when_no_override(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execute_buy_requires_explicit_limit_price(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=False)
     clob = _FakeClobRetry(fail_times=0)
     ok = _execute_buy(
         clob,
         cfg,
         5.0,
-        1.0,
+        1.25,
         _FakeToken(),
         "5m/close_buy_up/UP",
         start_px=100_000.0,
         spot_px=100_001.0,
         pm_trigger_px=0.30,
+        limit_price=0.33,
     )
-    assert ok == (True, None)
-    assert clob.market_calls == 1
-    assert clob.max_price is None
+    assert ok == (True, None, "buy123")
+    assert clob.limit_calls == 1
+    assert clob.price == 0.33
 
 
 def test_execute_buy_logs_filled_elapsed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -104,13 +105,13 @@ def test_execute_buy_logs_filled_elapsed(monkeypatch: pytest.MonkeyPatch) -> Non
             clob,
             cfg,
             5.0,
-            1.0,
+            1.25,
             _FakeToken(),
             "5m/close_buy_up/UP",
             start_px=100_000.0,
             spot_px=100_001.0,
             pm_trigger_px=0.30,
-            market_buy_max_price=0.44,
+            limit_price=0.33,
         )
     kinds = [call.args[0] for call in event_mock.call_args_list]
     assert "START_DEAL" in kinds
@@ -124,13 +125,13 @@ def test_execute_buy_logs_not_filled_elapsed(monkeypatch: pytest.MonkeyPatch) ->
             clob,
             cfg,
             5.0,
-            1.0,
+            1.25,
             _FakeToken(),
             "5m/close_buy_up/UP",
             start_px=100_000.0,
             spot_px=100_001.0,
             pm_trigger_px=0.30,
-            market_buy_max_price=0.44,
+            limit_price=0.33,
         )
     kinds = [call.args[0] for call in event_mock.call_args_list]
     assert "START_DEAL" in kinds

@@ -26,8 +26,10 @@ WINDOWS_TO_TRADE: tuple[int, ...] = (5, 15)
 BOOT_WARMUP_DELAY_SEC = 0.0
 MAX_SPOT_HISTORY_SEC = 180
 ENTRY_BALANCE_FRACTION = 0.05
-ENTRY_MIN_NOTIONAL_USD = 1.0
+ENTRY_MIN_NOTIONAL_USD = 1.25
 ENTRY_MAX_NOTIONAL_USD = 200.0
+ENTRY_MIN_SHARES = 5.0
+ENTRY_LIMIT_PRICE_BUFFER = 0.03
 DISCOVERY_RETRY_SEC_WHEN_MISSING = 15.0
 FAILED_RETRY_COOLDOWN_SEC = 2.0
 INSUFFICIENT_BALANCE_BACKOFF_SEC = 30.0
@@ -45,6 +47,7 @@ class WindowRunner:
     rule_notional_usd: dict[str, float] = field(default_factory=dict)
     traded_rule_keys: set[str] = field(default_factory=set)
     executed_rule_sides: dict[str, str] = field(default_factory=dict)
+    pending_order_ids: dict[str, str] = field(default_factory=dict)
     rule_retry_not_before: dict[str, float] = field(default_factory=dict)
     spot_history: deque[tuple[float, float]] = field(default_factory=deque)
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -96,14 +99,23 @@ def _rule_notional_usd(rule: MispriceRule, runner: WindowRunner) -> float:
     return float(runner.trade_notional_usd or 1.0)
 
 
-def _shares_for_budget(rule: MispriceRule, *, budget_usd: float, max_price_override: float | None = None) -> float:
-    max_price = float(max_price_override if max_price_override is not None else (rule.market_buy_max_price or 0.0))
-    if max_price <= 0:
-        return 0.0
-    raw_shares = float(budget_usd) / max_price
-    # Keep order size within the budget while matching Polymarket amount precision.
+def _limit_price_from_signal(signal_price: float) -> float:
+    px = round(float(signal_price) + ENTRY_LIMIT_PRICE_BUFFER, 2)
+    return min(max(px, 0.01), 0.99)
+
+
+def _shares_for_budget(*, budget_usd: float, limit_price: float) -> tuple[float, float]:
+    px = float(limit_price)
+    if px <= 0 or px >= 1:
+        return 0.0, 0.0
+    effective_budget = max(float(budget_usd), float(ENTRY_MIN_SHARES) * px)
+    raw_shares = effective_budget / px
     quantized = math.floor(raw_shares * 100.0) / 100.0
-    return quantized if quantized >= 0.01 else 0.0
+    shares = max(float(ENTRY_MIN_SHARES), quantized)
+    order_cost = shares * px
+    if shares < 0.01:
+        return 0.0
+    return shares, order_cost
 
 
 def _current_window_start_sec(now_ts: int, window_minutes: int) -> int:
@@ -203,6 +215,16 @@ def _effective_market_buy_cap(rule: MispriceRule, *, cfg: KngtopConfig, window_e
     return rule.market_buy_max_price
 
 
+def _extract_order_id(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("orderID", "orderId", "id"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return None
+
+
 def _signal_ready(
     rule: MispriceRule,
     *,
@@ -252,9 +274,17 @@ def _finalize_runner_window(
     *,
     binance: BinanceCombinedTradeFeed,
     cfg: KngtopConfig,
+    clob: KngtopClob | None = None,
 ) -> None:
     if runner is None or runner.start_px is None or not runner.executed_rule_sides:
         return
+    if clob is not None:
+        for order_id in tuple(runner.pending_order_ids.values()):
+            try:
+                clob.cancel_order_by_id(order_id)
+            except Exception:  # noqa: BLE001
+                pass
+        runner.pending_order_ids.clear()
     final_spot = binance.last_price(runner.binance_symbol, max_age_sec=max(cfg.binance_max_age_sec, 30.0))
     if final_spot is None:
         final_spot = fetch_binance_spot_price(symbol=runner.binance_symbol, timeout=cfg.request_timeout_sec)
@@ -292,9 +322,9 @@ def _execute_buy(
     start_px: float,
     spot_px: float,
     pm_trigger_px: float,
-    market_buy_max_price: float | None = None,
+    limit_price: float,
     retry_on_error_override: int | None = None,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, str | None]:
     shares_f = float(shares)
     _event(
         "START_DEAL",
@@ -304,14 +334,14 @@ def _execute_buy(
         start_px=f"{start_px:.10f}",
         spot_px=f"{spot_px:.10f}",
         pm_trigger_px=f"{pm_trigger_px:.10f}",
-        market_px_cap=f"{float(market_buy_max_price):.2f}" if market_buy_max_price is not None else "default",
+        limit_px=f"{float(limit_price):.2f}",
     )
     if cfg.dry_run:
-        return True, None
+        return True, None, None
     assert clob is not None
     started = time.perf_counter()
     try:
-        _ = clob.market_buy_usdc(token, usdc=float(budget_usd), max_price=market_buy_max_price)
+        payload = clob.limit_buy_shares(token, price=float(limit_price), shares=shares_f)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         lower_msg = msg.lower()
@@ -329,8 +359,8 @@ def _execute_buy(
         )
         if reason != "no_match":
             _event("ERROR", stage="market_buy", label=label, error=msg)
-        return False, reason
-    return True, None
+        return False, reason, None
+    return True, None, _extract_order_id(payload)
 
 
 def _tick_runner(
@@ -385,24 +415,24 @@ def _tick_runner(
                 continue
             if window_elapsed < rule.min_elapsed_sec or window_elapsed > rule.max_elapsed_sec:
                 continue
-            budget_usd = _rule_notional_usd(rule, runner)
-            effective_cap = _effective_market_buy_cap(rule, cfg=cfg, window_elapsed=window_elapsed)
-            shares = _shares_for_budget(rule, budget_usd=budget_usd, max_price_override=effective_cap)
+            planned_budget_usd = _rule_notional_usd(rule, runner)
+            limit_price = _limit_price_from_signal(float(trigger_px))
+            shares, order_budget_usd = _shares_for_budget(budget_usd=planned_budget_usd, limit_price=limit_price)
             if shares <= 0:
                 continue
             tok = _pick_token(runner.contract, rule.side)
             label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
-            executed, reason = _execute_buy(
+            executed, reason, order_id = _execute_buy(
                 clob,
                 cfg,
                 shares,
-                budget_usd,
+                order_budget_usd,
                 tok,
                 label,
                 start_px=start,
                 spot_px=spot,
                 pm_trigger_px=float(trigger_px),
-                market_buy_max_price=effective_cap,
+                limit_price=limit_price,
                 retry_on_error_override=rule.retry_on_error_override,
             )
             if not executed:
@@ -414,6 +444,8 @@ def _tick_runner(
                 continue
             runner.traded_rule_keys.add(rule.key)
             runner.executed_rule_sides[rule.key] = rule.side
+            if order_id:
+                runner.pending_order_ids[rule.key] = order_id
             break
 
 
@@ -458,7 +490,7 @@ def _run_iteration(
             state.last_checked_monotonic = now_monotonic
             t0 = time.perf_counter()
             if cur is not None and not _runner_matches_current_window(cur, now_ts=now_ts, window_minutes=wm):
-                _finalize_runner_window(cur, binance=binance, cfg=cfg)
+                _finalize_runner_window(cur, binance=binance, cfg=cfg, clob=clob)
             c = discover_active_btc_window(market_symbol=gamma_sym, window_minutes=wm, timeout=timeout)
             _timing(
                 "gamma_discovery",
