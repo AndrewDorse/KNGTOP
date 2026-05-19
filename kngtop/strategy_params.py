@@ -35,7 +35,7 @@ RECLAIM_LOOKBACK_SEC_15M = 40
 RECLAIM_GAP_MIN = 0.05
 
 
-RuleKind = Literal["reclaim_up", "reclaim_dn"]
+RuleKind = Literal["reclaim_up", "reclaim_dn", "cwc_up", "cwc_dn"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +51,21 @@ class MispriceRule:
     max_elapsed_sec: int = MAX_ELAPSED_SEC_5M
     lookback_sec: int = RECLAIM_LOOKBACK_SEC_5M
     gap_min: float = RECLAIM_GAP_MIN
+    distance_bps_max: float | None = None
+    momentum_lookback_sec: int | None = None
+    momentum_bps_min: float | None = None
     market_buy_max_price: float | None = MARKET_BUY_MAX_PRICE
     retry_on_error_override: int | None = 0
+
+
+CWC_ENTRY_PRICE_MIN_5M = 0.01
+CWC_ENTRY_PRICE_MAX_5M = 0.30
+CWC_MIN_ELAPSED_SEC_5M = 20
+CWC_MAX_ELAPSED_SEC_5M = 300
+CWC_GAP_MIN = 0.03
+CWC_DISTANCE_BPS_MAX = 5.0
+CWC_MOMENTUM_LOOKBACK_SEC = 3
+CWC_MOMENTUM_BPS_MIN = 0.0
 
 
 BTC_RULES_5M: tuple[MispriceRule, ...] = (
@@ -70,6 +83,34 @@ BTC_RULES_5M: tuple[MispriceRule, ...] = (
         cheap_max=BTC_ENTRY_PRICE_MAX_5M,
         side="DOWN",
         kind="reclaim_dn",
+        market_buy_max_price=BTC_MARKET_BUY_MAX_PRICE_5M,
+    ),
+    MispriceRule(
+        "cwc_buy_up",
+        price_min=CWC_ENTRY_PRICE_MIN_5M,
+        cheap_max=CWC_ENTRY_PRICE_MAX_5M,
+        side="UP",
+        kind="cwc_up",
+        min_elapsed_sec=CWC_MIN_ELAPSED_SEC_5M,
+        max_elapsed_sec=CWC_MAX_ELAPSED_SEC_5M,
+        gap_min=CWC_GAP_MIN,
+        distance_bps_max=CWC_DISTANCE_BPS_MAX,
+        momentum_lookback_sec=CWC_MOMENTUM_LOOKBACK_SEC,
+        momentum_bps_min=CWC_MOMENTUM_BPS_MIN,
+        market_buy_max_price=BTC_MARKET_BUY_MAX_PRICE_5M,
+    ),
+    MispriceRule(
+        "cwc_buy_down",
+        price_min=CWC_ENTRY_PRICE_MIN_5M,
+        cheap_max=CWC_ENTRY_PRICE_MAX_5M,
+        side="DOWN",
+        kind="cwc_dn",
+        min_elapsed_sec=CWC_MIN_ELAPSED_SEC_5M,
+        max_elapsed_sec=CWC_MAX_ELAPSED_SEC_5M,
+        gap_min=CWC_GAP_MIN,
+        distance_bps_max=CWC_DISTANCE_BPS_MAX,
+        momentum_lookback_sec=CWC_MOMENTUM_LOOKBACK_SEC,
+        momentum_bps_min=CWC_MOMENTUM_BPS_MIN,
         market_buy_max_price=BTC_MARKET_BUY_MAX_PRICE_5M,
     ),
 )
@@ -114,6 +155,34 @@ ETH_RULES_5M: tuple[MispriceRule, ...] = (
         cheap_max=ETH_ENTRY_PRICE_MAX_5M,
         side="DOWN",
         kind="reclaim_dn",
+        market_buy_max_price=ETH_MARKET_BUY_MAX_PRICE_5M,
+    ),
+    MispriceRule(
+        "cwc_buy_up",
+        price_min=CWC_ENTRY_PRICE_MIN_5M,
+        cheap_max=CWC_ENTRY_PRICE_MAX_5M,
+        side="UP",
+        kind="cwc_up",
+        min_elapsed_sec=CWC_MIN_ELAPSED_SEC_5M,
+        max_elapsed_sec=CWC_MAX_ELAPSED_SEC_5M,
+        gap_min=CWC_GAP_MIN,
+        distance_bps_max=CWC_DISTANCE_BPS_MAX,
+        momentum_lookback_sec=CWC_MOMENTUM_LOOKBACK_SEC,
+        momentum_bps_min=CWC_MOMENTUM_BPS_MIN,
+        market_buy_max_price=ETH_MARKET_BUY_MAX_PRICE_5M,
+    ),
+    MispriceRule(
+        "cwc_buy_down",
+        price_min=CWC_ENTRY_PRICE_MIN_5M,
+        cheap_max=CWC_ENTRY_PRICE_MAX_5M,
+        side="DOWN",
+        kind="cwc_dn",
+        min_elapsed_sec=CWC_MIN_ELAPSED_SEC_5M,
+        max_elapsed_sec=CWC_MAX_ELAPSED_SEC_5M,
+        gap_min=CWC_GAP_MIN,
+        distance_bps_max=CWC_DISTANCE_BPS_MAX,
+        momentum_lookback_sec=CWC_MOMENTUM_LOOKBACK_SEC,
+        momentum_bps_min=CWC_MOMENTUM_BPS_MIN,
         market_buy_max_price=ETH_MARKET_BUY_MAX_PRICE_5M,
     ),
 )

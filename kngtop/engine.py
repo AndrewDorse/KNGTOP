@@ -238,6 +238,32 @@ def _signal_ready(
     if start_px <= 0:
         return False, None
     gap = abs((ask_up or 0.0) - (ask_dn or 0.0)) if ask_up is not None and ask_dn is not None else None
+    if rule.kind in {"cwc_up", "cwc_dn"}:
+        if gap is None or gap < rule.gap_min:
+            return False, None
+        distance_bps = abs((spot - start_px) / start_px) * 10000.0
+        if rule.distance_bps_max is not None and distance_bps > rule.distance_bps_max:
+            return False, None
+        momentum_sec = int(rule.momentum_lookback_sec or 0)
+        if momentum_sec <= 0:
+            return False, None
+        hist_spot = None
+        cutoff_ts = now_ts - float(momentum_sec)
+        for ts, px in reversed(history):
+            if ts <= cutoff_ts:
+                hist_spot = px
+                break
+        if hist_spot is None:
+            return False, None
+        momentum_bps = ((spot - hist_spot) / start_px) * 10000.0
+        min_momentum = float(rule.momentum_bps_min or 0.0)
+        if rule.kind == "cwc_up":
+            if ask_up is None or spot <= start_px or momentum_bps < min_momentum:
+                return False, None
+            return rule.price_min <= ask_up <= rule.cheap_max, ask_up
+        if ask_dn is None or spot >= start_px or (-momentum_bps) < min_momentum:
+            return False, None
+        return rule.price_min <= ask_dn <= rule.cheap_max, ask_dn
     if rule.kind == "reclaim_up":
         if ask_up is None or spot <= start_px:
             return False, None
@@ -382,8 +408,6 @@ def _tick_runner(
         quote_dn = poly.best_bid_ask_for(dn_id, max_age_sec=cfg.poly_mid_max_age_sec)
         ask_up = quote_up[1] if quote_up is not None else None
         ask_dn = quote_dn[1] if quote_dn is not None else None
-        if runner.traded_rule_keys:
-            return
         start = float(runner.start_px)
         window_elapsed = _window_elapsed_sec(runner, now)
         now_monotonic = time.perf_counter()

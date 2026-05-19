@@ -158,7 +158,7 @@ def test_tick_does_not_fire_without_prior_opposite_side(monkeypatch: pytest.Monk
     )
     _tick_runner(
         runner,
-        poly=_FakePoly(ask_up=0.20, ask_dn=0.70),
+        poly=_FakePoly(ask_up=0.40, ask_dn=0.70),
         binance=_FakeBinanceCombo(100_001.0),
         clob=None,
         cfg=cfg,
@@ -178,7 +178,7 @@ def test_tick_does_not_fire_when_gap_too_small(monkeypatch: pytest.MonkeyPatch) 
     )
     _tick_runner(
         runner,
-        poly=_FakePoly(ask_up=0.20, ask_dn=0.17),
+        poly=_FakePoly(ask_up=0.20, ask_dn=0.18),
         binance=_FakeBinanceCombo(100_001.0),
         clob=None,
         cfg=cfg,
@@ -189,7 +189,7 @@ def test_tick_does_not_fire_when_gap_too_small(monkeypatch: pytest.MonkeyPatch) 
 
 def test_tick_does_not_fire_before_min_elapsed(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
-    runner = _runner_for_start(MIN_ELAPSED_SEC_5M - 1)
+    runner = _runner_for_start(19)
     runner.spot_history.extend(
         [
             (datetime.now(timezone.utc).timestamp() - 20, 99_999.0),
@@ -228,6 +228,41 @@ def test_tick_executes_first_leg_only(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert "reclaim_buy_up" in runner.traded_rule_keys
     assert clob.limit_calls == [(0.23, pytest.approx(21.73))]
+
+
+def test_tick_allows_cwc_after_reclaim_in_same_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    runner = _runner_for_start(90)
+    runner.trade_notional_usd = 5.0
+    now_ts = datetime.now(timezone.utc).timestamp()
+    runner.spot_history.extend(
+        [
+            (now_ts - 20, 99_999.0),
+            (now_ts - 10, 100_001.0),
+            (now_ts - 4, 99_999.8),
+        ]
+    )
+    clob = _FakeClobExec(100.0)
+    _tick_runner(
+        runner,
+        poly=_FakePoly(ask_up=0.20, ask_dn=0.70),
+        binance=_FakeBinanceCombo(100_001.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state={},
+    )
+    runner.spot_history.append((datetime.now(timezone.utc).timestamp() - 4, 100_000.9))
+    _tick_runner(
+        runner,
+        poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
+        binance=_FakeBinanceCombo(100_001.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state={},
+    )
+    assert "reclaim_buy_up" in runner.traded_rule_keys
+    assert "cwc_buy_up" in runner.traded_rule_keys
+    assert clob.limit_calls == [(0.23, pytest.approx(21.73)), (0.33, pytest.approx(15.15))]
 
 
 def test_tick_does_not_open_after_five_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
