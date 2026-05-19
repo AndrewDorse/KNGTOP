@@ -274,17 +274,9 @@ def _finalize_runner_window(
     *,
     binance: BinanceCombinedTradeFeed,
     cfg: KngtopConfig,
-    clob: KngtopClob | None = None,
 ) -> None:
     if runner is None or runner.start_px is None or not runner.executed_rule_sides:
         return
-    if clob is not None:
-        for order_id in tuple(runner.pending_order_ids.values()):
-            try:
-                clob.cancel_order_by_id(order_id)
-            except Exception:  # noqa: BLE001
-                pass
-        runner.pending_order_ids.clear()
     final_spot = binance.last_price(runner.binance_symbol, max_age_sec=max(cfg.binance_max_age_sec, 30.0))
     if final_spot is None:
         final_spot = fetch_binance_spot_price(symbol=runner.binance_symbol, timeout=cfg.request_timeout_sec)
@@ -490,7 +482,7 @@ def _run_iteration(
             state.last_checked_monotonic = now_monotonic
             t0 = time.perf_counter()
             if cur is not None and not _runner_matches_current_window(cur, now_ts=now_ts, window_minutes=wm):
-                _finalize_runner_window(cur, binance=binance, cfg=cfg, clob=clob)
+                _finalize_runner_window(cur, binance=binance, cfg=cfg)
             c = discover_active_btc_window(market_symbol=gamma_sym, window_minutes=wm, timeout=timeout)
             _timing(
                 "gamma_discovery",
