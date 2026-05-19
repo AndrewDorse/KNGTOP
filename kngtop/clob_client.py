@@ -56,6 +56,17 @@ def _normalize_usdc_balance(raw: object) -> float | None:
     return max(0.0, val)
 
 
+def _round_order_price(raw: float) -> float:
+    return round(float(raw), 2)
+
+
+def _round_order_shares(raw: float) -> float:
+    value = round(float(raw), 2)
+    if value <= 0:
+        raise ValueError("shares must round to > 0")
+    return value
+
+
 class KngtopClob:
     def __init__(
         self,
@@ -237,8 +248,8 @@ class KngtopClob:
         price_cap = min(max(raw_price_cap, tick_f), hi)
         order = OrderArgs(
             token_id=token.token_id,
-            price=round(price_cap, 2),
-            size=sz,
+            price=_round_order_price(price_cap),
+            size=_round_order_shares(sz),
             side=self._buy,
         )
         create_and_post = getattr(self.client, "create_and_post_order", None)
@@ -261,8 +272,8 @@ class KngtopClob:
         size = u / px
         order = OrderArgs(
             token_id=token.token_id,
-            price=round(px, 2),
-            size=float(size),
+            price=_round_order_price(px),
+            size=_round_order_shares(size),
             side=self._buy,
         )
         create_and_post = getattr(self.client, "create_and_post_order", None)
@@ -283,8 +294,8 @@ class KngtopClob:
             raise ValueError("price must be between 0 and 1")
         order = OrderArgs(
             token_id=token.token_id,
-            price=round(px, 2),
-            size=sz,
+            price=_round_order_price(px),
+            size=_round_order_shares(sz),
             side=self._buy,
         )
         create_and_post = getattr(self.client, "create_and_post_order", None)
@@ -309,8 +320,8 @@ class KngtopClob:
             raise ValueError("price must be between 0 and 1")
         order = OrderArgs(
             token_id=token.token_id,
-            price=round(px, 2),
-            size=sz,
+            price=_round_order_price(px),
+            size=_round_order_shares(sz),
             side=self._sell,
         )
         create_and_post = getattr(self.client, "create_and_post_order", None)
