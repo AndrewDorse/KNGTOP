@@ -35,7 +35,7 @@ RECLAIM_LOOKBACK_SEC_15M = 40
 RECLAIM_GAP_MIN = 0.05
 
 
-RuleKind = Literal["reclaim_up", "reclaim_dn", "cwc_up", "cwc_dn"]
+RuleKind = Literal["reclaim_up", "reclaim_dn", "cwc_up", "cwc_dn", "cwm_up", "cwm_dn"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,59 +58,42 @@ class MispriceRule:
     retry_on_error_override: int | None = 0
 
 
-CWC_ENTRY_PRICE_MIN_5M = 0.01
-CWC_ENTRY_PRICE_MAX_5M = 0.30
-CWC_MIN_ELAPSED_SEC_5M = 20
-CWC_MAX_ELAPSED_SEC_5M = 300
-CWC_GAP_MIN = 0.03
-CWC_DISTANCE_BPS_MAX = 5.0
-CWC_MOMENTUM_LOOKBACK_SEC = 3
-CWC_MOMENTUM_BPS_MIN = 0.0
+CWM_ENTRY_PRICE_MIN_5M = 0.01
+CWM_ENTRY_PRICE_MAX_5M = 0.25
+CWM_MIN_ELAPSED_SEC_5M = 20
+CWM_MAX_ELAPSED_SEC_5M = 300
+CWM_MOMENTUM_LOOKBACK_SEC = 5
+CWM_MOMENTUM_BPS_MIN = 0.0
 
 
 BTC_RULES_5M: tuple[MispriceRule, ...] = (
     MispriceRule(
-        "reclaim_buy_up",
-        price_min=BTC_ENTRY_PRICE_MIN_5M,
-        cheap_max=BTC_ENTRY_PRICE_MAX_5M,
+        "cwm_buy_up",
+        price_min=CWM_ENTRY_PRICE_MIN_5M,
+        cheap_max=CWM_ENTRY_PRICE_MAX_5M,
         side="UP",
-        kind="reclaim_up",
+        kind="cwm_up",
+        min_elapsed_sec=CWM_MIN_ELAPSED_SEC_5M,
+        max_elapsed_sec=CWM_MAX_ELAPSED_SEC_5M,
+        momentum_lookback_sec=CWM_MOMENTUM_LOOKBACK_SEC,
+        momentum_bps_min=CWM_MOMENTUM_BPS_MIN,
         market_buy_max_price=BTC_MARKET_BUY_MAX_PRICE_5M,
     ),
     MispriceRule(
-        "reclaim_buy_down",
-        price_min=BTC_ENTRY_PRICE_MIN_5M,
-        cheap_max=BTC_ENTRY_PRICE_MAX_5M,
+        "cwm_buy_down",
+        price_min=CWM_ENTRY_PRICE_MIN_5M,
+        cheap_max=CWM_ENTRY_PRICE_MAX_5M,
         side="DOWN",
-        kind="reclaim_dn",
+        kind="cwm_dn",
+        min_elapsed_sec=CWM_MIN_ELAPSED_SEC_5M,
+        max_elapsed_sec=CWM_MAX_ELAPSED_SEC_5M,
+        momentum_lookback_sec=CWM_MOMENTUM_LOOKBACK_SEC,
+        momentum_bps_min=CWM_MOMENTUM_BPS_MIN,
         market_buy_max_price=BTC_MARKET_BUY_MAX_PRICE_5M,
     ),
 )
 
-BTC_RULES_15M: tuple[MispriceRule, ...] = (
-    MispriceRule(
-        "reclaim_buy_up",
-        price_min=BTC_ENTRY_PRICE_MIN_15M,
-        cheap_max=BTC_ENTRY_PRICE_MAX_15M,
-        side="UP",
-        kind="reclaim_up",
-        min_elapsed_sec=MIN_ELAPSED_SEC_15M,
-        max_elapsed_sec=MAX_ELAPSED_SEC_15M,
-        lookback_sec=RECLAIM_LOOKBACK_SEC_15M,
-        market_buy_max_price=BTC_MARKET_BUY_MAX_PRICE_15M,
-    ),
-    MispriceRule(
-        "reclaim_buy_down",
-        price_min=BTC_ENTRY_PRICE_MIN_15M,
-        cheap_max=BTC_ENTRY_PRICE_MAX_15M,
-        side="DOWN",
-        kind="reclaim_dn",
-        min_elapsed_sec=MIN_ELAPSED_SEC_15M,
-        max_elapsed_sec=MAX_ELAPSED_SEC_15M,
-        lookback_sec=RECLAIM_LOOKBACK_SEC_15M,
-        market_buy_max_price=BTC_MARKET_BUY_MAX_PRICE_15M,
-    ),
-)
+BTC_RULES_15M: tuple[MispriceRule, ...] = ()
 
 ETH_RULES_5M: tuple[MispriceRule, ...] = ()
 
@@ -137,4 +120,8 @@ def rule_fires(rule: MispriceRule, *, btc: float, start_btc: float, mid_up: floa
         return btc > start_btc and rule.price_min <= mid_up <= rule.cheap_max and gap >= rule.gap_min
     if rule.kind == "reclaim_dn":
         return btc < start_btc and rule.price_min <= mid_dn <= rule.cheap_max and gap >= rule.gap_min
+    if rule.kind == "cwm_up":
+        return btc > start_btc and rule.price_min <= mid_up <= rule.cheap_max
+    if rule.kind == "cwm_dn":
+        return btc < start_btc and rule.price_min <= mid_dn <= rule.cheap_max
     return False

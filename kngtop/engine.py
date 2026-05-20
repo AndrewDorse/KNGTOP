@@ -264,6 +264,27 @@ def _signal_ready(
         if ask_dn is None or spot >= start_px or (-momentum_bps) < min_momentum:
             return False, None
         return rule.price_min <= ask_dn <= rule.cheap_max, ask_dn
+    if rule.kind in {"cwm_up", "cwm_dn"}:
+        momentum_sec = int(rule.momentum_lookback_sec or 0)
+        if momentum_sec <= 0:
+            return False, None
+        hist_spot = None
+        cutoff_ts = now_ts - float(momentum_sec)
+        for ts, px in reversed(history):
+            if ts <= cutoff_ts:
+                hist_spot = px
+                break
+        if hist_spot is None:
+            return False, None
+        momentum_bps = ((spot - hist_spot) / start_px) * 10000.0
+        min_momentum = float(rule.momentum_bps_min or 0.0)
+        if rule.kind == "cwm_up":
+            if ask_up is None or spot <= start_px or momentum_bps < min_momentum:
+                return False, None
+            return rule.price_min <= ask_up <= rule.cheap_max, ask_up
+        if ask_dn is None or spot >= start_px or (-momentum_bps) < min_momentum:
+            return False, None
+        return rule.price_min <= ask_dn <= rule.cheap_max, ask_dn
     if rule.kind == "reclaim_up":
         if ask_up is None or spot <= start_px:
             return False, None

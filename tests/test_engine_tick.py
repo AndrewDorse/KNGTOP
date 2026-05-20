@@ -107,12 +107,14 @@ def _runner_for_start(start_offset_sec: int) -> WindowRunner:
     return runner
 
 
-def test_tick_fires_reclaim_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_fires_cwm_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
     runner = _runner_for_start(90)
     runner.spot_history.extend(
         [
-            (datetime.now(timezone.utc).timestamp() - 20, 99_999.0),
+            (datetime.now(timezone.utc).timestamp() - 20, 100_000.1),
+            (datetime.now(timezone.utc).timestamp() - 10, 100_000.2),
+            (datetime.now(timezone.utc).timestamp() - 5, 99_999.0),
             (datetime.now(timezone.utc).timestamp() - 10, 100_001.0),
         ]
     )
@@ -124,16 +126,18 @@ def test_tick_fires_reclaim_up_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
         cfg=cfg,
         runtime_state={},
     )
-    assert "reclaim_buy_up" in runner.traded_rule_keys
+    assert "cwm_buy_up" in runner.traded_rule_keys
 
 
-def test_tick_fires_reclaim_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_fires_cwm_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
     runner = _runner_for_start(90)
     runner.spot_history.extend(
         [
-            (datetime.now(timezone.utc).timestamp() - 20, 100_001.0),
-            (datetime.now(timezone.utc).timestamp() - 10, 99_999.0),
+            (datetime.now(timezone.utc).timestamp() - 20, 99_999.9),
+            (datetime.now(timezone.utc).timestamp() - 10, 99_999.8),
+            (datetime.now(timezone.utc).timestamp() - 5, 100_001.0),
+            (datetime.now(timezone.utc).timestamp() - 1, 99_999.0),
         ]
     )
     _tick_runner(
@@ -144,16 +148,17 @@ def test_tick_fires_reclaim_down_dry_run(monkeypatch: pytest.MonkeyPatch) -> Non
         cfg=cfg,
         runtime_state={},
     )
-    assert "reclaim_buy_down" in runner.traded_rule_keys
+    assert "cwm_buy_down" in runner.traded_rule_keys
 
 
-def test_tick_does_not_fire_without_prior_opposite_side(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_does_not_fire_without_positive_momentum(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
     runner = _runner_for_start(90)
     runner.spot_history.extend(
         [
             (datetime.now(timezone.utc).timestamp() - 20, 100_000.5),
             (datetime.now(timezone.utc).timestamp() - 10, 100_000.8),
+            (datetime.now(timezone.utc).timestamp() - 5, 100_001.2),
         ]
     )
     _tick_runner(
@@ -167,18 +172,19 @@ def test_tick_does_not_fire_without_prior_opposite_side(monkeypatch: pytest.Monk
     assert not runner.traded_rule_keys
 
 
-def test_tick_does_not_fire_when_gap_too_small(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_does_not_fire_when_price_too_high(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
     runner = _runner_for_start(90)
     runner.spot_history.extend(
         [
-            (datetime.now(timezone.utc).timestamp() - 20, 99_999.0),
-            (datetime.now(timezone.utc).timestamp() - 10, 100_001.0),
+            (datetime.now(timezone.utc).timestamp() - 20, 100_000.1),
+            (datetime.now(timezone.utc).timestamp() - 10, 100_000.2),
+            (datetime.now(timezone.utc).timestamp() - 5, 99_999.0),
         ]
     )
     _tick_runner(
         runner,
-        poly=_FakePoly(ask_up=0.20, ask_dn=0.18),
+        poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
         binance=_FakeBinanceCombo(100_001.0),
         clob=None,
         cfg=cfg,
@@ -213,8 +219,9 @@ def test_tick_executes_first_leg_only(monkeypatch: pytest.MonkeyPatch) -> None:
     runner.trade_notional_usd = 5.0
     runner.spot_history.extend(
         [
-            (datetime.now(timezone.utc).timestamp() - 20, 99_999.0),
-            (datetime.now(timezone.utc).timestamp() - 10, 100_001.0),
+            (datetime.now(timezone.utc).timestamp() - 20, 100_000.1),
+            (datetime.now(timezone.utc).timestamp() - 10, 100_000.2),
+            (datetime.now(timezone.utc).timestamp() - 5, 99_999.0),
         ]
     )
     clob = _FakeClobExec(100.0)
@@ -226,20 +233,20 @@ def test_tick_executes_first_leg_only(monkeypatch: pytest.MonkeyPatch) -> None:
         cfg=cfg,
         runtime_state={},
     )
-    assert "reclaim_buy_up" in runner.traded_rule_keys
+    assert "cwm_buy_up" in runner.traded_rule_keys
     assert clob.limit_calls == [(0.23, pytest.approx(21.73))]
 
 
-def test_tick_marks_reclaim_rule_closed_after_send(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_marks_cwm_rule_closed_after_send(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=False)
     runner = _runner_for_start(90)
     runner.trade_notional_usd = 5.0
     now_ts = datetime.now(timezone.utc).timestamp()
     runner.spot_history.extend(
         [
-            (now_ts - 20, 99_999.0),
-            (now_ts - 10, 100_001.0),
-            (now_ts - 4, 99_999.8),
+            (now_ts - 20, 100_000.1),
+            (now_ts - 10, 100_000.2),
+            (now_ts - 5, 99_999.0),
         ]
     )
     clob = _FakeClobExec(100.0)
@@ -254,13 +261,13 @@ def test_tick_marks_reclaim_rule_closed_after_send(monkeypatch: pytest.MonkeyPat
     runner.spot_history.append((datetime.now(timezone.utc).timestamp() - 4, 100_000.9))
     _tick_runner(
         runner,
-        poly=_FakePoly(ask_up=0.30, ask_dn=0.70),
+        poly=_FakePoly(ask_up=0.24, ask_dn=0.70),
         binance=_FakeBinanceCombo(100_001.0),
         clob=clob,
         cfg=cfg,
         runtime_state={},
     )
-    assert "reclaim_buy_up" in runner.traded_rule_keys
+    assert "cwm_buy_up" in runner.traded_rule_keys
     assert clob.limit_calls == [(0.23, pytest.approx(21.73))]
 
 
@@ -294,6 +301,7 @@ def test_planned_window_notional_clamps_to_fraction_min_and_max(monkeypatch: pyt
     assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=100.0) == pytest.approx(100.0 * ENTRY_BALANCE_FRACTION)
     assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10_000.0) == pytest.approx(ENTRY_MAX_NOTIONAL_USD)
     assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10.0) == pytest.approx(1.25)
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=15, available_balance_usdc=10.0) == 0.0
 
 
 def test_shares_for_budget_is_quantized_without_share_floor() -> None:
@@ -363,7 +371,7 @@ def test_finalize_runner_window_logs_result(monkeypatch: pytest.MonkeyPatch) -> 
     cfg = _cfg(monkeypatch, dry_run=True)
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug="btc-updown-5m-1777900200"), 5, RULES_5M)
     runner.start_px = 100_000.0
-    runner.executed_rule_sides["reclaim_buy_up"] = "UP"
+    runner.executed_rule_sides["cwm_buy_up"] = "UP"
     with patch("kngtop.engine._event") as event_mock:
         _finalize_runner_window(runner, binance=_FakeBinanceCombo(100_010.0, symbol="BTCUSDT"), cfg=cfg)
     event_mock.assert_called_once()
@@ -414,5 +422,4 @@ def test_run_iteration_prewarms_token_metadata_for_new_runner(monkeypatch: pytes
 
 def test_15m_rules_are_available_for_runner() -> None:
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug="btc-updown-15m-1777900500"), 15, RULES_15M)
-    assert len(runner.rules) == 2
-    assert all(rule.min_elapsed_sec >= 180 for rule in runner.rules)
+    assert len(runner.rules) == 0
