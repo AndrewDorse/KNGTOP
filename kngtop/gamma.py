@@ -126,10 +126,26 @@ def discover_active_updown_window(
     now_ts = int(now.timestamp())
     window_sec = int(window_minutes) * 60
     start = (now_ts // window_sec) * window_sec
+    return discover_updown_window_by_start(
+        market_symbol=market_symbol,
+        window_minutes=window_minutes,
+        start_sec=start,
+        timeout=timeout,
+    )
+
+
+def discover_updown_window_by_start(
+    *,
+    market_symbol: str,
+    window_minutes: int,
+    start_sec: int,
+    timeout: float,
+) -> ActiveContract | None:
+    now = datetime.now(timezone.utc)
     sym = market_symbol.lower()
     url = f"{GAMMA_URL}/markets"
     for tf in _timeframe_aliases(window_minutes):
-        slug = f"{sym}-updown-{tf}-{start}"
+        slug = f"{sym}-updown-{tf}-{int(start_sec)}"
         try:
             r = requests.get(url, params={"slug": slug}, timeout=timeout)
             r.raise_for_status()

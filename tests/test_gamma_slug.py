@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from kngtop.gamma import TokenMarket, _timeframe_aliases, discover_active_updown_window, window_start_ts_from_slug
+from kngtop.gamma import (
+    TokenMarket,
+    _timeframe_aliases,
+    discover_active_updown_window,
+    discover_updown_window_by_start,
+    window_start_ts_from_slug,
+)
 
 
 def test_window_start_from_slug() -> None:
@@ -70,3 +76,41 @@ def test_discover_active_window_falls_back_to_60m_alias(monkeypatch) -> None:
     assert contract.question == "Bitcoin Up or Down - Hourly"
     assert contract.up == TokenMarket("up_id", "UP", "0.01", False)
     assert contract.down == TokenMarket("down_id", "DOWN", "0.01", False)
+
+
+def test_discover_window_by_exact_start(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    start = 1_777_900_500
+    expected_slug = f"btc-updown-5m-{start}"
+
+    def _fake_get(_url: str, *, params: dict[str, object], timeout: float):
+        del timeout
+        assert params["slug"] == expected_slug
+        return _FakeResp(
+            [
+                {
+                    "slug": expected_slug,
+                    "question": "Bitcoin Up or Down - 5m",
+                    "active": True,
+                    "closed": False,
+                    "archived": False,
+                    "endDate": (now + timedelta(minutes=4)).isoformat(),
+                    "outcomes": ["UP", "DOWN"],
+                    "clobTokenIds": ["up_id", "down_id"],
+                    "minimum_tick_size": "0.01",
+                    "neg_risk": False,
+                }
+            ]
+        )
+
+    monkeypatch.setattr("kngtop.gamma.requests.get", _fake_get)
+
+    contract = discover_updown_window_by_start(
+        market_symbol="btc",
+        window_minutes=5,
+        start_sec=start,
+        timeout=5.0,
+    )
+
+    assert contract is not None
+    assert contract.slug == expected_slug

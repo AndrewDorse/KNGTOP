@@ -1,40 +1,80 @@
-"""Multi-asset BTC/ETH/XRP Up/Down — 5m+15m parallel, WS-triggered eval + heartbeat."""
+"""BTC 5m balanced two-sided maker driven by websocket updates plus 0.2s heartbeat."""
 
 from __future__ import annotations
 
 import logging
-import math
 import sys
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 from kngtop.binance_multi_ws import BinanceCombinedTradeFeed
-from kngtop.binance_rest import fetch_binance_spot_price, fetch_binance_window_open_px
 from kngtop.clob_client import KngtopClob
 from kngtop.config import KngtopConfig
 from kngtop.eval_coordinator import EvalCoordinator
-from kngtop.gamma import ActiveContract, TokenMarket, discover_active_btc_window, window_start_ts_from_slug
-from kngtop.strategy_params import BTC_HEDGE_TARGET_SUM_5M, BTC_HEDGE_START_LIMIT_5M, MispriceRule, rules_for_asset
+from kngtop.gamma import (
+    ActiveContract,
+    TokenMarket,
+    discover_updown_window_by_start,
+    window_start_ts_from_slug,
+)
+from kngtop.pm_data import fetch_user_positions
 from kngtop.rest_poll import run_ws_rest_fallback_loop
 from kngtop.ws_market import MarketWsFeed
 
 LOGGER = logging.getLogger("kngtop")
-WINDOWS_TO_TRADE: tuple[int, ...] = (5, 15)
-BOOT_WARMUP_DELAY_SEC = 0.0
-MAX_SPOT_HISTORY_SEC = 180
-ENTRY_BALANCE_FRACTION = 0.05
-ENTRY_MIN_NOTIONAL_USD = 1.25
-ENTRY_MAX_NOTIONAL_USD = 200.0
-ENTRY_MIN_SHARES = 5.0
-ENTRY_LIMIT_PRICE_BUFFER = 0.03
-HEDGE_START_LIMIT_PRICE = BTC_HEDGE_START_LIMIT_5M
-HEDGE_TARGET_SUM = BTC_HEDGE_TARGET_SUM_5M
-DISCOVERY_RETRY_SEC_WHEN_MISSING = 15.0
-FAILED_RETRY_COOLDOWN_SEC = 2.0
-INSUFFICIENT_BALANCE_BACKOFF_SEC = 30.0
+
+TRADE_PAIR_KEY = "BTC"
+TRADE_WINDOW_MINUTES = 5
+WINDOW_SECONDS = TRADE_WINDOW_MINUTES * 60
+NEXT_WINDOW_LOOKAHEAD_SEC = 20
+MIN_REMAINING_SEC = 30
+STOP_NEW_BUYS_ELAPSED_SEC = 270
+BASE_ORDER_SHARES = 5.0
+PRICE_STEP = 0.01
+MIN_BUY_PRICE = 0.35
+MAX_BUY_PRICE = 0.65
+MAX_TOTAL_EXPOSURE_PER_WINDOW = 30.0
+MAX_ONE_SIDE_EXPOSURE = 20.0
+MAX_OPEN_BUY_ORDERS = 2
+MAX_OPEN_BUY_ORDERS_PER_SIDE = 1
+MAX_IMBALANCE_SHARES = 5.0
+DISCOVERY_RETRY_SEC_WHEN_MISSING = 2.0
+RECONCILE_COOLDOWN_SEC = 2.0
+FAST_RECONCILE_AFTER_ACTION_SEC = 0.75
+SENT_ORDER_CACHE_SEC = 10.0
+CANCEL_REPLACE_COOLDOWN_SEC = 5.0
+SAME_SIDE_ORDER_COOLDOWN_SEC = 5.0
+WS_UPDATE_LOG_COOLDOWN_SEC = 1.0
+
+
+def _side_float_map() -> dict[str, float]:
+    return {"UP": 0.0, "DOWN": 0.0}
+
+
+def _side_orders_map() -> dict[str, list["ManagedOrder"]]:
+    return {"UP": [], "DOWN": []}
+
+
+def _side_time_map() -> dict[str, float]:
+    return {"UP": 0.0, "DOWN": 0.0}
+
+
+@dataclass(slots=True)
+class ManagedOrder:
+    order_id: str
+    side: str
+    token_id: str
+    price: float
+    original_size: float
+    remaining_size: float
+    matched_size: float
+    first_seen_monotonic: float
+
+    def age_sec(self, now_monotonic: float) -> float:
+        return max(0.0, float(now_monotonic) - float(self.first_seen_monotonic))
 
 
 @dataclass
@@ -43,128 +83,53 @@ class WindowRunner:
     binance_symbol: str
     contract: ActiveContract
     window_minutes: int
-    rules: tuple[MispriceRule, ...]
-    start_px: float | None = None
-    trade_notional_usd: float | None = None
-    rule_notional_usd: dict[str, float] = field(default_factory=dict)
-    traded_rule_keys: set[str] = field(default_factory=set)
-    executed_rule_sides: dict[str, str] = field(default_factory=dict)
-    pending_order_ids: dict[str, str] = field(default_factory=dict)
-    rule_retry_not_before: dict[str, float] = field(default_factory=dict)
-    spot_history: deque[tuple[float, float]] = field(default_factory=deque)
-    starter_order_ids: dict[str, str] = field(default_factory=dict)
-    starter_shares: float | None = None
-    starter_order_cost: float | None = None
-    starter_orders_posted: bool = False
-    pair_started: bool = False
-    pair_completed: bool = False
-    filled_first_side: str | None = None
-    first_fill_price: float | None = None
-    hedge_order_id: str | None = None
-    hedge_order_side: str | None = None
-    hedge_limit_price: float | None = None
+    stopped: bool = False
+    stop_reason: str | None = None
+    filled_shares: dict[str, float] = field(default_factory=_side_float_map)
+    filled_cost: dict[str, float] = field(default_factory=_side_float_map)
+    open_orders: dict[str, list[ManagedOrder]] = field(default_factory=_side_orders_map)
+    order_first_seen: dict[str, float] = field(default_factory=dict)
+    sent_order_cache: dict[str, float] = field(default_factory=dict)
+    last_place_monotonic: dict[str, float] = field(default_factory=_side_time_map)
+    last_cancel_monotonic: dict[str, float] = field(default_factory=_side_time_map)
+    last_reconcile_monotonic: float = 0.0
+    reconcile_after_action_monotonic: float = 0.0
+    force_reconcile: bool = True
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def refresh_start_px(self, cfg: KngtopConfig) -> None:
-        if self.start_px is not None:
-            return
-        w0 = window_start_ts_from_slug(self.contract.slug)
-        if w0 is None:
-            return
-        self.start_px = fetch_binance_window_open_px(
-            symbol=self.binance_symbol,
-            window_start_sec=w0,
-            window_minutes=self.window_minutes,
-            timeout=cfg.request_timeout_sec,
-        )
+    def start_sec(self) -> int | None:
+        return window_start_ts_from_slug(self.contract.slug)
+
+    def avg_price(self, side: str) -> float | None:
+        shares = float(self.filled_shares.get(side, 0.0))
+        if shares <= 0:
+            return None
+        return float(self.filled_cost.get(side, 0.0)) / shares
+
+    def side_exposure(self, side: str) -> float:
+        filled = float(self.filled_cost.get(side, 0.0))
+        open_exposure = sum(max(0.0, o.remaining_size) * max(0.0, o.price) for o in self.open_orders.get(side, []))
+        return filled + open_exposure
+
+    def total_exposure(self) -> float:
+        return self.side_exposure("UP") + self.side_exposure("DOWN")
+
+    def imbalance_shares(self) -> float:
+        return float(self.filled_shares.get("UP", 0.0)) - float(self.filled_shares.get("DOWN", 0.0))
+
+    def open_order_count(self, side: str | None = None) -> int:
+        if side is None:
+            return sum(len(rows) for rows in self.open_orders.values())
+        return len(self.open_orders.get(side, []))
 
 
 @dataclass
 class DiscoveryState:
-    last_window_start_sec: int | None = None
     last_checked_monotonic: float = 0.0
 
 
-def _planned_window_notional_usd(
-    cfg: KngtopConfig,
-    *,
-    pair_key: str,
-    window_minutes: int,
-    available_balance_usdc: float | None,
-) -> float:
-    rules = rules_for_asset(pair_key, window_minutes)
-    if not rules:
-        return 0.0
-    min_required_budget = ENTRY_MIN_NOTIONAL_USD
-    if available_balance_usdc is None:
-        return min_required_budget
-    if available_balance_usdc < min_required_budget:
-        return 0.0
-    budget_usd = available_balance_usdc * ENTRY_BALANCE_FRACTION
-    budget_usd = max(min_required_budget, budget_usd)
-    budget_usd = min(ENTRY_MAX_NOTIONAL_USD, budget_usd)
-    return float(budget_usd)
-
-
-def _rule_notional_usd(rule: MispriceRule, runner: WindowRunner) -> float:
-    if rule.key in runner.rule_notional_usd:
-        return float(runner.rule_notional_usd[rule.key])
-    return float(runner.trade_notional_usd or 1.0)
-
-
-def _limit_price_from_signal(signal_price: float) -> float:
-    px = round(float(signal_price) + ENTRY_LIMIT_PRICE_BUFFER, 2)
-    return min(max(px, 0.01), 0.99)
-
-
-def _shares_for_budget(*, budget_usd: float, limit_price: float) -> tuple[float, float]:
-    px = float(limit_price)
-    if px <= 0 or px >= 1:
-        return 0.0, 0.0
-    effective_budget = max(float(budget_usd), float(ENTRY_MIN_SHARES) * px)
-    raw_shares = effective_budget / px
-    quantized = math.floor(raw_shares * 100.0) / 100.0
-    shares = max(float(ENTRY_MIN_SHARES), quantized)
-    order_cost = shares * px
-    if shares < 0.01:
-        return 0.0
-    return shares, order_cost
-
-
-def _current_window_start_sec(now_ts: int, window_minutes: int) -> int:
-    window_sec = max(60, int(window_minutes) * 60)
-    return (int(now_ts) // window_sec) * window_sec
-
-
-def _runner_matches_current_window(runner: WindowRunner | None, *, now_ts: int, window_minutes: int) -> bool:
-    if runner is None:
-        return False
-    start_ts = window_start_ts_from_slug(runner.contract.slug)
-    if start_ts is None:
-        return False
-    return int(start_ts) == _current_window_start_sec(now_ts, window_minutes)
-
-
-def _should_discover_contract(
-    runner: WindowRunner | None,
-    state: DiscoveryState,
-    *,
-    now_ts: int,
-    now_monotonic: float,
-    window_minutes: int,
-) -> bool:
-    current_start = _current_window_start_sec(now_ts, window_minutes)
-    if _runner_matches_current_window(runner, now_ts=now_ts, window_minutes=window_minutes):
-        return False
-    if state.last_window_start_sec != current_start:
-        return True
-    if runner is None and (now_monotonic - state.last_checked_monotonic) >= DISCOVERY_RETRY_SEC_WHEN_MISSING:
-        return True
-    return False
-
-
 def _setup_logging(level: str) -> None:
-    lv = getattr(logging, level.upper(), logging.ERROR)
+    lv = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
         level=lv,
         format="%(asctime)sZ %(levelname)s %(name)s %(message)s",
@@ -184,48 +149,26 @@ def _setup_logging(level: str) -> None:
         noisy.propagate = False
 
 
+def _log_tag(tag: str, **fields: object) -> None:
+    parts = [f"{key}={value}" for key, value in fields.items() if value is not None]
+    LOGGER.info("[%s] %s", tag, " ".join(parts))
+
+
 def _event(kind: str, **fields: object) -> None:
-    if kind not in {"INIT", "BOOT_DELAY", "START_DEAL", "RETRY_BUY", "DEAL_WINDOW_CLOSED", "ERROR"}:
-        return
-    parts = [f"{k}={v}" for k, v in fields.items()]
-    print(f"{kind} " + " ".join(parts), flush=True)
-
-
-def _timing(stage: str, **fields: object) -> None:
-    _event("TIMING", stage=stage, **fields)
+    _log_tag(kind, **fields)
 
 
 def _ws_reconnected_event(feed: str, downtime_sec: float) -> None:
-    _event("WS_RECONNECTED", feed=feed, downtime_sec=f"{downtime_sec:.3f}")
+    _log_tag("WS UPDATE", feed=feed, event="reconnected", downtime_sec=f"{downtime_sec:.3f}")
 
 
-def _pick_token(c: ActiveContract, side: str):
-    return c.up if side.upper() == "UP" else c.down
-
-
-def _opposite_side(side: str) -> str:
-    return "DOWN" if side.upper() == "UP" else "UP"
-
-
-def _window_elapsed_ready(runner: WindowRunner, now: datetime) -> bool:
-    start_ts = window_start_ts_from_slug(runner.contract.slug)
-    if start_ts is None:
-        return False
-    elapsed = now.timestamp() - float(start_ts)
-    min_elapsed = min((rule.min_elapsed_sec for rule in runner.rules), default=0)
-    return elapsed >= min_elapsed
-
-
-def _window_elapsed_sec(runner: WindowRunner, now: datetime) -> float | None:
-    start_ts = window_start_ts_from_slug(runner.contract.slug)
-    if start_ts is None:
-        return None
-    return now.timestamp() - float(start_ts)
-
-
-def _effective_market_buy_cap(rule: MispriceRule, *, cfg: KngtopConfig, window_elapsed: float | None) -> float | None:
-    del cfg, window_elapsed
-    return rule.market_buy_max_price
+def _log_ws_update(runtime_state: dict[str, Any], *, feed: str, symbol: str | None = None) -> None:
+    now_monotonic = time.perf_counter()
+    gate_key = f"ws_log_not_before:{feed}:{symbol or '-'}"
+    if now_monotonic < float(runtime_state.get(gate_key, 0.0)):
+        return
+    runtime_state[gate_key] = now_monotonic + WS_UPDATE_LOG_COOLDOWN_SEC
+    _log_tag("WS UPDATE", feed=feed, symbol=symbol or "-")
 
 
 def _extract_order_id(payload: object) -> str | None:
@@ -238,179 +181,276 @@ def _extract_order_id(payload: object) -> str | None:
     return None
 
 
-def _is_order_still_open(clob: KngtopClob | None, token: TokenMarket, order_id: str | None) -> bool:
-    if clob is None or not order_id:
-        return False
-    try:
-        return clob.is_order_open_for_asset(token, order_id)
-    except Exception as exc:  # noqa: BLE001
-        _event("ERROR", stage="order_open_check", order_id=str(order_id), error=str(exc))
-        return False
-
-
 def _extract_numeric(payload: dict[str, object], *keys: str) -> float | None:
     for key in keys:
         raw = payload.get(key)
         try:
-            if raw is not None:
+            if raw is not None and raw != "":
                 return float(raw)
         except (TypeError, ValueError):
             continue
     return None
 
 
-def _is_order_verified_filled(clob: KngtopClob | None, order_id: str | None) -> bool:
-    if clob is None or not order_id:
+def _normalize_share_qty(raw: float | None) -> float | None:
+    if raw is None:
+        return None
+    qty = float(raw)
+    if float(qty).is_integer() and abs(qty) >= 100_000:
+        return qty / 1_000_000.0
+    return qty
+
+
+def _current_window_start_sec(now_ts: int, window_minutes: int) -> int:
+    window_sec = max(60, int(window_minutes) * 60)
+    return (int(now_ts) // window_sec) * window_sec
+
+
+def _candidate_window_starts(now_ts: int) -> tuple[int, ...]:
+    current_start = _current_window_start_sec(now_ts, TRADE_WINDOW_MINUTES)
+    next_start = current_start + WINDOW_SECONDS
+    if next_start - int(now_ts) <= NEXT_WINDOW_LOOKAHEAD_SEC:
+        return (current_start, next_start)
+    return (current_start,)
+
+
+def _window_elapsed_remaining(runner: WindowRunner, now_ts: float) -> tuple[float | None, float | None]:
+    start_sec = runner.start_sec()
+    if start_sec is None:
+        return None, None
+    elapsed = float(now_ts) - float(start_sec)
+    remaining = float(runner.window_minutes * 60) - elapsed
+    return elapsed, remaining
+
+
+def _runner_needs_reconcile(runner: WindowRunner, now_monotonic: float) -> bool:
+    if runner.force_reconcile:
+        return True
+    if runner.reconcile_after_action_monotonic > 0 and now_monotonic >= runner.reconcile_after_action_monotonic:
+        return True
+    return (now_monotonic - runner.last_reconcile_monotonic) >= RECONCILE_COOLDOWN_SEC
+
+
+def _compute_limit_buy_price(*, best_bid: float | None, best_ask: float | None) -> float | None:
+    if best_bid is None or best_ask is None:
+        return None
+    target = float(best_bid) + PRICE_STEP
+    target = min(max(target, MIN_BUY_PRICE), MAX_BUY_PRICE)
+    if target >= float(best_ask):
+        target = float(best_ask) - PRICE_STEP
+    target = round(target, 2)
+    if target <= 0 or target >= 1:
+        return None
+    if target < MIN_BUY_PRICE or target > MAX_BUY_PRICE:
+        return None
+    if target >= float(best_ask):
+        return None
+    return target
+
+
+def _desired_sides(imbalance_shares: float) -> tuple[str, ...]:
+    if imbalance_shares > 0:
+        return ("DOWN",)
+    if imbalance_shares < 0:
+        return ("UP",)
+    return ("UP", "DOWN")
+
+
+def _prune_sent_order_cache(runner: WindowRunner, now_monotonic: float) -> None:
+    runner.sent_order_cache = {
+        key: ts for key, ts in runner.sent_order_cache.items() if (now_monotonic - float(ts)) < SENT_ORDER_CACHE_SEC
+    }
+
+
+def _parse_order_rows(
+    *,
+    rows: list[dict[str, Any]],
+    token: TokenMarket,
+    side: str,
+    order_first_seen: dict[str, float],
+    now_monotonic: float,
+) -> list[ManagedOrder]:
+    parsed: list[ManagedOrder] = []
+    token_id = str(token.token_id)
+    for row in rows:
+        asset_id = str(row.get("asset_id") or row.get("asset") or row.get("token_id") or "")
+        if asset_id and asset_id != token_id:
+            continue
+        raw_side = str(row.get("side") or row.get("order_side") or "").strip().upper()
+        if raw_side and raw_side != "BUY":
+            continue
+        order_id = _extract_order_id(row)
+        price = _extract_numeric(row, "price")
+        if not order_id or price is None:
+            continue
+        original_size = _normalize_share_qty(
+            _extract_numeric(row, "original_size", "size", "makerAmount", "amount")
+        )
+        matched_size = _normalize_share_qty(
+            _extract_numeric(row, "size_matched", "matched_amount", "filled_amount", "filled", "makerAmountFilled")
+        )
+        remaining_size = _normalize_share_qty(
+            _extract_numeric(row, "size_left", "remaining", "remaining_amount", "size_remaining", "makerAmountRemaining")
+        )
+        matched_size = max(0.0, float(matched_size or 0.0))
+        if remaining_size is None and original_size is not None:
+            remaining_size = max(0.0, float(original_size) - matched_size)
+        if original_size is None and remaining_size is not None:
+            original_size = max(0.0, float(remaining_size) + matched_size)
+        if original_size is None:
+            continue
+        remaining = max(0.0, float(remaining_size or 0.0))
+        if remaining <= 0:
+            continue
+        first_seen = float(order_first_seen.get(order_id, now_monotonic))
+        order_first_seen[order_id] = first_seen
+        parsed.append(
+            ManagedOrder(
+                order_id=order_id,
+                side=side,
+                token_id=token_id,
+                price=float(price),
+                original_size=float(original_size),
+                remaining_size=remaining,
+                matched_size=matched_size,
+                first_seen_monotonic=first_seen,
+            )
+        )
+    parsed.sort(key=lambda order: (order.first_seen_monotonic, order.order_id))
+    return parsed
+
+
+def _apply_reconcile_snapshot(
+    runner: WindowRunner,
+    *,
+    open_order_rows: list[dict[str, Any]],
+    position_rows: list[dict[str, Any]],
+    now_monotonic: float,
+) -> None:
+    runner.open_orders["UP"] = _parse_order_rows(
+        rows=open_order_rows,
+        token=runner.contract.up,
+        side="UP",
+        order_first_seen=runner.order_first_seen,
+        now_monotonic=now_monotonic,
+    )
+    runner.open_orders["DOWN"] = _parse_order_rows(
+        rows=open_order_rows,
+        token=runner.contract.down,
+        side="DOWN",
+        order_first_seen=runner.order_first_seen,
+        now_monotonic=now_monotonic,
+    )
+    live_order_ids = {order.order_id for orders in runner.open_orders.values() for order in orders}
+    stale_ids = [oid for oid in runner.order_first_seen if oid not in live_order_ids]
+    for oid in stale_ids:
+        runner.order_first_seen.pop(oid, None)
+    for side, token in (("UP", runner.contract.up), ("DOWN", runner.contract.down)):
+        shares = 0.0
+        cost = 0.0
+        for row in position_rows:
+            slug = str(row.get("slug") or row.get("marketSlug") or row.get("market_slug") or "")
+            asset_id = str(row.get("asset") or row.get("asset_id") or row.get("token_id") or "")
+            outcome = str(row.get("outcome") or "").strip().upper()
+            if slug and slug != runner.contract.slug:
+                continue
+            if asset_id and asset_id != token.token_id and outcome != side:
+                continue
+            if outcome and outcome != side and asset_id != token.token_id:
+                continue
+            size = _normalize_share_qty(_extract_numeric(row, "size", "amount", "shares"))
+            avg_price = _extract_numeric(row, "avgPrice", "averagePrice", "avg_price", "price")
+            if size is None or size <= 0:
+                continue
+            shares += float(size)
+            if avg_price is not None and 0 < float(avg_price) < 1:
+                cost += float(size) * float(avg_price)
+        runner.filled_shares[side] = shares
+        runner.filled_cost[side] = cost
+    runner.last_reconcile_monotonic = now_monotonic
+    runner.reconcile_after_action_monotonic = 0.0
+    runner.force_reconcile = False
+    runner.sent_order_cache.clear()
+    _log_tag(
+        "POSITION",
+        slug=runner.contract.slug,
+        up_shares=f"{runner.filled_shares['UP']:.2f}",
+        down_shares=f"{runner.filled_shares['DOWN']:.2f}",
+        avg_up="-" if runner.avg_price("UP") is None else f"{runner.avg_price('UP'):.4f}",
+        avg_down="-" if runner.avg_price("DOWN") is None else f"{runner.avg_price('DOWN'):.4f}",
+    )
+    _log_tag(
+        "OPEN ORDERS",
+        slug=runner.contract.slug,
+        up_count=str(len(runner.open_orders["UP"])),
+        down_count=str(len(runner.open_orders["DOWN"])),
+        total_count=str(runner.open_order_count()),
+    )
+
+
+def _refresh_global_reconcile_cache(
+    *,
+    clob: KngtopClob | None,
+    cfg: KngtopConfig,
+    runtime_state: dict[str, Any],
+) -> None:
+    if clob is None:
+        return
+    open_rows: list[dict[str, Any]] = []
+    position_rows: list[dict[str, Any]] = []
+    try:
+        open_rows = clob.get_open_orders()
+        position_rows = fetch_user_positions(user=cfg.funder, timeout=cfg.request_timeout_sec)
+    except Exception as exc:  # noqa: BLE001
+        _log_tag("RECONCILE", scope="global", status="error", error=str(exc))
+        return
+    runtime_state["reconcile_cache_at"] = time.perf_counter()
+    runtime_state["reconcile_open_orders"] = open_rows
+    runtime_state["reconcile_positions"] = position_rows
+    _log_tag(
+        "RECONCILE",
+        scope="global",
+        status="ok",
+        open_orders=str(len(open_rows)),
+        positions=str(len(position_rows)),
+    )
+
+
+def _filtered_positions_for_runner(runner: WindowRunner, position_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    token_ids = {runner.contract.up.token_id, runner.contract.down.token_id}
+    for row in position_rows:
+        slug = str(row.get("slug") or row.get("marketSlug") or row.get("market_slug") or "")
+        asset_id = str(row.get("asset") or row.get("asset_id") or row.get("token_id") or "")
+        if slug and slug == runner.contract.slug:
+            out.append(row)
+            continue
+        if asset_id and asset_id in token_ids:
+            out.append(row)
+    return out
+
+
+def _cancel_order(
+    runner: WindowRunner,
+    *,
+    clob: KngtopClob | None,
+    order: ManagedOrder,
+    reason: str,
+) -> bool:
+    if clob is None:
+        _log_tag("CANCEL", slug=runner.contract.slug, side=order.side, order_id=order.order_id, reason=f"{reason}:dry_run")
         return False
     try:
-        payload = clob.get_order(str(order_id))
+        clob.cancel_order_by_id(order.order_id)
     except Exception as exc:  # noqa: BLE001
-        _event("ERROR", stage="order_status_check", order_id=str(order_id), error=str(exc))
+        _log_tag("CANCEL", slug=runner.contract.slug, side=order.side, order_id=order.order_id, reason=reason, error=str(exc))
         return False
-    if not isinstance(payload, dict):
-        return False
-    nested = payload.get("order")
-    if isinstance(nested, dict):
-        merged = dict(nested)
-        merged.update(payload)
-        payload = merged
-    status = str(payload.get("status") or payload.get("state") or "").strip().lower()
-    matched = _extract_numeric(payload, "matched_amount", "filled_amount", "filled", "size_matched", "makerAmountFilled")
-    remaining = _extract_numeric(payload, "remaining", "remaining_amount", "size_remaining", "makerAmountRemaining")
-    if matched is not None and matched > 0:
-        return True
-    if remaining is not None:
-        size = _extract_numeric(payload, "size", "original_size", "makerAmount")
-        if size is not None and remaining < size:
-            return True
-    return status in {"filled", "matched", "executed", "complete", "completed"}
-
-
-def _signal_ready(
-    rule: MispriceRule,
-    *,
-    now_ts: float,
-    spot: float,
-    start_px: float,
-    ask_up: float | None,
-    ask_dn: float | None,
-    history: deque[tuple[float, float]],
-) -> tuple[bool, float | None]:
-    if start_px <= 0:
-        return False, None
-    gap = abs((ask_up or 0.0) - (ask_dn or 0.0)) if ask_up is not None and ask_dn is not None else None
-    if rule.kind in {"cwc_up", "cwc_dn"}:
-        if gap is None or gap < rule.gap_min:
-            return False, None
-        distance_bps = abs((spot - start_px) / start_px) * 10000.0
-        if rule.distance_bps_max is not None and distance_bps > rule.distance_bps_max:
-            return False, None
-        momentum_sec = int(rule.momentum_lookback_sec or 0)
-        if momentum_sec <= 0:
-            return False, None
-        hist_spot = None
-        cutoff_ts = now_ts - float(momentum_sec)
-        for ts, px in reversed(history):
-            if ts <= cutoff_ts:
-                hist_spot = px
-                break
-        if hist_spot is None:
-            return False, None
-        momentum_bps = ((spot - hist_spot) / start_px) * 10000.0
-        min_momentum = float(rule.momentum_bps_min or 0.0)
-        if rule.kind == "cwc_up":
-            if ask_up is None or spot <= start_px or momentum_bps < min_momentum:
-                return False, None
-            return rule.price_min <= ask_up <= rule.cheap_max, ask_up
-        if ask_dn is None or spot >= start_px or (-momentum_bps) < min_momentum:
-            return False, None
-        return rule.price_min <= ask_dn <= rule.cheap_max, ask_dn
-    if rule.kind in {"cwm_up", "cwm_dn"}:
-        momentum_sec = int(rule.momentum_lookback_sec or 0)
-        if momentum_sec <= 0:
-            return False, None
-        hist_spot = None
-        cutoff_ts = now_ts - float(momentum_sec)
-        for ts, px in reversed(history):
-            if ts <= cutoff_ts:
-                hist_spot = px
-                break
-        if hist_spot is None:
-            return False, None
-        momentum_bps = ((spot - hist_spot) / start_px) * 10000.0
-        min_momentum = float(rule.momentum_bps_min or 0.0)
-        if rule.kind == "cwm_up":
-            if ask_up is None or spot <= start_px or momentum_bps < min_momentum:
-                return False, None
-            return rule.price_min <= ask_up <= rule.cheap_max, ask_up
-        if ask_dn is None or spot >= start_px or (-momentum_bps) < min_momentum:
-            return False, None
-        return rule.price_min <= ask_dn <= rule.cheap_max, ask_dn
-    if rule.kind == "reclaim_up":
-        if ask_up is None or spot <= start_px:
-            return False, None
-        if gap is None or gap < rule.gap_min:
-            return False, None
-        reclaimed = any(
-            ts < now_ts and (now_ts - ts) <= rule.lookback_sec and hist_spot < start_px
-            for ts, hist_spot in history
-        )
-        return reclaimed and rule.price_min <= ask_up <= rule.cheap_max, ask_up
-    if rule.kind == "reclaim_dn":
-        if ask_dn is None or spot >= start_px:
-            return False, None
-        if gap is None or gap < rule.gap_min:
-            return False, None
-        reclaimed = any(
-            ts < now_ts and (now_ts - ts) <= rule.lookback_sec and hist_spot > start_px
-            for ts, hist_spot in history
-        )
-        return reclaimed and rule.price_min <= ask_dn <= rule.cheap_max, ask_dn
-    return False, None
-
-
-def _window_result(side: str, *, start_px: float, final_spot_px: float) -> str:
-    if final_spot_px > start_px:
-        return "RIGHT" if side.upper() == "UP" else "WRONG"
-    if final_spot_px < start_px:
-        return "RIGHT" if side.upper() == "DOWN" else "WRONG"
-    return "TIE"
-
-
-def _finalize_runner_window(
-    runner: WindowRunner | None,
-    *,
-    binance: BinanceCombinedTradeFeed,
-    cfg: KngtopConfig,
-) -> None:
-    if runner is not None and runner.rules and all(rule.kind == "serial_hedge" for rule in runner.rules):
-        return
-    if runner is None or runner.start_px is None or not runner.executed_rule_sides:
-        return
-    final_spot = binance.last_price(runner.binance_symbol, max_age_sec=max(cfg.binance_max_age_sec, 30.0))
-    if final_spot is None:
-        final_spot = fetch_binance_spot_price(symbol=runner.binance_symbol, timeout=cfg.request_timeout_sec)
-    if final_spot is None:
-        return
-    start_px = float(runner.start_px)
-    for rule in runner.rules:
-        side = runner.executed_rule_sides.get(rule.key)
-        if side is None:
-            continue
-        _event(
-            "DEAL_WINDOW_CLOSED",
-            label=f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{side}",
-            result=_window_result(side, start_px=start_px, final_spot_px=float(final_spot)),
-            start_px=f"{start_px:.10f}",
-            final_spot_px=f"{float(final_spot):.10f}",
-        )
-
-
-def _append_spot_history(runner: WindowRunner, *, now_ts: float, spot: float) -> None:
-    runner.spot_history.append((now_ts, spot))
-    cutoff = now_ts - MAX_SPOT_HISTORY_SEC
-    while runner.spot_history and runner.spot_history[0][0] < cutoff:
-        runner.spot_history.popleft()
+    now_monotonic = time.perf_counter()
+    runner.last_cancel_monotonic[order.side] = now_monotonic
+    runner.force_reconcile = True
+    runner.reconcile_after_action_monotonic = now_monotonic + FAST_RECONCILE_AFTER_ACTION_SEC
+    _log_tag("CANCEL", slug=runner.contract.slug, side=order.side, order_id=order.order_id, reason=reason)
+    return True
 
 
 def _execute_buy(
@@ -418,7 +458,7 @@ def _execute_buy(
     cfg: KngtopConfig,
     shares: float,
     budget_usd: float,
-    token,
+    token: TokenMarket,
     label: str,
     *,
     start_px: float,
@@ -427,156 +467,180 @@ def _execute_buy(
     limit_price: float,
     retry_on_error_override: int | None = None,
 ) -> tuple[bool, str | None, str | None]:
-    shares_f = float(shares)
+    del budget_usd, retry_on_error_override
     _event(
         "START_DEAL",
         label=label,
-        shares=str(shares_f),
-        budget_usd=f"{float(budget_usd):.10f}",
-        start_px=f"{start_px:.10f}",
-        spot_px=f"{spot_px:.10f}",
-        pm_trigger_px=f"{pm_trigger_px:.10f}",
+        shares=f"{float(shares):.2f}",
+        start_px=f"{float(start_px):.10f}",
+        spot_px=f"{float(spot_px):.10f}",
+        pm_trigger_px=f"{float(pm_trigger_px):.10f}",
         limit_px=f"{float(limit_price):.2f}",
     )
-    if cfg.dry_run:
+    if cfg.dry_run or clob is None:
         return True, None, None
-    assert clob is not None
-    started = time.perf_counter()
     try:
-        payload = clob.limit_buy_shares(token, price=float(limit_price), shares=shares_f)
+        payload = clob.limit_buy_shares(token, price=float(limit_price), shares=float(shares))
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
-        lower_msg = msg.lower()
-        if "no orders found to match" in lower_msg:
-            reason = "no_match"
-        elif "not enough balance / allowance" in lower_msg:
-            reason = "insufficient_balance"
-        else:
-            reason = "error"
-        _event(
-            "RETRY_BUY",
-            label=label,
-            elapsed_ms=f"{(time.perf_counter() - started) * 1000.0:.1f}",
-            reason=reason,
-        )
-        if reason != "no_match":
-            _event("ERROR", stage="market_buy", label=label, error=msg)
+        reason = "insufficient_balance" if "not enough balance" in msg.lower() else "error"
+        _event("RETRY_BUY", label=label, reason=reason)
         return False, reason, None
     return True, None, _extract_order_id(payload)
 
 
-def _place_serial_hedge_starters(
+def _place_limit_buy(
     runner: WindowRunner,
     *,
     clob: KngtopClob | None,
-    cfg: KngtopConfig,
-    spot: float,
+    token: TokenMarket,
+    side: str,
+    price: float,
+) -> bool:
+    if clob is None:
+        _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{BASE_ORDER_SHARES:.2f}", mode="dry_run")
+        return False
+    try:
+        payload = clob.limit_buy_shares(token, price=float(price), shares=float(BASE_ORDER_SHARES))
+    except Exception as exc:  # noqa: BLE001
+        _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{BASE_ORDER_SHARES:.2f}", status="error", error=str(exc))
+        return False
+    order_id = _extract_order_id(payload) or "unknown"
+    now_monotonic = time.perf_counter()
+    runner.last_place_monotonic[side] = now_monotonic
+    runner.sent_order_cache[f"{side}:{price:.2f}"] = now_monotonic
+    runner.force_reconcile = True
+    runner.reconcile_after_action_monotonic = now_monotonic + FAST_RECONCILE_AFTER_ACTION_SEC
+    _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{BASE_ORDER_SHARES:.2f}", order_id=order_id)
+    return True
+
+
+def _maybe_cancel_orders(
+    runner: WindowRunner,
+    *,
+    clob: KngtopClob | None,
+    side: str,
+    keep: int,
+    reason: str,
+    now_monotonic: float,
 ) -> None:
-    if runner.starter_orders_posted or runner.trade_notional_usd is None or runner.trade_notional_usd <= 0:
+    rows = list(runner.open_orders.get(side, []))
+    if len(rows) <= keep:
         return
-    shares, order_budget_usd = _shares_for_budget(
-        budget_usd=float(runner.trade_notional_usd),
-        limit_price=float(HEDGE_START_LIMIT_PRICE),
+    for order in rows[keep:]:
+        if (now_monotonic - runner.last_cancel_monotonic[side]) < CANCEL_REPLACE_COOLDOWN_SEC:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason=f"{reason}:cancel_cooldown")
+            return
+        if order.age_sec(now_monotonic) < CANCEL_REPLACE_COOLDOWN_SEC:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason=f"{reason}:order_young")
+            continue
+        if _cancel_order(runner, clob=clob, order=order, reason=reason):
+            break
+
+
+def _window_stop_check(runner: WindowRunner) -> tuple[bool, float | None]:
+    avg_up = runner.avg_price("UP")
+    avg_down = runner.avg_price("DOWN")
+    if avg_up is None or avg_down is None:
+        return False, None
+    total = float(avg_up) + float(avg_down)
+    return total <= 0.96, total
+
+
+def _book_for_side(runner: WindowRunner, side: str, poly: MarketWsFeed, cfg: KngtopConfig) -> tuple[float | None, float | None]:
+    token_id = runner.contract.up.token_id if side == "UP" else runner.contract.down.token_id
+    quote = poly.best_bid_ask_for(token_id, max_age_sec=cfg.poly_mid_max_age_sec)
+    if quote is None:
+        return None, None
+    return float(quote[0]), float(quote[1])
+
+
+def _maybe_place_side(
+    runner: WindowRunner,
+    *,
+    clob: KngtopClob | None,
+    poly: MarketWsFeed,
+    cfg: KngtopConfig,
+    side: str,
+    now_monotonic: float,
+) -> None:
+    if runner.open_order_count() >= MAX_OPEN_BUY_ORDERS:
+        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="max_open_orders")
+        return
+    if runner.open_order_count(side) >= MAX_OPEN_BUY_ORDERS_PER_SIDE:
+        return
+    if (now_monotonic - runner.last_place_monotonic[side]) < SAME_SIDE_ORDER_COOLDOWN_SEC:
+        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="same_side_cooldown")
+        return
+    bid, ask = _book_for_side(runner, side, poly, cfg)
+    _log_tag(
+        "BOOK",
+        slug=runner.contract.slug,
+        side=side,
+        bid="-" if bid is None else f"{bid:.2f}",
+        ask="-" if ask is None else f"{ask:.2f}",
     )
-    if shares <= 0:
+    price = _compute_limit_buy_price(best_bid=bid, best_ask=ask)
+    if price is None:
+        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="invalid_book_price")
         return
-    for side in ("UP", "DOWN"):
-        token = _pick_token(runner.contract, side)
-        label = f"{runner.pair_key}/{runner.window_minutes}m/serial_start_{side}/{side}"
-        executed, reason, order_id = _execute_buy(
-            clob,
-            cfg,
-            shares,
-            order_budget_usd,
-            token,
-            label,
-            start_px=float(runner.start_px or 0.0),
-            spot_px=float(spot),
-            pm_trigger_px=float(HEDGE_START_LIMIT_PRICE),
-            limit_price=float(HEDGE_START_LIMIT_PRICE),
-        )
-        if not executed:
-            cooldown = FAILED_RETRY_COOLDOWN_SEC
-            if reason == "insufficient_balance":
-                cooldown = INSUFFICIENT_BALANCE_BACKOFF_SEC
-            runner.rule_retry_not_before["serial_hedge_starters"] = time.perf_counter() + cooldown
-            return
-        if order_id:
-            runner.starter_order_ids[side] = order_id
-    runner.starter_shares = shares
-    runner.starter_order_cost = order_budget_usd
-    runner.starter_orders_posted = True
+    cache_key = f"{side}:{price:.2f}"
+    if cache_key in runner.sent_order_cache:
+        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="duplicate_cooldown", price=f"{price:.2f}")
+        return
+    side_exposure_if_placed = runner.side_exposure(side) + (BASE_ORDER_SHARES * price)
+    total_exposure_if_placed = runner.total_exposure() + (BASE_ORDER_SHARES * price)
+    if side_exposure_if_placed > MAX_ONE_SIDE_EXPOSURE:
+        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="max_one_side_exposure")
+        return
+    if total_exposure_if_placed > MAX_TOTAL_EXPOSURE_PER_WINDOW:
+        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="max_total_exposure")
+        return
+    token = runner.contract.up if side == "UP" else runner.contract.down
+    _place_limit_buy(runner, clob=clob, token=token, side=side, price=price)
 
 
-def _advance_serial_hedge(
+def _maybe_replace_stale_order(
     runner: WindowRunner,
     *,
     clob: KngtopClob | None,
+    poly: MarketWsFeed,
     cfg: KngtopConfig,
-    spot: float,
+    side: str,
+    now_monotonic: float,
 ) -> None:
-    if cfg.dry_run or clob is None or not runner.starter_orders_posted or runner.pair_completed:
+    rows = runner.open_orders.get(side, [])
+    if len(rows) != 1:
         return
-    up_token = runner.contract.up
-    dn_token = runner.contract.down
-    up_order_id = runner.starter_order_ids.get("UP")
-    dn_order_id = runner.starter_order_ids.get("DOWN")
-    up_open = _is_order_still_open(clob, up_token, up_order_id) if up_order_id else False
-    dn_open = _is_order_still_open(clob, dn_token, dn_order_id) if dn_order_id else False
-
-    if not runner.pair_started:
-        up_filled = bool(up_order_id) and not up_open and _is_order_verified_filled(clob, up_order_id)
-        dn_filled = bool(dn_order_id) and not dn_open and _is_order_verified_filled(clob, dn_order_id)
-        if not up_filled and not dn_filled:
-            return
-        if up_filled and dn_filled:
-            runner.pair_started = True
-            runner.pair_completed = True
-            runner.filled_first_side = "UP"
-            runner.first_fill_price = float(HEDGE_START_LIMIT_PRICE)
-            return
-        filled_side = "UP" if up_filled else "DOWN"
-        open_side = "DOWN" if filled_side == "UP" else "UP"
-        open_order_id = runner.starter_order_ids.get(open_side)
-        if open_order_id:
-            try:
-                clob.cancel_order_by_id(open_order_id)
-            except Exception as exc:  # noqa: BLE001
-                _event("ERROR", stage="cancel_starter", side=open_side, order_id=str(open_order_id), error=str(exc))
-            runner.starter_order_ids[open_side] = ""
-        hedge_side = _opposite_side(filled_side)
-        hedge_limit = round(HEDGE_TARGET_SUM - float(HEDGE_START_LIMIT_PRICE), 2)
-        shares = float(runner.starter_shares or ENTRY_MIN_SHARES)
-        budget_usd = float(runner.starter_order_cost or shares * hedge_limit)
-        token = _pick_token(runner.contract, hedge_side)
-        label = f"{runner.pair_key}/{runner.window_minutes}m/serial_hedge_{hedge_side}/{hedge_side}"
-        executed, reason, order_id = _execute_buy(
-            clob,
-            cfg,
-            shares,
-            budget_usd,
-            token,
-            label,
-            start_px=float(runner.start_px or 0.0),
-            spot_px=float(spot),
-            pm_trigger_px=float(hedge_limit),
-            limit_price=float(hedge_limit),
-        )
-        if not executed:
-            runner.rule_retry_not_before["serial_hedge_retry"] = time.perf_counter() + FAILED_RETRY_COOLDOWN_SEC
-            return
-        runner.pair_started = True
-        runner.filled_first_side = filled_side
-        runner.first_fill_price = float(HEDGE_START_LIMIT_PRICE)
-        runner.hedge_order_id = order_id
-        runner.hedge_order_side = hedge_side
-        runner.hedge_limit_price = hedge_limit
+    order = rows[0]
+    bid, ask = _book_for_side(runner, side, poly, cfg)
+    _log_tag(
+        "BOOK",
+        slug=runner.contract.slug,
+        side=side,
+        bid="-" if bid is None else f"{bid:.2f}",
+        ask="-" if ask is None else f"{ask:.2f}",
+    )
+    target_price = _compute_limit_buy_price(best_bid=bid, best_ask=ask)
+    if target_price is None:
         return
+    if abs(float(order.price) - float(target_price)) < PRICE_STEP:
+        return
+    if order.age_sec(now_monotonic) < CANCEL_REPLACE_COOLDOWN_SEC:
+        return
+    if (now_monotonic - runner.last_cancel_monotonic[side]) < CANCEL_REPLACE_COOLDOWN_SEC:
+        return
+    _cancel_order(runner, clob=clob, order=order, reason=f"stale_price->{target_price:.2f}")
 
-    if runner.hedge_order_id and runner.hedge_order_side:
-        hedge_token = _pick_token(runner.contract, runner.hedge_order_side)
-        if not _is_order_still_open(clob, hedge_token, runner.hedge_order_id):
-            runner.pair_completed = True
+
+def _finalize_runner_window(
+    runner: WindowRunner | None,
+    *,
+    binance: BinanceCombinedTradeFeed,
+    cfg: KngtopConfig,
+) -> None:
+    del runner, binance, cfg
+    return
 
 
 def _tick_runner(
@@ -586,223 +650,279 @@ def _tick_runner(
     binance: BinanceCombinedTradeFeed,
     clob: KngtopClob | None,
     cfg: KngtopConfig,
-    runtime_state: dict[str, float],
+    runtime_state: dict[str, Any],
 ) -> None:
     if runner is None:
         return
     with runner._exec_lock:
-        if runner.start_px is None or runner.trade_notional_usd is None:
-            return
-        if runner.trade_notional_usd <= 0:
-            return
         now = datetime.now(timezone.utc)
+        now_ts = now.timestamp()
+        now_monotonic = time.perf_counter()
+        elapsed, remaining = _window_elapsed_remaining(runner, now_ts)
+        if elapsed is None or remaining is None:
+            return
+        _prune_sent_order_cache(runner, now_monotonic)
         spot = binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec)
         if spot is None:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="binance_stale")
             return
-        _append_spot_history(runner, now_ts=now.timestamp(), spot=spot)
-        up_id = runner.contract.up.token_id
-        dn_id = runner.contract.down.token_id
-        quote_up = poly.best_bid_ask_for(up_id, max_age_sec=cfg.poly_mid_max_age_sec)
-        quote_dn = poly.best_bid_ask_for(dn_id, max_age_sec=cfg.poly_mid_max_age_sec)
-        ask_up = quote_up[1] if quote_up is not None else None
-        ask_dn = quote_dn[1] if quote_dn is not None else None
-        start = float(runner.start_px)
-        window_elapsed = _window_elapsed_sec(runner, now)
-        now_monotonic = time.perf_counter()
-        if runner.rules and all(rule.kind == "serial_hedge" for rule in runner.rules):
-            if window_elapsed is None:
+        _log_tag(
+            "WINDOW",
+            slug=runner.contract.slug,
+            elapsed_sec=f"{elapsed:.1f}",
+            remaining_sec=f"{remaining:.1f}",
+            stopped=str(runner.stopped).lower(),
+            btc_spot=f"{spot:.2f}",
+        )
+        if elapsed < 0:
+            _log_tag("WINDOW", slug=runner.contract.slug, state="prestart_watch")
+            return
+        if _runner_needs_reconcile(runner, now_monotonic):
+            cache_at = float(runtime_state.get("reconcile_cache_at", 0.0))
+            if cache_at <= runner.last_reconcile_monotonic:
+                _log_tag("SKIP BUY", slug=runner.contract.slug, reason="reconcile_pending")
                 return
-            if now_monotonic >= runner.rule_retry_not_before.get("serial_hedge_starters", 0.0):
-                if 0 <= window_elapsed <= runner.rules[0].max_elapsed_sec:
-                    _place_serial_hedge_starters(runner, clob=clob, cfg=cfg, spot=spot)
-            _advance_serial_hedge(runner, clob=clob, cfg=cfg, spot=spot)
+            open_rows = list(runtime_state.get("reconcile_open_orders", []))
+            position_rows = _filtered_positions_for_runner(
+                runner,
+                list(runtime_state.get("reconcile_positions", [])),
+            )
+            _apply_reconcile_snapshot(
+                runner,
+                open_order_rows=open_rows,
+                position_rows=position_rows,
+                now_monotonic=cache_at,
+            )
+        imbalance = runner.imbalance_shares()
+        _log_tag(
+            "IMBALANCE",
+            slug=runner.contract.slug,
+            up_shares=f"{runner.filled_shares['UP']:.2f}",
+            down_shares=f"{runner.filled_shares['DOWN']:.2f}",
+            imbalance=f"{imbalance:.2f}",
+        )
+        stop_hit, avg_sum = _window_stop_check(runner)
+        if stop_hit and not runner.stopped:
+            runner.stopped = True
+            runner.stop_reason = "avg_sum_le_0.96"
+            _log_tag("WINDOW STOP", slug=runner.contract.slug, avg_sum=f"{avg_sum:.4f}")
+        if runner.filled_shares["UP"] > 0 and runner.filled_shares["DOWN"] > 0 and abs(imbalance) < 1e-9:
+            _log_tag(
+                "BALANCED",
+                slug=runner.contract.slug,
+                avg_sum="-" if avg_sum is None else f"{avg_sum:.4f}",
+                up_shares=f"{runner.filled_shares['UP']:.2f}",
+                down_shares=f"{runner.filled_shares['DOWN']:.2f}",
+            )
+        if remaining <= MIN_REMAINING_SEC:
+            _log_tag("LATE WINDOW", slug=runner.contract.slug, remaining_sec=f"{remaining:.1f}")
+            for side in ("UP", "DOWN"):
+                _maybe_cancel_orders(
+                    runner,
+                    clob=clob,
+                    side=side,
+                    keep=0,
+                    reason="late_window",
+                    now_monotonic=now_monotonic,
+                )
             return
-        for rule in runner.rules:
-            if rule.key in runner.traded_rule_keys:
-                continue
-            if now_monotonic < runner.rule_retry_not_before.get(rule.key, 0.0):
-                continue
-            ready, trigger_px = _signal_ready(
-                rule,
-                now_ts=now.timestamp(),
-                spot=spot,
-                start_px=start,
-                ask_up=ask_up,
-                ask_dn=ask_dn,
-                history=runner.spot_history,
+        if runner.stopped:
+            for side in ("UP", "DOWN"):
+                _maybe_cancel_orders(
+                    runner,
+                    clob=clob,
+                    side=side,
+                    keep=0,
+                    reason="window_stop",
+                    now_monotonic=now_monotonic,
+                )
+            return
+        if elapsed >= STOP_NEW_BUYS_ELAPSED_SEC:
+            _log_tag("LATE WINDOW", slug=runner.contract.slug, elapsed_sec=f"{elapsed:.1f}", reason="no_new_buys")
+            return
+        allowed_sides = set(_desired_sides(imbalance))
+        if abs(imbalance) > MAX_IMBALANCE_SHARES:
+            _log_tag("IMBALANCE", slug=runner.contract.slug, status="over_limit", max_allowed=f"{MAX_IMBALANCE_SHARES:.2f}")
+        for side in ("UP", "DOWN"):
+            keep = 1 if side in allowed_sides else 0
+            reason = "forbidden_side" if keep == 0 else "extra_orders"
+            _maybe_cancel_orders(
+                runner,
+                clob=clob,
+                side=side,
+                keep=keep,
+                reason=reason,
+                now_monotonic=now_monotonic,
             )
-            if not ready:
-                continue
-            if window_elapsed is None:
-                continue
-            if window_elapsed < rule.min_elapsed_sec or window_elapsed > rule.max_elapsed_sec:
-                continue
-            planned_budget_usd = _rule_notional_usd(rule, runner)
-            limit_price = _limit_price_from_signal(float(trigger_px))
-            shares, order_budget_usd = _shares_for_budget(budget_usd=planned_budget_usd, limit_price=limit_price)
-            if shares <= 0:
-                continue
-            tok = _pick_token(runner.contract, rule.side)
-            label = f"{runner.pair_key}/{runner.window_minutes}m/{rule.key}/{rule.side}"
-            executed, reason, order_id = _execute_buy(
-                clob,
-                cfg,
-                shares,
-                order_budget_usd,
-                tok,
-                label,
-                start_px=start,
-                spot_px=spot,
-                pm_trigger_px=float(trigger_px),
-                limit_price=limit_price,
-                retry_on_error_override=rule.retry_on_error_override,
+        if runner.open_order_count() > MAX_OPEN_BUY_ORDERS:
+            for side in ("UP", "DOWN"):
+                _maybe_cancel_orders(
+                    runner,
+                    clob=clob,
+                    side=side,
+                    keep=0 if side not in allowed_sides else 1,
+                    reason="max_open_orders",
+                    now_monotonic=now_monotonic,
+                )
+            return
+        for side in tuple(allowed_sides):
+            _maybe_replace_stale_order(
+                runner,
+                clob=clob,
+                poly=poly,
+                cfg=cfg,
+                side=side,
+                now_monotonic=now_monotonic,
             )
-            if not executed:
-                cooldown = FAILED_RETRY_COOLDOWN_SEC
-                if reason == "insufficient_balance":
-                    cooldown = INSUFFICIENT_BALANCE_BACKOFF_SEC
-                    runtime_state["insufficient_balance_not_before"] = time.perf_counter() + cooldown
-                runner.rule_retry_not_before[rule.key] = time.perf_counter() + cooldown
+        for side in ("UP", "DOWN"):
+            if side not in allowed_sides:
                 continue
-            runner.traded_rule_keys.add(rule.key)
-            runner.executed_rule_sides[rule.key] = rule.side
-            if order_id:
-                runner.pending_order_ids[rule.key] = order_id
-            break
+            if runner.open_order_count(side) > 0:
+                continue
+            if abs(imbalance) > MAX_IMBALANCE_SHARES and side not in _desired_sides(imbalance):
+                _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="imbalance_guard")
+                continue
+            _maybe_place_side(
+                runner,
+                clob=clob,
+                poly=poly,
+                cfg=cfg,
+                side=side,
+                now_monotonic=now_monotonic,
+            )
 
 
-def _pairs_summary(cfg: KngtopConfig) -> str:
-    return ",".join(f"{k}:{s}" for k, s in cfg.trading_pairs)
+def _btc_binance_symbol(cfg: KngtopConfig) -> str:
+    pairs = dict(cfg.trading_pairs)
+    symbol = (pairs.get(TRADE_PAIR_KEY) or "").strip().upper()
+    if not symbol:
+        raise RuntimeError("KNGTOP_PAIRS must include BTC:BTCUSDT for the BTC 5m scalper")
+    return symbol
+
+
+def _discover_target_windows(
+    cfg: KngtopConfig,
+    *,
+    runners: dict[int, WindowRunner],
+    discovery: dict[int, DiscoveryState],
+    binance_symbol: str,
+) -> None:
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    now_monotonic = time.perf_counter()
+    for start_sec in _candidate_window_starts(now_ts):
+        if start_sec in runners:
+            continue
+        state = discovery.setdefault(start_sec, DiscoveryState())
+        if (now_monotonic - state.last_checked_monotonic) < DISCOVERY_RETRY_SEC_WHEN_MISSING:
+            continue
+        state.last_checked_monotonic = now_monotonic
+        contract = discover_updown_window_by_start(
+            market_symbol=TRADE_PAIR_KEY.lower(),
+            window_minutes=TRADE_WINDOW_MINUTES,
+            start_sec=start_sec,
+            timeout=cfg.request_timeout_sec,
+        )
+        if contract is None:
+            continue
+        runners[start_sec] = WindowRunner(
+            pair_key=TRADE_PAIR_KEY,
+            binance_symbol=binance_symbol,
+            contract=contract,
+            window_minutes=TRADE_WINDOW_MINUTES,
+        )
+        _log_tag("WINDOW", slug=contract.slug, state="discovered", start_sec=str(start_sec))
+
+
+def _refresh_subscriptions(
+    *,
+    runners: dict[int, WindowRunner],
+    poly: MarketWsFeed,
+    clob: KngtopClob | None,
+) -> None:
+    asset_ids: list[str] = []
+    for runner in runners.values():
+        asset_ids.append(runner.contract.up.token_id)
+        asset_ids.append(runner.contract.down.token_id)
+        if clob is not None:
+            clob.prewarm_market_metadata(runner.contract.up)
+            clob.prewarm_market_metadata(runner.contract.down)
+    poly.set_assets(asset_ids)
+
+
+def _purge_finished_windows(
+    *,
+    runners: dict[int, WindowRunner],
+    discovery: dict[int, DiscoveryState],
+) -> None:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    for start_sec, runner in list(runners.items()):
+        elapsed, remaining = _window_elapsed_remaining(runner, now_ts)
+        if elapsed is None or remaining is None:
+            continue
+        if remaining > 0:
+            continue
+        if runner.open_order_count() > 0:
+            continue
+        runners.pop(start_sec, None)
+        discovery.pop(start_sec, None)
+        _log_tag("WINDOW", slug=runner.contract.slug, state="dropped", reason="expired")
 
 
 def _run_iteration(
     cfg: KngtopConfig,
     *,
-    runners: dict[tuple[str, int], WindowRunner | None],
-    discovery: dict[tuple[str, int], DiscoveryState],
+    runners: dict[int, WindowRunner],
+    discovery: dict[int, DiscoveryState],
     subscribed_asset_ids: set[str],
     poly: MarketWsFeed,
     binance: BinanceCombinedTradeFeed,
     clob: KngtopClob | None,
-    runtime_state: dict[str, float],
+    runtime_state: dict[str, Any],
 ) -> None:
-    timeout = cfg.request_timeout_sec
-    sym_for_pair = dict(cfg.trading_pairs)
-    now_ts = int(datetime.now(timezone.utc).timestamp())
+    del subscribed_asset_ids
+    binance_symbol = str(runtime_state["btc_binance_symbol"])
+    _discover_target_windows(cfg, runners=runners, discovery=discovery, binance_symbol=binance_symbol)
+    _refresh_subscriptions(runners=runners, poly=poly, clob=clob)
     now_monotonic = time.perf_counter()
-    refreshed_keys: list[tuple[str, int]] = []
-
-    for pair_key in sym_for_pair:
-        gamma_sym = pair_key.lower()
-        bs_sym = sym_for_pair[pair_key]
-        for wm in WINDOWS_TO_TRADE:
-            rk = (pair_key, wm)
-            state = discovery.setdefault(rk, DiscoveryState())
-            cur = runners.get(rk)
-            current_start = _current_window_start_sec(now_ts, wm)
-            if not _should_discover_contract(
-                cur,
-                state,
-                now_ts=now_ts,
-                now_monotonic=now_monotonic,
-                window_minutes=wm,
-            ):
-                continue
-            state.last_window_start_sec = current_start
-            state.last_checked_monotonic = now_monotonic
-            t0 = time.perf_counter()
-            if cur is not None and not _runner_matches_current_window(cur, now_ts=now_ts, window_minutes=wm):
-                _finalize_runner_window(cur, binance=binance, cfg=cfg)
-            c = discover_active_btc_window(market_symbol=gamma_sym, window_minutes=wm, timeout=timeout)
-            _timing(
-                "gamma_discovery",
-                pair=pair_key,
-                window_minutes=str(wm),
-                elapsed_ms=f"{(time.perf_counter() - t0) * 1000.0:.1f}",
-                found=str(c is not None).lower(),
+    if clob is not None and any(_runner_needs_reconcile(runner, now_monotonic) for runner in runners.values()):
+        _refresh_global_reconcile_cache(clob=clob, cfg=cfg, runtime_state=runtime_state)
+    for runner in list(runners.values()):
+        try:
+            _tick_runner(
+                runner,
+                poly=poly,
+                binance=binance,
+                clob=clob,
+                cfg=cfg,
+                runtime_state=runtime_state,
             )
-            if c is None:
-                runners[rk] = None
-                continue
-            if cur is None or cur.contract.slug != c.slug:
-                runners[rk] = WindowRunner(
-                    pair_key=pair_key,
-                    binance_symbol=bs_sym,
-                    contract=c,
-                    window_minutes=wm,
-                    rules=rules_for_asset(pair_key, wm),
-                )
-                refreshed_keys.append(rk)
-
-    available_balance_usdc: float | None = None
-    if refreshed_keys and clob is not None:
-        t0 = time.perf_counter()
-        available_balance_usdc = clob.available_balance_usdc()
-        _timing(
-            "balance_fetch",
-            elapsed_ms=f"{(time.perf_counter() - t0) * 1000.0:.1f}",
-            available_balance="none" if available_balance_usdc is None else f"{available_balance_usdc:.6f}",
-        )
-    for rk in refreshed_keys:
-        rv = runners.get(rk)
-        if rv is None:
-            continue
-        rv.trade_notional_usd = _planned_window_notional_usd(
-            cfg,
-            pair_key=rv.pair_key,
-            window_minutes=rv.window_minutes,
-            available_balance_usdc=available_balance_usdc,
-        )
-        if clob is not None:
-            clob.prewarm_market_metadata(rv.contract.up)
-            clob.prewarm_market_metadata(rv.contract.down)
-
-    asset_ids: list[str] = []
-    for rv in runners.values():
-        if rv is not None:
-            asset_ids.extend([rv.contract.up.token_id, rv.contract.down.token_id])
-    next_asset_ids = set(asset_ids)
-    if next_asset_ids != subscribed_asset_ids:
-        poly.set_assets(asset_ids)
-        subscribed_asset_ids.clear()
-        subscribed_asset_ids.update(next_asset_ids)
-
-    for rv in runners.values():
-        if rv is not None:
-            rv.refresh_start_px(cfg)
-
-    if now_monotonic < runtime_state.get("insufficient_balance_not_before", 0.0):
-        return
-
-    for pair_key in sym_for_pair:
-        for wm in WINDOWS_TO_TRADE:
-            try:
-                _tick_runner(
-                    runners.get((pair_key, wm)),
-                    poly=poly,
-                    binance=binance,
-                    clob=clob,
-                    cfg=cfg,
-                    runtime_state=runtime_state,
-                )
-            except Exception as exc:  # noqa: BLE001
-                _event("ERROR", stage="tick", pair=str(pair_key), window_minutes=str(wm), error=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            _log_tag("WINDOW", slug=runner.contract.slug, state="tick_error", error=str(exc))
+    _purge_finished_windows(runners=runners, discovery=discovery)
 
 
 def main() -> None:
     cfg = KngtopConfig.from_env()
     _setup_logging(cfg.log_level)
-    coord = EvalCoordinator(debounce_sec=cfg.eval_debounce_sec, heartbeat_sec=cfg.poll_interval_sec)
+    btc_binance_symbol = _btc_binance_symbol(cfg)
+    coord = EvalCoordinator(debounce_sec=0.0, heartbeat_sec=cfg.poll_interval_sec)
+    runtime_state: dict[str, Any] = {"btc_binance_symbol": btc_binance_symbol}
 
-    bin_syms_sorted = sorted({s for _, s in cfg.trading_pairs})
+    def _on_poly_quote() -> None:
+        _log_ws_update(runtime_state, feed="polymarket")
+        coord.notify()
+
+    def _on_binance_trade(symbol: str) -> None:
+        _log_ws_update(runtime_state, feed="binance", symbol=symbol)
+        coord.notify()
 
     poly = MarketWsFeed(
-        on_quote_update=coord.notify,
+        on_quote_update=_on_poly_quote,
         on_ws_reconnect=lambda dt: _ws_reconnected_event("polymarket", dt),
     )
     binance = BinanceCombinedTradeFeed(
-        bin_syms_sorted,
-        on_trade=lambda _sym: coord.notify(),
+        [btc_binance_symbol],
+        on_trade=_on_binance_trade,
         on_ws_reconnect=lambda dt: _ws_reconnected_event("binance", dt),
     )
     poly.start()
@@ -819,7 +939,6 @@ def main() -> None:
 
     clob: KngtopClob | None = None
     if not cfg.dry_run:
-        t0 = time.perf_counter()
         clob = KngtopClob(
             private_key=cfg.private_key,
             funder=cfg.funder,
@@ -829,28 +948,19 @@ def main() -> None:
             relayer_passphrase=cfg.relayer_passphrase,
             market_buy_max_price=cfg.market_buy_max_price,
         )
-        _timing("clob_init", elapsed_ms=f"{(time.perf_counter() - t0) * 1000.0:.1f}")
 
-    runners: dict[tuple[str, int], WindowRunner | None] = {}
-    discovery: dict[tuple[str, int], DiscoveryState] = {}
+    runners: dict[int, WindowRunner] = {}
+    discovery: dict[int, DiscoveryState] = {}
     subscribed_asset_ids: set[str] = set()
-    runtime_state: dict[str, float] = {}
 
-    _event(
-        "INIT",
-        scope="BOOT",
-        pairs=_pairs_summary(cfg),
-        dry_run=str(cfg.dry_run).lower(),
+    _log_tag(
+        "WINDOW",
+        state="boot",
+        pair=TRADE_PAIR_KEY,
+        window_minutes=str(TRADE_WINDOW_MINUTES),
         heartbeat_sec=str(cfg.poll_interval_sec),
-        debounce_sec=str(cfg.eval_debounce_sec),
-        notional_usd=str(cfg.notional_usd),
-        retry_on_error=str(cfg.order_retry_on_error),
         ws_rest_poll=str(cfg.ws_rest_poll_enabled).lower(),
-        ws_rest_poll_interval_sec=str(cfg.ws_rest_poll_interval_sec),
     )
-    _event("BOOT_DELAY", seconds=str(int(BOOT_WARMUP_DELAY_SEC)))
-    if BOOT_WARMUP_DELAY_SEC > 0:
-        time.sleep(BOOT_WARMUP_DELAY_SEC)
 
     while True:
         try:
@@ -866,7 +976,7 @@ def main() -> None:
                 runtime_state=runtime_state,
             )
         except Exception as exc:  # noqa: BLE001
-            _event("ERROR", stage="main_loop", error=str(exc))
+            _log_tag("WINDOW", state="main_loop_error", error=str(exc))
 
 
 if __name__ == "__main__":

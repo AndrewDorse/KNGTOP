@@ -347,6 +347,13 @@ class KngtopClob:
         )
         return [row for row in rows if isinstance(row, dict)]
 
+    def get_open_orders(self) -> list[dict[str, Any]]:
+        rows = self.client.get_open_orders(
+            None,
+            only_first_page=True,
+        )
+        return [row for row in rows if isinstance(row, dict)]
+
     def get_order(self, order_id: str) -> dict[str, Any]:
         payload = self.client.get_order(order_id)
         return payload if isinstance(payload, dict) else {}
