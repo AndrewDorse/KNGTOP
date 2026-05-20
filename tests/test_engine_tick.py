@@ -54,7 +54,8 @@ class _FakeClob:
         self.prewarmed: list[str] = []
         self._next_id = 1
 
-    def limit_buy_shares(self, token: TokenMarket, *, price: float, shares: float):  # noqa: ANN201
+    def limit_buy_shares(self, token: TokenMarket, *, price: float, shares: float, post_only: bool = True):  # noqa: ANN201
+        assert post_only is True
         order_id = f"ord{self._next_id}"
         self._next_id += 1
         self.limit_calls.append((token.token_id, price, shares))
@@ -128,7 +129,7 @@ def test_tick_places_one_buy_per_side_when_flat(monkeypatch: pytest.MonkeyPatch)
     start = int(datetime.now(timezone.utc).timestamp()) - 60
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
     clob = _FakeClob()
-    poly = _FakePoly({"tid_up": (0.40, 0.45), "tid_dn": (0.42, 0.47)})
+    poly = _FakePoly({"tid_up": (0.40, 0.45), "tid_dn": (0.42, 0.48)})
     _tick_runner(
         runner,
         poly=poly,
@@ -148,7 +149,7 @@ def test_tick_only_places_smaller_side_when_imbalanced(monkeypatch: pytest.Monke
     start = int(datetime.now(timezone.utc).timestamp()) - 60
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
     clob = _FakeClob()
-    poly = _FakePoly({"tid_up": (0.40, 0.45), "tid_dn": (0.42, 0.47)})
+    poly = _FakePoly({"tid_up": (0.40, 0.45), "tid_dn": (0.42, 0.48)})
     positions = [{"slug": runner.contract.slug, "asset": "tid_up", "outcome": "UP", "size": 5, "avgPrice": 0.44}]
     _tick_runner(
         runner,
@@ -161,7 +162,89 @@ def test_tick_only_places_smaller_side_when_imbalanced(monkeypatch: pytest.Monke
     assert clob.limit_calls == [("tid_dn", pytest.approx(0.43), pytest.approx(5.0))]
 
 
-def test_tick_triggers_window_stop_and_cancels_buys(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_allows_second_pair_only_for_strong_first_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    start = int(datetime.now(timezone.utc).timestamp()) - 60
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
+    clob = _FakeClob()
+    poly = _FakePoly({"tid_up": (0.50, 0.58), "tid_dn": (0.52, 0.60)})
+    positions = [
+        {"slug": runner.contract.slug, "asset": "tid_up", "outcome": "UP", "size": 5, "avgPrice": 0.51},
+        {"slug": runner.contract.slug, "asset": "tid_dn", "outcome": "DOWN", "size": 5, "avgPrice": 0.52},
+    ]
+    _tick_runner(
+        runner,
+        poly=poly,
+        binance=_FakeBinanceCombo(100_000.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state=_runtime_cache(positions=positions),
+    )
+    assert runner.second_pair_gate_state == "allowed"
+    assert runner.stopped is False
+    assert clob.limit_calls == [
+        ("tid_up", pytest.approx(0.51), pytest.approx(5.0)),
+        ("tid_dn", pytest.approx(0.53), pytest.approx(5.0)),
+    ]
+
+
+def test_tick_blocks_second_pair_and_stops_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    start = int(datetime.now(timezone.utc).timestamp()) - 60
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
+    clob = _FakeClob()
+    poly = _FakePoly({"tid_up": (0.50, 0.54), "tid_dn": (0.52, 0.56)})
+    positions = [
+        {"slug": runner.contract.slug, "asset": "tid_up", "outcome": "UP", "size": 5, "avgPrice": 0.51},
+        {"slug": runner.contract.slug, "asset": "tid_dn", "outcome": "DOWN", "size": 5, "avgPrice": 0.52},
+    ]
+    _tick_runner(
+        runner,
+        poly=poly,
+        binance=_FakeBinanceCombo(100_000.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state=_runtime_cache(positions=positions),
+    )
+    assert runner.second_pair_gate_state == "blocked"
+    assert runner.stopped is True
+    assert runner.stop_reason == "second_pair_blocked"
+    assert clob.limit_calls == []
+
+
+def test_tick_respects_max_pairs_per_side(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    start = int(datetime.now(timezone.utc).timestamp()) - 60
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
+    clob = _FakeClob()
+    poly = _FakePoly({"tid_up": (0.40, 0.45), "tid_dn": (0.42, 0.48)})
+    positions = [{"slug": runner.contract.slug, "asset": "tid_up", "outcome": "UP", "size": 10, "avgPrice": 0.44}]
+    _tick_runner(
+        runner,
+        poly=poly,
+        binance=_FakeBinanceCombo(100_000.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state=_runtime_cache(positions=positions),
+    )
+    assert clob.limit_calls == [("tid_dn", pytest.approx(0.43), pytest.approx(5.0))]
+    clob.limit_calls.clear()
+    positions = [
+        {"slug": runner.contract.slug, "asset": "tid_up", "outcome": "UP", "size": 10, "avgPrice": 0.44},
+        {"slug": runner.contract.slug, "asset": "tid_dn", "outcome": "DOWN", "size": 10, "avgPrice": 0.45},
+    ]
+    _tick_runner(
+        runner,
+        poly=poly,
+        binance=_FakeBinanceCombo(100_000.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state=_runtime_cache(positions=positions),
+    )
+    assert clob.limit_calls == []
+
+
+def test_tick_positive_gross_lock_cancels_buys(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=False)
     start = int(datetime.now(timezone.utc).timestamp()) - 60
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
@@ -172,8 +255,8 @@ def test_tick_triggers_window_stop_and_cancels_buys(monkeypatch: pytest.MonkeyPa
         {"id": "ord2", "asset_id": "tid_dn", "side": "BUY", "price": 0.43, "original_size": 5, "size_left": 5},
     ]
     positions = [
-        {"slug": runner.contract.slug, "asset": "tid_up", "outcome": "UP", "size": 5, "avgPrice": 0.46},
-        {"slug": runner.contract.slug, "asset": "tid_dn", "outcome": "DOWN", "size": 5, "avgPrice": 0.48},
+        {"slug": runner.contract.slug, "asset": "tid_up", "outcome": "UP", "size": 10, "avgPrice": 0.45},
+        {"slug": runner.contract.slug, "asset": "tid_dn", "outcome": "DOWN", "size": 10, "avgPrice": 0.45},
     ]
     _tick_runner(
         runner,
@@ -184,12 +267,13 @@ def test_tick_triggers_window_stop_and_cancels_buys(monkeypatch: pytest.MonkeyPa
         runtime_state=_runtime_cache(positions=positions, open_orders=open_orders),
     )
     assert runner.stopped is True
+    assert runner.stop_reason == "positive_gross_lock"
     assert sorted(clob.cancelled) == ["ord1", "ord2"]
 
 
-def test_tick_cancels_orders_in_last_30_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_cancels_orders_after_240_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=False)
-    start = int(datetime.now(timezone.utc).timestamp()) - 281
+    start = int(datetime.now(timezone.utc).timestamp()) - 241
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
     runner.order_first_seen = {"ord1": time.perf_counter() - 10}
     clob = _FakeClob()
@@ -203,6 +287,39 @@ def test_tick_cancels_orders_in_last_30_seconds(monkeypatch: pytest.MonkeyPatch)
         runtime_state=_runtime_cache(open_orders=open_orders),
     )
     assert clob.cancelled == ["ord1"]
+    assert clob.limit_calls == []
+
+
+def test_tick_stops_new_buys_after_220_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    start = int(datetime.now(timezone.utc).timestamp()) - 221
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
+    clob = _FakeClob()
+    _tick_runner(
+        runner,
+        poly=_FakePoly({"tid_up": (0.40, 0.45), "tid_dn": (0.42, 0.47)}),
+        binance=_FakeBinanceCombo(100_000.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state=_runtime_cache(),
+    )
+    assert clob.limit_calls == []
+
+
+def test_tick_skips_side_when_maker_edge_too_small(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    start = int(datetime.now(timezone.utc).timestamp()) - 60
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
+    clob = _FakeClob()
+    poly = _FakePoly({"tid_up": (0.48, 0.50), "tid_dn": (0.48, 0.50)})
+    _tick_runner(
+        runner,
+        poly=poly,
+        binance=_FakeBinanceCombo(100_000.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state=_runtime_cache(),
+    )
     assert clob.limit_calls == []
 
 

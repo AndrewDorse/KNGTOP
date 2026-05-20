@@ -262,7 +262,7 @@ class KngtopClob:
             signed = self.client.create_order(order)
             return self.client.post_order(signed, OrderType.FAK)
 
-    def limit_buy(self, token: TokenMarket, *, price: float, usdc: float) -> dict[str, Any]:
+    def limit_buy(self, token: TokenMarket, *, price: float, usdc: float, post_only: bool = True) -> dict[str, Any]:
         u = float(usdc)
         px = float(price)
         if u <= 0:
@@ -279,13 +279,20 @@ class KngtopClob:
         create_and_post = getattr(self.client, "create_and_post_order", None)
         if callable(create_and_post):
             try:
-                return create_and_post(order_args=order, options=None, order_type=OrderType.GTC, post_only=False)
+                return create_and_post(order_args=order, options=None, order_type=OrderType.GTC, post_only=post_only)
             except TypeError:
                 return create_and_post(order, None, OrderType.GTC)
         signed = self.client.create_order(order)
         return self.client.post_order(signed, OrderType.GTC)
 
-    def limit_buy_shares(self, token: TokenMarket, *, price: float, shares: float) -> dict[str, Any]:
+    def limit_buy_shares(
+        self,
+        token: TokenMarket,
+        *,
+        price: float,
+        shares: float,
+        post_only: bool = True,
+    ) -> dict[str, Any]:
         sz = float(shares)
         px = float(price)
         if sz <= 0:
@@ -301,7 +308,7 @@ class KngtopClob:
         create_and_post = getattr(self.client, "create_and_post_order", None)
         if callable(create_and_post):
             try:
-                return create_and_post(order_args=order, options=None, order_type=OrderType.GTC, post_only=False)
+                return create_and_post(order_args=order, options=None, order_type=OrderType.GTC, post_only=post_only)
             except TypeError:
                 return create_and_post(order, None, OrderType.GTC)
         signed = self.client.create_order(order)

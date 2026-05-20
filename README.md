@@ -7,19 +7,21 @@ Dockerized Polymarket Up/Down runner for BTC, ETH, XRP, SOL, DOGE, BNB, HYPE, an
 
 ## Current strategy
 
-Per window, rules are evaluated in list order. The first rule that fires gets the single trade.
+Current live entrypoint is `BTC` `5m` only and runs the `cheap-hit + volume OR move` family.
 
-| Order | Key | Logic |
-|------|-----|--------|
-| 1 | `cheap_buy_up` | `mid_up <= 0.15` and `binance_spot > window_open` -> buy `UP` |
-| 2 | `cheap_buy_down` | `mid_dn <= 0.15` and `binance_spot < window_open` -> buy `DOWN` |
+- Trigger: first side whose Polymarket mid is `<= 0.15`
+- Side choice: buy the cheaper of `UP` / `DOWN`
+- BTC gate: `volume spike OR move`
+- Volume gate: current Binance trade-size volume / previous `10s` average `>= 1.4x`, with cheap-side-favor alignment over `5s` or already beyond window open
+- Move gate: cheap-side-favor BTC move over `30s >= $1`, or already beyond window open
+- Order: `$1` FAK buy capped at `0.25`
+- Delay: none in live bot
 
-This logic is used for every configured asset and for 5m and 15m contracts.
+Only one buy attempt is made per window.
 
 ## Sizing
 
-- BTC, ETH, XRP, SOL on 5m and 15m: `max($1, 10% of available balance)` computed at window start
-- DOGE, BNB, HYPE, LINK on 5m and 15m: `max($1, 5% of available balance)` computed at window start
+- Fixed `$1` notional per live order for the current BTC `5m` strategy
 
 ## Run
 

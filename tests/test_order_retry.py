@@ -21,7 +21,8 @@ class _FakeClobRetry:
         self.price: float | None = None
         self.shares: float | None = None
 
-    def limit_buy_shares(self, token: _FakeToken, *, price: float, shares: float):  # noqa: ANN201
+    def limit_buy_shares(self, token: _FakeToken, *, price: float, shares: float, post_only: bool = True):  # noqa: ANN201
+        assert post_only is True
         self.limit_calls += 1
         self.price = price
         self.shares = shares

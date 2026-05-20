@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 import time
@@ -31,16 +32,21 @@ TRADE_WINDOW_MINUTES = 5
 WINDOW_SECONDS = TRADE_WINDOW_MINUTES * 60
 NEXT_WINDOW_LOOKAHEAD_SEC = 20
 MIN_REMAINING_SEC = 30
-STOP_NEW_BUYS_ELAPSED_SEC = 270
+STOP_NEW_BUYS_ELAPSED_SEC = 220
+CANCEL_ALL_BUYS_ELAPSED_SEC = 240
 BASE_ORDER_SHARES = 5.0
+MAX_PAIRS_PER_SIDE = 2
 PRICE_STEP = 0.01
 MIN_BUY_PRICE = 0.35
 MAX_BUY_PRICE = 0.65
 MAX_TOTAL_EXPOSURE_PER_WINDOW = 30.0
 MAX_ONE_SIDE_EXPOSURE = 20.0
-MAX_OPEN_BUY_ORDERS = 2
-MAX_OPEN_BUY_ORDERS_PER_SIDE = 1
+MAX_OPEN_BUY_ORDERS = MAX_PAIRS_PER_SIDE * 2
+MAX_OPEN_BUY_ORDERS_PER_SIDE = MAX_PAIRS_PER_SIDE
 MAX_IMBALANCE_SHARES = 5.0
+MIN_MAKER_EDGE = 0.015
+STRONG_MAKER_EDGE = 0.025
+SECOND_PAIR_MIN_REMAINING_SEC = 90
 DISCOVERY_RETRY_SEC_WHEN_MISSING = 2.0
 RECONCILE_COOLDOWN_SEC = 2.0
 FAST_RECONCILE_AFTER_ACTION_SEC = 0.75
@@ -48,6 +54,7 @@ SENT_ORDER_CACHE_SEC = 10.0
 CANCEL_REPLACE_COOLDOWN_SEC = 5.0
 SAME_SIDE_ORDER_COOLDOWN_SEC = 5.0
 WS_UPDATE_LOG_COOLDOWN_SEC = 1.0
+LIVE_BOOK_RECORDER_PATH = os.path.join("logs", "btc_5m_live_book.csv")
 
 
 def _side_float_map() -> dict[str, float]:
@@ -95,6 +102,7 @@ class WindowRunner:
     last_reconcile_monotonic: float = 0.0
     reconcile_after_action_monotonic: float = 0.0
     force_reconcile: bool = True
+    second_pair_gate_state: str | None = None
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def start_sec(self) -> int | None:
@@ -122,10 +130,23 @@ class WindowRunner:
             return sum(len(rows) for rows in self.open_orders.values())
         return len(self.open_orders.get(side, []))
 
+    def balanced_pair_count(self) -> int:
+        return int(min(self.filled_shares.get("UP", 0.0), self.filled_shares.get("DOWN", 0.0)) // BASE_ORDER_SHARES)
+
 
 @dataclass
 class DiscoveryState:
     last_checked_monotonic: float = 0.0
+
+
+@dataclass(slots=True)
+class BookSnapshot:
+    bid: float | None
+    ask: float | None
+    mid: float | None
+    candidate_buy: float | None
+    maker_edge: float | None
+    spread: float | None
 
 
 def _setup_logging(level: str) -> None:
@@ -248,12 +269,38 @@ def _compute_limit_buy_price(*, best_bid: float | None, best_ask: float | None) 
     return target
 
 
+def _book_snapshot(*, best_bid: float | None, best_ask: float | None) -> BookSnapshot:
+    bid = None if best_bid is None else float(best_bid)
+    ask = None if best_ask is None else float(best_ask)
+    spread = None
+    mid = None
+    if bid is not None and ask is not None and ask > bid:
+        spread = float(ask) - float(bid)
+        mid = (float(bid) + float(ask)) / 2.0
+    candidate = _compute_limit_buy_price(best_bid=bid, best_ask=ask)
+    maker_edge = None
+    if mid is not None and candidate is not None:
+        maker_edge = mid - candidate
+    return BookSnapshot(
+        bid=bid,
+        ask=ask,
+        mid=mid,
+        candidate_buy=candidate,
+        maker_edge=maker_edge,
+        spread=spread,
+    )
+
+
 def _desired_sides(imbalance_shares: float) -> tuple[str, ...]:
     if imbalance_shares > 0:
         return ("DOWN",)
     if imbalance_shares < 0:
         return ("UP",)
     return ("UP", "DOWN")
+
+
+def _max_side_shares() -> float:
+    return float(MAX_PAIRS_PER_SIDE) * float(BASE_ORDER_SHARES)
 
 
 def _prune_sent_order_cache(runner: WindowRunner, now_monotonic: float) -> None:
@@ -430,6 +477,45 @@ def _filtered_positions_for_runner(runner: WindowRunner, position_rows: list[dic
     return out
 
 
+def _record_live_book_snapshot(
+    *,
+    runtime_state: dict[str, Any],
+    runner: WindowRunner,
+    up_book: BookSnapshot,
+    down_book: BookSnapshot,
+) -> None:
+    os.makedirs(os.path.dirname(LIVE_BOOK_RECORDER_PATH), exist_ok=True)
+    write_header = not os.path.exists(LIVE_BOOK_RECORDER_PATH)
+    with open(LIVE_BOOK_RECORDER_PATH, "a", encoding="utf-8", newline="") as handle:
+        if write_header:
+            handle.write(
+                "timestamp,window_id,up_best_bid,up_best_ask,down_best_bid,down_best_ask,up_mid,down_mid,"
+                "up_candidate_buy,down_candidate_buy,maker_edge_up,maker_edge_down,spread_up,spread_down\n"
+            )
+        handle.write(
+            ",".join(
+                [
+                    datetime.now(timezone.utc).isoformat(),
+                    runner.contract.slug,
+                    "" if up_book.bid is None else f"{up_book.bid:.4f}",
+                    "" if up_book.ask is None else f"{up_book.ask:.4f}",
+                    "" if down_book.bid is None else f"{down_book.bid:.4f}",
+                    "" if down_book.ask is None else f"{down_book.ask:.4f}",
+                    "" if up_book.mid is None else f"{up_book.mid:.4f}",
+                    "" if down_book.mid is None else f"{down_book.mid:.4f}",
+                    "" if up_book.candidate_buy is None else f"{up_book.candidate_buy:.4f}",
+                    "" if down_book.candidate_buy is None else f"{down_book.candidate_buy:.4f}",
+                    "" if up_book.maker_edge is None else f"{up_book.maker_edge:.4f}",
+                    "" if down_book.maker_edge is None else f"{down_book.maker_edge:.4f}",
+                    "" if up_book.spread is None else f"{up_book.spread:.4f}",
+                    "" if down_book.spread is None else f"{down_book.spread:.4f}",
+                ]
+            )
+            + "\n"
+        )
+    runtime_state["last_live_book_recorded_at"] = time.perf_counter()
+
+
 def _cancel_order(
     runner: WindowRunner,
     *,
@@ -451,6 +537,24 @@ def _cancel_order(
     runner.reconcile_after_action_monotonic = now_monotonic + FAST_RECONCILE_AFTER_ACTION_SEC
     _log_tag("CANCEL", slug=runner.contract.slug, side=order.side, order_id=order.order_id, reason=reason)
     return True
+
+
+def _cancel_all_buys(
+    runner: WindowRunner,
+    *,
+    clob: KngtopClob | None,
+    reason: str,
+    now_monotonic: float,
+) -> None:
+    for side in ("UP", "DOWN"):
+        rows = list(runner.open_orders.get(side, []))
+        for order in rows:
+            _cancel_order(runner, clob=clob, order=order, reason=reason)
+
+
+def _mark_window_done(runner: WindowRunner, *, reason: str) -> None:
+    runner.stopped = True
+    runner.stop_reason = reason
 
 
 def _execute_buy(
@@ -480,7 +584,7 @@ def _execute_buy(
     if cfg.dry_run or clob is None:
         return True, None, None
     try:
-        payload = clob.limit_buy_shares(token, price=float(limit_price), shares=float(shares))
+        payload = clob.limit_buy_shares(token, price=float(limit_price), shares=float(shares), post_only=True)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         reason = "insufficient_balance" if "not enough balance" in msg.lower() else "error"
@@ -501,7 +605,7 @@ def _place_limit_buy(
         _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{BASE_ORDER_SHARES:.2f}", mode="dry_run")
         return False
     try:
-        payload = clob.limit_buy_shares(token, price=float(price), shares=float(BASE_ORDER_SHARES))
+        payload = clob.limit_buy_shares(token, price=float(price), shares=float(BASE_ORDER_SHARES), post_only=True)
     except Exception as exc:  # noqa: BLE001
         _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{BASE_ORDER_SHARES:.2f}", status="error", error=str(exc))
         return False
@@ -538,13 +642,16 @@ def _maybe_cancel_orders(
             break
 
 
-def _window_stop_check(runner: WindowRunner) -> tuple[bool, float | None]:
+def _avg_sum(runner: WindowRunner) -> float | None:
     avg_up = runner.avg_price("UP")
     avg_down = runner.avg_price("DOWN")
     if avg_up is None or avg_down is None:
-        return False, None
-    total = float(avg_up) + float(avg_down)
-    return total <= 0.96, total
+        return None
+    return float(avg_up) + float(avg_down)
+
+
+def _expected_pair_pnl(avg_sum: float) -> float:
+    return 1.0 - float(avg_sum)
 
 
 def _book_for_side(runner: WindowRunner, side: str, poly: MarketWsFeed, cfg: KngtopConfig) -> tuple[float | None, float | None]:
@@ -555,13 +662,21 @@ def _book_for_side(runner: WindowRunner, side: str, poly: MarketWsFeed, cfg: Kng
     return float(quote[0]), float(quote[1])
 
 
+def _snapshot_for_side(runner: WindowRunner, side: str, poly: MarketWsFeed, cfg: KngtopConfig) -> BookSnapshot:
+    bid, ask = _book_for_side(runner, side, poly, cfg)
+    return _book_snapshot(best_bid=bid, best_ask=ask)
+
+
+def _book_beats_realized_avg(avg_price: float | None, book: BookSnapshot) -> bool:
+    return avg_price is not None and book.mid is not None and float(avg_price) < float(book.mid)
+
+
 def _maybe_place_side(
     runner: WindowRunner,
     *,
     clob: KngtopClob | None,
-    poly: MarketWsFeed,
-    cfg: KngtopConfig,
     side: str,
+    book: BookSnapshot,
     now_monotonic: float,
 ) -> None:
     if runner.open_order_count() >= MAX_OPEN_BUY_ORDERS:
@@ -572,21 +687,44 @@ def _maybe_place_side(
     if (now_monotonic - runner.last_place_monotonic[side]) < SAME_SIDE_ORDER_COOLDOWN_SEC:
         _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="same_side_cooldown")
         return
-    bid, ask = _book_for_side(runner, side, poly, cfg)
     _log_tag(
-        "BOOK",
+        "CANDIDATE",
         slug=runner.contract.slug,
         side=side,
-        bid="-" if bid is None else f"{bid:.2f}",
-        ask="-" if ask is None else f"{ask:.2f}",
+        bid="-" if book.bid is None else f"{book.bid:.2f}",
+        ask="-" if book.ask is None else f"{book.ask:.2f}",
+        mid="-" if book.mid is None else f"{book.mid:.2f}",
+        candidate="-" if book.candidate_buy is None else f"{book.candidate_buy:.2f}",
+        maker_edge="-" if book.maker_edge is None else f"{book.maker_edge:.3f}",
     )
-    price = _compute_limit_buy_price(best_bid=bid, best_ask=ask)
+    price = book.candidate_buy
     if price is None:
-        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="invalid_book_price")
+        _log_tag("SKIP NO EDGE", slug=runner.contract.slug, side=side, reason="invalid_book_price")
+        return
+    maker_edge = book.maker_edge
+    if maker_edge is None or maker_edge < MIN_MAKER_EDGE:
+        _log_tag(
+            "SKIP NO EDGE",
+            slug=runner.contract.slug,
+            side=side,
+            maker_edge="-" if maker_edge is None else f"{maker_edge:.3f}",
+            min_required=f"{MIN_MAKER_EDGE:.3f}",
+        )
         return
     cache_key = f"{side}:{price:.2f}"
     if cache_key in runner.sent_order_cache:
         _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="duplicate_cooldown", price=f"{price:.2f}")
+        return
+    side_pending_shares = sum(max(0.0, order.remaining_size) for order in runner.open_orders.get(side, []))
+    side_total_shares_if_placed = float(runner.filled_shares.get(side, 0.0)) + side_pending_shares + BASE_ORDER_SHARES
+    if side_total_shares_if_placed > _max_side_shares():
+        _log_tag(
+            "SKIP BUY",
+            slug=runner.contract.slug,
+            side=side,
+            reason="max_pairs_per_side",
+            max_side_shares=f"{_max_side_shares():.2f}",
+        )
         return
     side_exposure_if_placed = runner.side_exposure(side) + (BASE_ORDER_SHARES * price)
     total_exposure_if_placed = runner.total_exposure() + (BASE_ORDER_SHARES * price)
@@ -597,32 +735,33 @@ def _maybe_place_side(
         _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="max_total_exposure")
         return
     token = runner.contract.up if side == "UP" else runner.contract.down
-    _place_limit_buy(runner, clob=clob, token=token, side=side, price=price)
+    if _place_limit_buy(runner, clob=clob, token=token, side=side, price=price):
+        _log_tag(
+            "POST ONLY BUY",
+            slug=runner.contract.slug,
+            side=side,
+            price=f"{price:.2f}",
+            shares=f"{BASE_ORDER_SHARES:.2f}",
+            edge=f"{maker_edge:.3f}",
+        )
 
 
 def _maybe_replace_stale_order(
     runner: WindowRunner,
     *,
     clob: KngtopClob | None,
-    poly: MarketWsFeed,
-    cfg: KngtopConfig,
     side: str,
+    book: BookSnapshot,
     now_monotonic: float,
 ) -> None:
     rows = runner.open_orders.get(side, [])
     if len(rows) != 1:
         return
     order = rows[0]
-    bid, ask = _book_for_side(runner, side, poly, cfg)
-    _log_tag(
-        "BOOK",
-        slug=runner.contract.slug,
-        side=side,
-        bid="-" if bid is None else f"{bid:.2f}",
-        ask="-" if ask is None else f"{ask:.2f}",
-    )
-    target_price = _compute_limit_buy_price(best_bid=bid, best_ask=ask)
+    target_price = book.candidate_buy
     if target_price is None:
+        return
+    if book.maker_edge is None or book.maker_edge < MIN_MAKER_EDGE:
         return
     if abs(float(order.price) - float(target_price)) < PRICE_STEP:
         return
@@ -694,6 +833,17 @@ def _tick_runner(
                 now_monotonic=cache_at,
             )
         imbalance = runner.imbalance_shares()
+        up_book = _snapshot_for_side(runner, "UP", poly, cfg)
+        down_book = _snapshot_for_side(runner, "DOWN", poly, cfg)
+        _log_tag(
+            "REAL BOOK",
+            slug=runner.contract.slug,
+            up_bid="-" if up_book.bid is None else f"{up_book.bid:.2f}",
+            up_ask="-" if up_book.ask is None else f"{up_book.ask:.2f}",
+            down_bid="-" if down_book.bid is None else f"{down_book.bid:.2f}",
+            down_ask="-" if down_book.ask is None else f"{down_book.ask:.2f}",
+        )
+        _record_live_book_snapshot(runtime_state=runtime_state, runner=runner, up_book=up_book, down_book=down_book)
         _log_tag(
             "IMBALANCE",
             slug=runner.contract.slug,
@@ -701,41 +851,81 @@ def _tick_runner(
             down_shares=f"{runner.filled_shares['DOWN']:.2f}",
             imbalance=f"{imbalance:.2f}",
         )
-        stop_hit, avg_sum = _window_stop_check(runner)
-        if stop_hit and not runner.stopped:
-            runner.stopped = True
-            runner.stop_reason = "avg_sum_le_0.96"
-            _log_tag("WINDOW STOP", slug=runner.contract.slug, avg_sum=f"{avg_sum:.4f}")
-        if runner.filled_shares["UP"] > 0 and runner.filled_shares["DOWN"] > 0 and abs(imbalance) < 1e-9:
+        avg_sum = _avg_sum(runner)
+        balanced_pairs = runner.balanced_pair_count()
+        is_balanced = balanced_pairs > 0 and abs(imbalance) < 1e-9
+        if is_balanced:
+            gross_pair_result = _expected_pair_pnl(avg_sum) if avg_sum is not None else None
             _log_tag(
-                "BALANCED",
+                "BALANCED POSITION",
                 slug=runner.contract.slug,
-                avg_sum="-" if avg_sum is None else f"{avg_sum:.4f}",
-                up_shares=f"{runner.filled_shares['UP']:.2f}",
-                down_shares=f"{runner.filled_shares['DOWN']:.2f}",
+                up_avg="-" if runner.avg_price("UP") is None else f"{runner.avg_price('UP'):.4f}",
+                down_avg="-" if runner.avg_price("DOWN") is None else f"{runner.avg_price('DOWN'):.4f}",
+                gross_pair_result="-" if gross_pair_result is None else f"{gross_pair_result:.4f}",
+                note="not_true_arbitrage",
             )
         if remaining <= MIN_REMAINING_SEC:
             _log_tag("LATE WINDOW", slug=runner.contract.slug, remaining_sec=f"{remaining:.1f}")
-            for side in ("UP", "DOWN"):
-                _maybe_cancel_orders(
-                    runner,
-                    clob=clob,
-                    side=side,
-                    keep=0,
-                    reason="late_window",
-                    now_monotonic=now_monotonic,
-                )
+            _cancel_all_buys(runner, clob=clob, reason="late_window", now_monotonic=now_monotonic)
             return
-        if runner.stopped:
-            for side in ("UP", "DOWN"):
-                _maybe_cancel_orders(
-                    runner,
-                    clob=clob,
-                    side=side,
-                    keep=0,
-                    reason="window_stop",
-                    now_monotonic=now_monotonic,
+        if elapsed >= CANCEL_ALL_BUYS_ELAPSED_SEC:
+            _log_tag("LATE WINDOW", slug=runner.contract.slug, elapsed_sec=f"{elapsed:.1f}", reason="cancel_all_buys")
+            _cancel_all_buys(runner, clob=clob, reason="late_window_cancel_all", now_monotonic=now_monotonic)
+            return
+        if is_balanced and avg_sum is not None:
+            gross_pair_result = _expected_pair_pnl(avg_sum)
+            if gross_pair_result > 0:
+                _log_tag(
+                    "POSITIVE GROSS LOCK",
+                    slug=runner.contract.slug,
+                    up_avg=f"{runner.avg_price('UP'):.4f}",
+                    down_avg=f"{runner.avg_price('DOWN'):.4f}",
+                    gross_pair_result=f"{gross_pair_result:.4f}",
+                    action="stop_window",
                 )
+                _mark_window_done(runner, reason="positive_gross_lock")
+            elif balanced_pairs >= MAX_PAIRS_PER_SIDE:
+                _mark_window_done(runner, reason="max_pairs_reached")
+            elif balanced_pairs == 1:
+                second_pair_ok = (
+                    remaining > SECOND_PAIR_MIN_REMAINING_SEC
+                    and _book_beats_realized_avg(runner.avg_price("UP"), up_book)
+                    and _book_beats_realized_avg(runner.avg_price("DOWN"), down_book)
+                    and up_book.maker_edge is not None
+                    and up_book.maker_edge >= STRONG_MAKER_EDGE
+                    and down_book.maker_edge is not None
+                    and down_book.maker_edge >= STRONG_MAKER_EDGE
+                )
+                if second_pair_ok:
+                    runner.second_pair_gate_state = "allowed"
+                    _log_tag(
+                        "SECOND PAIR ALLOWED",
+                        slug=runner.contract.slug,
+                        up_avg=f"{runner.avg_price('UP'):.4f}",
+                        down_avg=f"{runner.avg_price('DOWN'):.4f}",
+                        up_mid=f"{up_book.mid:.4f}",
+                        down_mid=f"{down_book.mid:.4f}",
+                        up_edge=f"{up_book.maker_edge:.3f}",
+                        down_edge=f"{down_book.maker_edge:.3f}",
+                        action="ALLOW_REARM",
+                    )
+                else:
+                    runner.second_pair_gate_state = "blocked"
+                    _log_tag(
+                        "SECOND PAIR BLOCKED",
+                        slug=runner.contract.slug,
+                        up_avg="-" if runner.avg_price("UP") is None else f"{runner.avg_price('UP'):.4f}",
+                        down_avg="-" if runner.avg_price("DOWN") is None else f"{runner.avg_price('DOWN'):.4f}",
+                        up_mid="-" if up_book.mid is None else f"{up_book.mid:.4f}",
+                        down_mid="-" if down_book.mid is None else f"{down_book.mid:.4f}",
+                        up_edge="-" if up_book.maker_edge is None else f"{up_book.maker_edge:.3f}",
+                        down_edge="-" if down_book.maker_edge is None else f"{down_book.maker_edge:.3f}",
+                        remaining_sec=f"{remaining:.1f}",
+                        reason="second_pair_rules_failed",
+                    )
+                    _mark_window_done(runner, reason="second_pair_blocked")
+        if runner.stopped:
+            _cancel_all_buys(runner, clob=clob, reason=runner.stop_reason or "window_stop", now_monotonic=now_monotonic)
             return
         if elapsed >= STOP_NEW_BUYS_ELAPSED_SEC:
             _log_tag("LATE WINDOW", slug=runner.contract.slug, elapsed_sec=f"{elapsed:.1f}", reason="no_new_buys")
@@ -765,13 +955,14 @@ def _tick_runner(
                     now_monotonic=now_monotonic,
                 )
             return
+        if balanced_pairs >= 1 and runner.second_pair_gate_state != "allowed":
+            allowed_sides.clear()
         for side in tuple(allowed_sides):
             _maybe_replace_stale_order(
                 runner,
                 clob=clob,
-                poly=poly,
-                cfg=cfg,
                 side=side,
+                book=up_book if side == "UP" else down_book,
                 now_monotonic=now_monotonic,
             )
         for side in ("UP", "DOWN"):
@@ -785,9 +976,8 @@ def _tick_runner(
             _maybe_place_side(
                 runner,
                 clob=clob,
-                poly=poly,
-                cfg=cfg,
                 side=side,
+                book=up_book if side == "UP" else down_book,
                 now_monotonic=now_monotonic,
             )
 
