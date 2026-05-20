@@ -248,6 +248,44 @@ def _is_order_still_open(clob: KngtopClob | None, token: TokenMarket, order_id: 
         return False
 
 
+def _extract_numeric(payload: dict[str, object], *keys: str) -> float | None:
+    for key in keys:
+        raw = payload.get(key)
+        try:
+            if raw is not None:
+                return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _is_order_verified_filled(clob: KngtopClob | None, order_id: str | None) -> bool:
+    if clob is None or not order_id:
+        return False
+    try:
+        payload = clob.get_order(str(order_id))
+    except Exception as exc:  # noqa: BLE001
+        _event("ERROR", stage="order_status_check", order_id=str(order_id), error=str(exc))
+        return False
+    if not isinstance(payload, dict):
+        return False
+    nested = payload.get("order")
+    if isinstance(nested, dict):
+        merged = dict(nested)
+        merged.update(payload)
+        payload = merged
+    status = str(payload.get("status") or payload.get("state") or "").strip().lower()
+    matched = _extract_numeric(payload, "matched_amount", "filled_amount", "filled", "size_matched", "makerAmountFilled")
+    remaining = _extract_numeric(payload, "remaining", "remaining_amount", "size_remaining", "makerAmountRemaining")
+    if matched is not None and matched > 0:
+        return True
+    if remaining is not None:
+        size = _extract_numeric(payload, "size", "original_size", "makerAmount")
+        if size is not None and remaining < size:
+            return True
+    return status in {"filled", "matched", "executed", "complete", "completed"}
+
+
 def _signal_ready(
     rule: MispriceRule,
     *,
@@ -487,8 +525,8 @@ def _advance_serial_hedge(
     dn_open = _is_order_still_open(clob, dn_token, dn_order_id) if dn_order_id else False
 
     if not runner.pair_started:
-        up_filled = bool(up_order_id) and not up_open
-        dn_filled = bool(dn_order_id) and not dn_open
+        up_filled = bool(up_order_id) and not up_open and _is_order_verified_filled(clob, up_order_id)
+        dn_filled = bool(dn_order_id) and not dn_open and _is_order_verified_filled(clob, dn_order_id)
         if not up_filled and not dn_filled:
             return
         if up_filled and dn_filled:

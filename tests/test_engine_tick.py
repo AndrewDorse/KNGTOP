@@ -60,6 +60,7 @@ class _FakeClobExec(_FakeClobBalance):
         super().__init__(balance)
         self.limit_calls: list[tuple[str, float, float]] = []
         self.open_orders: dict[str, str] = {}
+        self.order_status: dict[str, dict[str, object]] = {}
         self.cancelled: list[str] = []
         self._next_id = 1
 
@@ -68,14 +69,20 @@ class _FakeClobExec(_FakeClobBalance):
         self._next_id += 1
         self.limit_calls.append((token.token_id, price, shares))
         self.open_orders[order_id] = token.token_id
+        self.order_status[order_id] = {"id": order_id, "status": "live", "size": shares, "matched_amount": 0}
         return {"ok": True, "orderID": order_id}
 
     def is_order_open_for_asset(self, token: TokenMarket, order_id: str) -> bool:
         return self.open_orders.get(order_id) == token.token_id
 
+    def get_order(self, order_id: str) -> dict[str, object]:
+        return dict(self.order_status.get(order_id, {}))
+
     def cancel_order_by_id(self, order_id: str):  # noqa: ANN201
         self.cancelled.append(order_id)
         self.open_orders.pop(order_id, None)
+        status = self.order_status.setdefault(order_id, {"id": order_id})
+        status["status"] = "cancelled"
         return {"ok": True}
 
     def prewarm_market_metadata(self, token: TokenMarket) -> None:
@@ -142,6 +149,8 @@ def test_tick_places_hedge_after_first_fill(monkeypatch: pytest.MonkeyPatch) -> 
     )
     up_id = runner.starter_order_ids["UP"]
     clob.open_orders.pop(up_id, None)
+    clob.order_status[up_id]["status"] = "filled"
+    clob.order_status[up_id]["matched_amount"] = runner.starter_shares
     _tick_runner(
         runner,
         poly=_FakePoly(),
@@ -171,6 +180,9 @@ def test_tick_marks_pair_completed_when_both_starters_fill(monkeypatch: pytest.M
         runtime_state={},
     )
     clob.open_orders.clear()
+    for order_id in list(clob.order_status):
+        clob.order_status[order_id]["status"] = "filled"
+        clob.order_status[order_id]["matched_amount"] = runner.starter_shares or 0
     _tick_runner(
         runner,
         poly=_FakePoly(),
@@ -181,6 +193,34 @@ def test_tick_marks_pair_completed_when_both_starters_fill(monkeypatch: pytest.M
     )
     assert runner.pair_completed is True
     assert runner.hedge_order_id is None
+
+
+def test_tick_does_not_place_hedge_when_starter_disappears_unfilled(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    runner = _runner_for_start(10)
+    clob = _FakeClobExec(100.0)
+    _tick_runner(
+        runner,
+        poly=_FakePoly(),
+        binance=_FakeBinanceCombo(100_000.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state={},
+    )
+    up_id = runner.starter_order_ids["UP"]
+    clob.open_orders.pop(up_id, None)
+    clob.order_status[up_id]["status"] = "cancelled"
+    _tick_runner(
+        runner,
+        poly=_FakePoly(),
+        binance=_FakeBinanceCombo(100_000.0),
+        clob=clob,
+        cfg=cfg,
+        runtime_state={},
+    )
+    assert runner.pair_started is False
+    assert runner.hedge_order_id is None
+    assert len(clob.limit_calls) == 2
 
 
 def test_planned_window_notional_clamps_to_fraction_min_and_max(monkeypatch: pytest.MonkeyPatch) -> None:
