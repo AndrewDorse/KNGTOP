@@ -16,8 +16,8 @@ from kngtop.binance_rest import fetch_binance_spot_price, fetch_binance_window_o
 from kngtop.clob_client import KngtopClob
 from kngtop.config import KngtopConfig
 from kngtop.eval_coordinator import EvalCoordinator
-from kngtop.gamma import ActiveContract, discover_active_btc_window, window_start_ts_from_slug
-from kngtop.strategy_params import MispriceRule, rules_for_asset
+from kngtop.gamma import ActiveContract, TokenMarket, discover_active_btc_window, window_start_ts_from_slug
+from kngtop.strategy_params import BTC_HEDGE_TARGET_SUM_5M, BTC_HEDGE_START_LIMIT_5M, MispriceRule, rules_for_asset
 from kngtop.rest_poll import run_ws_rest_fallback_loop
 from kngtop.ws_market import MarketWsFeed
 
@@ -30,6 +30,8 @@ ENTRY_MIN_NOTIONAL_USD = 1.25
 ENTRY_MAX_NOTIONAL_USD = 200.0
 ENTRY_MIN_SHARES = 5.0
 ENTRY_LIMIT_PRICE_BUFFER = 0.03
+HEDGE_START_LIMIT_PRICE = BTC_HEDGE_START_LIMIT_5M
+HEDGE_TARGET_SUM = BTC_HEDGE_TARGET_SUM_5M
 DISCOVERY_RETRY_SEC_WHEN_MISSING = 15.0
 FAILED_RETRY_COOLDOWN_SEC = 2.0
 INSUFFICIENT_BALANCE_BACKOFF_SEC = 30.0
@@ -50,6 +52,17 @@ class WindowRunner:
     pending_order_ids: dict[str, str] = field(default_factory=dict)
     rule_retry_not_before: dict[str, float] = field(default_factory=dict)
     spot_history: deque[tuple[float, float]] = field(default_factory=deque)
+    starter_order_ids: dict[str, str] = field(default_factory=dict)
+    starter_shares: float | None = None
+    starter_order_cost: float | None = None
+    starter_orders_posted: bool = False
+    pair_started: bool = False
+    pair_completed: bool = False
+    filled_first_side: str | None = None
+    first_fill_price: float | None = None
+    hedge_order_id: str | None = None
+    hedge_order_side: str | None = None
+    hedge_limit_price: float | None = None
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def refresh_start_px(self, cfg: KngtopConfig) -> None:
@@ -225,6 +238,16 @@ def _extract_order_id(payload: object) -> str | None:
     return None
 
 
+def _is_order_still_open(clob: KngtopClob | None, token: TokenMarket, order_id: str | None) -> bool:
+    if clob is None or not order_id:
+        return False
+    try:
+        return clob.is_order_open_for_asset(token, order_id)
+    except Exception as exc:  # noqa: BLE001
+        _event("ERROR", stage="order_open_check", order_id=str(order_id), error=str(exc))
+        return False
+
+
 def _signal_ready(
     rule: MispriceRule,
     *,
@@ -322,6 +345,8 @@ def _finalize_runner_window(
     binance: BinanceCombinedTradeFeed,
     cfg: KngtopConfig,
 ) -> None:
+    if runner is not None and runner.rules and all(rule.kind == "serial_hedge" for rule in runner.rules):
+        return
     if runner is None or runner.start_px is None or not runner.executed_rule_sides:
         return
     final_spot = binance.last_price(runner.binance_symbol, max_age_sec=max(cfg.binance_max_age_sec, 30.0))
@@ -402,6 +427,120 @@ def _execute_buy(
     return True, None, _extract_order_id(payload)
 
 
+def _place_serial_hedge_starters(
+    runner: WindowRunner,
+    *,
+    clob: KngtopClob | None,
+    cfg: KngtopConfig,
+    spot: float,
+) -> None:
+    if runner.starter_orders_posted or runner.trade_notional_usd is None or runner.trade_notional_usd <= 0:
+        return
+    shares, order_budget_usd = _shares_for_budget(
+        budget_usd=float(runner.trade_notional_usd),
+        limit_price=float(HEDGE_START_LIMIT_PRICE),
+    )
+    if shares <= 0:
+        return
+    for side in ("UP", "DOWN"):
+        token = _pick_token(runner.contract, side)
+        label = f"{runner.pair_key}/{runner.window_minutes}m/serial_start_{side}/{side}"
+        executed, reason, order_id = _execute_buy(
+            clob,
+            cfg,
+            shares,
+            order_budget_usd,
+            token,
+            label,
+            start_px=float(runner.start_px or 0.0),
+            spot_px=float(spot),
+            pm_trigger_px=float(HEDGE_START_LIMIT_PRICE),
+            limit_price=float(HEDGE_START_LIMIT_PRICE),
+        )
+        if not executed:
+            cooldown = FAILED_RETRY_COOLDOWN_SEC
+            if reason == "insufficient_balance":
+                cooldown = INSUFFICIENT_BALANCE_BACKOFF_SEC
+            runner.rule_retry_not_before["serial_hedge_starters"] = time.perf_counter() + cooldown
+            return
+        if order_id:
+            runner.starter_order_ids[side] = order_id
+    runner.starter_shares = shares
+    runner.starter_order_cost = order_budget_usd
+    runner.starter_orders_posted = True
+
+
+def _advance_serial_hedge(
+    runner: WindowRunner,
+    *,
+    clob: KngtopClob | None,
+    cfg: KngtopConfig,
+    spot: float,
+) -> None:
+    if cfg.dry_run or clob is None or not runner.starter_orders_posted or runner.pair_completed:
+        return
+    up_token = runner.contract.up
+    dn_token = runner.contract.down
+    up_order_id = runner.starter_order_ids.get("UP")
+    dn_order_id = runner.starter_order_ids.get("DOWN")
+    up_open = _is_order_still_open(clob, up_token, up_order_id) if up_order_id else False
+    dn_open = _is_order_still_open(clob, dn_token, dn_order_id) if dn_order_id else False
+
+    if not runner.pair_started:
+        up_filled = bool(up_order_id) and not up_open
+        dn_filled = bool(dn_order_id) and not dn_open
+        if not up_filled and not dn_filled:
+            return
+        if up_filled and dn_filled:
+            runner.pair_started = True
+            runner.pair_completed = True
+            runner.filled_first_side = "UP"
+            runner.first_fill_price = float(HEDGE_START_LIMIT_PRICE)
+            return
+        filled_side = "UP" if up_filled else "DOWN"
+        open_side = "DOWN" if filled_side == "UP" else "UP"
+        open_order_id = runner.starter_order_ids.get(open_side)
+        if open_order_id:
+            try:
+                clob.cancel_order_by_id(open_order_id)
+            except Exception as exc:  # noqa: BLE001
+                _event("ERROR", stage="cancel_starter", side=open_side, order_id=str(open_order_id), error=str(exc))
+            runner.starter_order_ids[open_side] = ""
+        hedge_side = _opposite_side(filled_side)
+        hedge_limit = round(HEDGE_TARGET_SUM - float(HEDGE_START_LIMIT_PRICE), 2)
+        shares = float(runner.starter_shares or ENTRY_MIN_SHARES)
+        budget_usd = float(runner.starter_order_cost or shares * hedge_limit)
+        token = _pick_token(runner.contract, hedge_side)
+        label = f"{runner.pair_key}/{runner.window_minutes}m/serial_hedge_{hedge_side}/{hedge_side}"
+        executed, reason, order_id = _execute_buy(
+            clob,
+            cfg,
+            shares,
+            budget_usd,
+            token,
+            label,
+            start_px=float(runner.start_px or 0.0),
+            spot_px=float(spot),
+            pm_trigger_px=float(hedge_limit),
+            limit_price=float(hedge_limit),
+        )
+        if not executed:
+            runner.rule_retry_not_before["serial_hedge_retry"] = time.perf_counter() + FAILED_RETRY_COOLDOWN_SEC
+            return
+        runner.pair_started = True
+        runner.filled_first_side = filled_side
+        runner.first_fill_price = float(HEDGE_START_LIMIT_PRICE)
+        runner.hedge_order_id = order_id
+        runner.hedge_order_side = hedge_side
+        runner.hedge_limit_price = hedge_limit
+        return
+
+    if runner.hedge_order_id and runner.hedge_order_side:
+        hedge_token = _pick_token(runner.contract, runner.hedge_order_side)
+        if not _is_order_still_open(clob, hedge_token, runner.hedge_order_id):
+            runner.pair_completed = True
+
+
 def _tick_runner(
     runner: WindowRunner | None,
     *,
@@ -432,6 +571,14 @@ def _tick_runner(
         start = float(runner.start_px)
         window_elapsed = _window_elapsed_sec(runner, now)
         now_monotonic = time.perf_counter()
+        if runner.rules and all(rule.kind == "serial_hedge" for rule in runner.rules):
+            if window_elapsed is None:
+                return
+            if now_monotonic >= runner.rule_retry_not_before.get("serial_hedge_starters", 0.0):
+                if 0 <= window_elapsed <= runner.rules[0].max_elapsed_sec:
+                    _place_serial_hedge_starters(runner, clob=clob, cfg=cfg, spot=spot)
+            _advance_serial_hedge(runner, clob=clob, cfg=cfg, spot=spot)
+            return
         for rule in runner.rules:
             if rule.key in runner.traded_rule_keys:
                 continue

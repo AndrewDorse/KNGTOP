@@ -5,29 +5,13 @@ from __future__ import annotations
 import pytest
 
 from kngtop.strategy_params import (
-    BTC_ENTRY_PRICE_MAX_15M,
-    BTC_ENTRY_PRICE_MAX_5M,
-    BTC_ENTRY_PRICE_MIN_15M,
-    BTC_ENTRY_PRICE_MIN_5M,
-    BTC_MARKET_BUY_MAX_PRICE_15M,
-    BTC_MARKET_BUY_MAX_PRICE_5M,
+    BTC_HEDGE_START_LIMIT_5M,
+    BTC_HEDGE_TARGET_SUM_5M,
     BTC_RULES_15M,
     BTC_RULES_5M,
-    ENTRY_PRICE_MAX_15M,
-    ENTRY_PRICE_MAX_5M,
-    ENTRY_PRICE_MIN_15M,
-    ENTRY_PRICE_MIN_5M,
-    ETH_MARKET_BUY_MAX_PRICE_15M,
-    ETH_MARKET_BUY_MAX_PRICE_5M,
     ETH_RULES_15M,
     ETH_RULES_5M,
-    MAX_ELAPSED_SEC_15M,
     MAX_ELAPSED_SEC_5M,
-    MIN_ELAPSED_SEC_15M,
-    MIN_ELAPSED_SEC_5M,
-    RECLAIM_GAP_MIN,
-    RECLAIM_LOOKBACK_SEC_15M,
-    RECLAIM_LOOKBACK_SEC_5M,
     RULES_15M,
     RULES_5M,
     MispriceRule,
@@ -36,65 +20,42 @@ from kngtop.strategy_params import (
 )
 
 
-def test_rule_fires_reclaim_up() -> None:
-    r = MispriceRule(
-        "reclaim_buy_up",
-        price_min=ENTRY_PRICE_MIN_5M,
-        cheap_max=ENTRY_PRICE_MAX_5M,
-        side="UP",
-        kind="reclaim_up",
+def test_rule_fires_serial_hedge() -> None:
+    rule = MispriceRule(
+        "serial_hedge_12c_sum68",
+        price_min=0.01,
+        cheap_max=0.12,
+        side="BOTH",
+        kind="serial_hedge",
     )
-    assert rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.20, mid_dn=0.70)
-    assert not rule_fires(r, btc=100_000.0, start_btc=100_000.0, mid_up=0.20, mid_dn=0.70)
-    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.20, mid_dn=0.70)
-    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.46, mid_dn=0.70)
-    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.30, mid_dn=0.27)
-
-
-def test_rule_fires_reclaim_down() -> None:
-    r = MispriceRule(
-        "reclaim_buy_down",
-        price_min=ENTRY_PRICE_MIN_5M,
-        cheap_max=ENTRY_PRICE_MAX_5M,
-        side="DOWN",
-        kind="reclaim_dn",
-    )
-    assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.20)
-    assert not rule_fires(r, btc=100_000.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.20)
-    assert not rule_fires(r, btc=100_001.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.20)
-    assert rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.70, mid_dn=0.25)
-    assert not rule_fires(r, btc=99_999.0, start_btc=100_000.0, mid_up=0.30, mid_dn=0.27)
+    assert rule_fires(rule, btc=100_001.0, start_btc=100_000.0, mid_up=0.08, mid_dn=0.92)
+    assert rule_fires(rule, btc=99_999.0, start_btc=100_000.0, mid_up=0.88, mid_dn=0.12)
+    assert not rule_fires(rule, btc=100_001.0, start_btc=100_000.0, mid_up=0.14, mid_dn=0.86)
 
 
 def test_rules_count_and_defaults() -> None:
-    assert len(BTC_RULES_5M) == 2
+    assert len(BTC_RULES_5M) == 1
     assert len(BTC_RULES_15M) == 0
     assert len(ETH_RULES_5M) == 0
     assert len(ETH_RULES_15M) == 0
 
-    btc_5m_cwm = [rule for rule in BTC_RULES_5M if rule.kind.startswith("cwm")]
-    eth_5m_reclaim = [rule for rule in ETH_RULES_5M if rule.kind.startswith("reclaim")]
-    eth_5m_cwc = [rule for rule in ETH_RULES_5M if rule.kind.startswith("cwc")]
-
-    assert len(btc_5m_cwm) == 2
-    assert len(eth_5m_reclaim) == 0
-    assert len(eth_5m_cwc) == 0
-
-    assert all(rule.min_elapsed_sec == 20 for rule in btc_5m_cwm)
-    assert all(rule.max_elapsed_sec == MAX_ELAPSED_SEC_5M for rule in btc_5m_cwm)
-    assert all(rule.price_min == 0.01 for rule in btc_5m_cwm)
-    assert all(rule.cheap_max == 0.25 for rule in btc_5m_cwm)
-    assert all(rule.momentum_lookback_sec == 5 for rule in btc_5m_cwm)
-    assert all(rule.momentum_bps_min == 0.0 for rule in btc_5m_cwm)
-    assert all(rule.market_buy_max_price == BTC_MARKET_BUY_MAX_PRICE_5M == 0.85 for rule in btc_5m_cwm)
+    rule = BTC_RULES_5M[0]
+    assert rule.kind == "serial_hedge"
+    assert rule.price_min == 0.01
+    assert rule.cheap_max == BTC_HEDGE_START_LIMIT_5M == 0.12
+    assert rule.min_elapsed_sec == 0
+    assert rule.max_elapsed_sec == MAX_ELAPSED_SEC_5M
+    assert BTC_HEDGE_TARGET_SUM_5M == 0.68
 
 
-def test_rules_are_selected_for_btc_and_eth() -> None:
+def test_rules_are_selected_for_btc_only() -> None:
     assert rules_for_asset("BTC", 5) == BTC_RULES_5M
     assert rules_for_asset("BTC", 15) == ()
     assert rules_for_asset("ETH", 5) == ()
     assert rules_for_asset("ETH", 15) == ()
     assert rules_for_asset("DOGE", 5) == ()
+    assert RULES_5M == BTC_RULES_5M
+    assert RULES_15M == BTC_RULES_15M
 
 
 def test_rules_reject_unknown_asset() -> None:

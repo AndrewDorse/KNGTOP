@@ -7,6 +7,25 @@ This file keeps a short memory of recent live strategy configurations.
 ### 2026-05-20
 - Scope: `BTC` only
 - Windows: `5m` only
+- Family: `serial_hedge`
+- Variant: `start 12c / target sum 68c`
+- Flow:
+  - at window start, place resting buy limits on both `UP` and `DOWN` at `0.12`
+  - whichever starter fills first becomes the first leg
+  - cancel the opposite starter
+  - place the hedge on the opposite side at `0.56`
+  - one pair max per window
+- Sizing:
+  - `5%` of available balance at window start
+  - minimum budget `$1.25`
+  - maximum budget `$200`
+  - minimum order size `5` shares
+
+## Archived Live Strategies
+
+### 2026-05-20
+- Scope: `BTC` only
+- Windows: `5m` only
 - Family: `cheap_winner_momentum`
 - Variant: `ub0.25_e20_lb5_m0`
 - Signal:
@@ -23,8 +42,6 @@ This file keeps a short memory of recent live strategy configurations.
   - minimum budget `$1.25`
   - maximum budget `$200`
   - minimum order size `5` shares
-
-## Archived Live Strategies
 
 ### 2026-05-20
 - Scope: `BTC` only
