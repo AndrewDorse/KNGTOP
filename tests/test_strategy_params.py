@@ -67,10 +67,10 @@ def test_rule_fires_reclaim_down() -> None:
 
 
 def test_rules_count_and_defaults() -> None:
-    assert len(BTC_RULES_5M) == 4
+    assert len(BTC_RULES_5M) == 2
     assert len(BTC_RULES_15M) == 2
-    assert len(ETH_RULES_5M) == 4
-    assert len(ETH_RULES_15M) == 2
+    assert len(ETH_RULES_5M) == 0
+    assert len(ETH_RULES_15M) == 0
 
     btc_5m_reclaim = [rule for rule in BTC_RULES_5M if rule.kind.startswith("reclaim")]
     btc_5m_cwc = [rule for rule in BTC_RULES_5M if rule.kind.startswith("cwc")]
@@ -78,9 +78,9 @@ def test_rules_count_and_defaults() -> None:
     eth_5m_cwc = [rule for rule in ETH_RULES_5M if rule.kind.startswith("cwc")]
 
     assert len(btc_5m_reclaim) == 2
-    assert len(btc_5m_cwc) == 2
-    assert len(eth_5m_reclaim) == 2
-    assert len(eth_5m_cwc) == 2
+    assert len(btc_5m_cwc) == 0
+    assert len(eth_5m_reclaim) == 0
+    assert len(eth_5m_cwc) == 0
 
     assert all(rule.min_elapsed_sec == MIN_ELAPSED_SEC_5M for rule in btc_5m_reclaim)
     assert all(rule.max_elapsed_sec == MAX_ELAPSED_SEC_5M for rule in btc_5m_reclaim)
@@ -96,31 +96,15 @@ def test_rules_count_and_defaults() -> None:
     assert all(rule.cheap_max == BTC_ENTRY_PRICE_MAX_15M for rule in BTC_RULES_15M)
     assert all(rule.market_buy_max_price == BTC_MARKET_BUY_MAX_PRICE_15M == 0.85 for rule in BTC_RULES_15M)
 
-    assert all(rule.min_elapsed_sec == MIN_ELAPSED_SEC_5M for rule in eth_5m_reclaim)
-    assert all(rule.max_elapsed_sec == MAX_ELAPSED_SEC_5M for rule in eth_5m_reclaim)
-    assert all(rule.lookback_sec == RECLAIM_LOOKBACK_SEC_5M for rule in eth_5m_reclaim)
-    assert all(rule.price_min == ENTRY_PRICE_MIN_5M for rule in eth_5m_reclaim)
-    assert all(rule.cheap_max == ENTRY_PRICE_MAX_5M for rule in eth_5m_reclaim)
-    assert all(rule.market_buy_max_price == ETH_MARKET_BUY_MAX_PRICE_5M == 0.85 for rule in eth_5m_reclaim)
-
-    assert all(rule.min_elapsed_sec == MIN_ELAPSED_SEC_15M for rule in ETH_RULES_15M)
-    assert all(rule.max_elapsed_sec == MAX_ELAPSED_SEC_15M for rule in ETH_RULES_15M)
-    assert all(rule.lookback_sec == RECLAIM_LOOKBACK_SEC_15M for rule in ETH_RULES_15M)
-    assert all(rule.price_min == ENTRY_PRICE_MIN_15M for rule in ETH_RULES_15M)
-    assert all(rule.cheap_max == ENTRY_PRICE_MAX_15M for rule in ETH_RULES_15M)
-    assert all(rule.market_buy_max_price == ETH_MARKET_BUY_MAX_PRICE_15M == 0.85 for rule in ETH_RULES_15M)
-
     assert all(rule.gap_min == RECLAIM_GAP_MIN for rule in btc_5m_reclaim)
     assert all(rule.gap_min == RECLAIM_GAP_MIN for rule in BTC_RULES_15M)
-    assert all(rule.gap_min == RECLAIM_GAP_MIN for rule in eth_5m_reclaim)
-    assert all(rule.gap_min == RECLAIM_GAP_MIN for rule in ETH_RULES_15M)
 
 
 def test_rules_are_selected_for_btc_and_eth() -> None:
     assert rules_for_asset("BTC", 5) == BTC_RULES_5M
     assert rules_for_asset("BTC", 15) == BTC_RULES_15M
-    assert rules_for_asset("ETH", 5) == ETH_RULES_5M
-    assert rules_for_asset("ETH", 15) == ETH_RULES_15M
+    assert rules_for_asset("ETH", 5) == ()
+    assert rules_for_asset("ETH", 15) == ()
     assert rules_for_asset("DOGE", 5) == ()
 
 

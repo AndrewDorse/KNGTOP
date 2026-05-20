@@ -230,7 +230,7 @@ def test_tick_executes_first_leg_only(monkeypatch: pytest.MonkeyPatch) -> None:
     assert clob.limit_calls == [(0.23, pytest.approx(21.73))]
 
 
-def test_tick_allows_cwc_after_reclaim_in_same_window(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_marks_reclaim_rule_closed_after_send(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=False)
     runner = _runner_for_start(90)
     runner.trade_notional_usd = 5.0
@@ -261,8 +261,7 @@ def test_tick_allows_cwc_after_reclaim_in_same_window(monkeypatch: pytest.Monkey
         runtime_state={},
     )
     assert "reclaim_buy_up" in runner.traded_rule_keys
-    assert "cwc_buy_up" in runner.traded_rule_keys
-    assert clob.limit_calls == [(0.23, pytest.approx(21.73)), (0.33, pytest.approx(15.15))]
+    assert clob.limit_calls == [(0.23, pytest.approx(21.73))]
 
 
 def test_tick_does_not_open_after_five_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -289,11 +288,11 @@ def test_tick_does_not_open_after_five_minutes(monkeypatch: pytest.MonkeyPatch) 
 
 def test_planned_window_notional_clamps_to_fraction_min_and_max(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
-    assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=0.99) == 0.0
-    assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=1.0) == 0.0
-    assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=1.25) == pytest.approx(1.25)
-    assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=100.0) == pytest.approx(100.0 * ENTRY_BALANCE_FRACTION)
-    assert _planned_window_notional_usd(cfg, pair_key="ETH", window_minutes=5, available_balance_usdc=10_000.0) == pytest.approx(ENTRY_MAX_NOTIONAL_USD)
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=0.99) == 0.0
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=1.0) == 0.0
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=1.25) == pytest.approx(1.25)
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=100.0) == pytest.approx(100.0 * ENTRY_BALANCE_FRACTION)
+    assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10_000.0) == pytest.approx(ENTRY_MAX_NOTIONAL_USD)
     assert _planned_window_notional_usd(cfg, pair_key="BTC", window_minutes=5, available_balance_usdc=10.0) == pytest.approx(1.25)
 
 
@@ -318,7 +317,7 @@ def test_normalize_usdc_balance_converts_base_units() -> None:
 def test_runner_matches_current_window() -> None:
     now_ts = 1_777_900_589
     start = _current_window_start_sec(now_ts, 5)
-    runner = WindowRunner("ETH", "ETHUSDT", _contract(slug=f"eth-updown-5m-{start}"), 5, RULES_5M)
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     assert _runner_matches_current_window(runner, now_ts=now_ts, window_minutes=5)
 
 
@@ -326,7 +325,7 @@ def test_should_not_rediscover_when_runner_matches_current_window() -> None:
     now_ts = 1_777_900_589
     now_mono = 100.0
     start = _current_window_start_sec(now_ts, 5)
-    runner = WindowRunner("ETH", "ETHUSDT", _contract(slug=f"eth-updown-5m-{start}"), 5, RULES_5M)
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5, RULES_5M)
     state = DiscoveryState(last_window_start_sec=start, last_checked_monotonic=95.0)
     assert not _should_discover_contract(runner, state, now_ts=now_ts, now_monotonic=now_mono, window_minutes=5)
 
@@ -355,18 +354,18 @@ def test_should_discover_on_new_window_even_with_previous_runner() -> None:
     now_ts = 1_777_900_589
     current_start = _current_window_start_sec(now_ts, 5)
     previous_start = current_start - 300
-    runner = WindowRunner("ETH", "ETHUSDT", _contract(slug=f"eth-updown-5m-{previous_start}"), 5, RULES_5M)
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{previous_start}"), 5, RULES_5M)
     state = DiscoveryState(last_window_start_sec=previous_start, last_checked_monotonic=50.0)
     assert _should_discover_contract(runner, state, now_ts=now_ts, now_monotonic=55.0, window_minutes=5)
 
 
 def test_finalize_runner_window_logs_result(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=True)
-    runner = WindowRunner("ETH", "ETHUSDT", _contract(), 5, RULES_5M)
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug="btc-updown-5m-1777900200"), 5, RULES_5M)
     runner.start_px = 100_000.0
     runner.executed_rule_sides["reclaim_buy_up"] = "UP"
     with patch("kngtop.engine._event") as event_mock:
-        _finalize_runner_window(runner, binance=_FakeBinanceCombo(100_010.0), cfg=cfg)
+        _finalize_runner_window(runner, binance=_FakeBinanceCombo(100_010.0, symbol="BTCUSDT"), cfg=cfg)
     event_mock.assert_called_once()
     assert event_mock.call_args.args[0] == "DEAL_WINDOW_CLOSED"
     assert event_mock.call_args.kwargs["result"] == "RIGHT"
@@ -387,7 +386,7 @@ def test_run_iteration_prewarms_token_metadata_for_new_runner(monkeypatch: pytes
             return None
 
     start = _current_window_start_sec(int(datetime.now(timezone.utc).timestamp()), 5)
-    contract = _contract(slug=f"eth-updown-5m-{start}")
+    contract = _contract(slug=f"btc-updown-5m-{start}")
     clob = _FakeClobPrewarm(100.0)
     with (
         patch("kngtop.engine.discover_active_btc_window", return_value=contract),
@@ -405,15 +404,15 @@ def test_run_iteration_prewarms_token_metadata_for_new_runner(monkeypatch: pytes
             binance=_FakeBinance(),
             clob=clob,
             runtime_state={},
-        )
+    )
     assert contract.up.token_id in clob.prewarmed
     assert contract.down.token_id in clob.prewarmed
-    assert runners[("ETH", 5)] is not None
-    assert runners[("ETH", 15)] is not None
-    assert runners[("ETH", 5)].trade_notional_usd == pytest.approx(5.0)
+    assert runners[("BTC", 5)] is not None
+    assert runners[("BTC", 15)] is not None
+    assert runners[("BTC", 5)].trade_notional_usd == pytest.approx(5.0)
 
 
 def test_15m_rules_are_available_for_runner() -> None:
-    runner = WindowRunner("ETH", "ETHUSDT", _contract(slug="eth-updown-15m-1777900500"), 15, RULES_15M)
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug="btc-updown-15m-1777900500"), 15, RULES_15M)
     assert len(runner.rules) == 2
     assert all(rule.min_elapsed_sec >= 180 for rule in runner.rules)

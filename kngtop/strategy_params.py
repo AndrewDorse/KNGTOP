@@ -85,34 +85,6 @@ BTC_RULES_5M: tuple[MispriceRule, ...] = (
         kind="reclaim_dn",
         market_buy_max_price=BTC_MARKET_BUY_MAX_PRICE_5M,
     ),
-    MispriceRule(
-        "cwc_buy_up",
-        price_min=CWC_ENTRY_PRICE_MIN_5M,
-        cheap_max=CWC_ENTRY_PRICE_MAX_5M,
-        side="UP",
-        kind="cwc_up",
-        min_elapsed_sec=CWC_MIN_ELAPSED_SEC_5M,
-        max_elapsed_sec=CWC_MAX_ELAPSED_SEC_5M,
-        gap_min=CWC_GAP_MIN,
-        distance_bps_max=CWC_DISTANCE_BPS_MAX,
-        momentum_lookback_sec=CWC_MOMENTUM_LOOKBACK_SEC,
-        momentum_bps_min=CWC_MOMENTUM_BPS_MIN,
-        market_buy_max_price=BTC_MARKET_BUY_MAX_PRICE_5M,
-    ),
-    MispriceRule(
-        "cwc_buy_down",
-        price_min=CWC_ENTRY_PRICE_MIN_5M,
-        cheap_max=CWC_ENTRY_PRICE_MAX_5M,
-        side="DOWN",
-        kind="cwc_dn",
-        min_elapsed_sec=CWC_MIN_ELAPSED_SEC_5M,
-        max_elapsed_sec=CWC_MAX_ELAPSED_SEC_5M,
-        gap_min=CWC_GAP_MIN,
-        distance_bps_max=CWC_DISTANCE_BPS_MAX,
-        momentum_lookback_sec=CWC_MOMENTUM_LOOKBACK_SEC,
-        momentum_bps_min=CWC_MOMENTUM_BPS_MIN,
-        market_buy_max_price=BTC_MARKET_BUY_MAX_PRICE_5M,
-    ),
 )
 
 BTC_RULES_15M: tuple[MispriceRule, ...] = (
@@ -140,81 +112,13 @@ BTC_RULES_15M: tuple[MispriceRule, ...] = (
     ),
 )
 
-ETH_RULES_5M: tuple[MispriceRule, ...] = (
-    MispriceRule(
-        "reclaim_buy_up",
-        price_min=ETH_ENTRY_PRICE_MIN_5M,
-        cheap_max=ETH_ENTRY_PRICE_MAX_5M,
-        side="UP",
-        kind="reclaim_up",
-        market_buy_max_price=ETH_MARKET_BUY_MAX_PRICE_5M,
-    ),
-    MispriceRule(
-        "reclaim_buy_down",
-        price_min=ETH_ENTRY_PRICE_MIN_5M,
-        cheap_max=ETH_ENTRY_PRICE_MAX_5M,
-        side="DOWN",
-        kind="reclaim_dn",
-        market_buy_max_price=ETH_MARKET_BUY_MAX_PRICE_5M,
-    ),
-    MispriceRule(
-        "cwc_buy_up",
-        price_min=CWC_ENTRY_PRICE_MIN_5M,
-        cheap_max=CWC_ENTRY_PRICE_MAX_5M,
-        side="UP",
-        kind="cwc_up",
-        min_elapsed_sec=CWC_MIN_ELAPSED_SEC_5M,
-        max_elapsed_sec=CWC_MAX_ELAPSED_SEC_5M,
-        gap_min=CWC_GAP_MIN,
-        distance_bps_max=CWC_DISTANCE_BPS_MAX,
-        momentum_lookback_sec=CWC_MOMENTUM_LOOKBACK_SEC,
-        momentum_bps_min=CWC_MOMENTUM_BPS_MIN,
-        market_buy_max_price=ETH_MARKET_BUY_MAX_PRICE_5M,
-    ),
-    MispriceRule(
-        "cwc_buy_down",
-        price_min=CWC_ENTRY_PRICE_MIN_5M,
-        cheap_max=CWC_ENTRY_PRICE_MAX_5M,
-        side="DOWN",
-        kind="cwc_dn",
-        min_elapsed_sec=CWC_MIN_ELAPSED_SEC_5M,
-        max_elapsed_sec=CWC_MAX_ELAPSED_SEC_5M,
-        gap_min=CWC_GAP_MIN,
-        distance_bps_max=CWC_DISTANCE_BPS_MAX,
-        momentum_lookback_sec=CWC_MOMENTUM_LOOKBACK_SEC,
-        momentum_bps_min=CWC_MOMENTUM_BPS_MIN,
-        market_buy_max_price=ETH_MARKET_BUY_MAX_PRICE_5M,
-    ),
-)
+ETH_RULES_5M: tuple[MispriceRule, ...] = ()
 
-ETH_RULES_15M: tuple[MispriceRule, ...] = (
-    MispriceRule(
-        "reclaim_buy_up",
-        price_min=ETH_ENTRY_PRICE_MIN_15M,
-        cheap_max=ETH_ENTRY_PRICE_MAX_15M,
-        side="UP",
-        kind="reclaim_up",
-        min_elapsed_sec=MIN_ELAPSED_SEC_15M,
-        max_elapsed_sec=MAX_ELAPSED_SEC_15M,
-        lookback_sec=RECLAIM_LOOKBACK_SEC_15M,
-        market_buy_max_price=ETH_MARKET_BUY_MAX_PRICE_15M,
-    ),
-    MispriceRule(
-        "reclaim_buy_down",
-        price_min=ETH_ENTRY_PRICE_MIN_15M,
-        cheap_max=ETH_ENTRY_PRICE_MAX_15M,
-        side="DOWN",
-        kind="reclaim_dn",
-        min_elapsed_sec=MIN_ELAPSED_SEC_15M,
-        max_elapsed_sec=MAX_ELAPSED_SEC_15M,
-        lookback_sec=RECLAIM_LOOKBACK_SEC_15M,
-        market_buy_max_price=ETH_MARKET_BUY_MAX_PRICE_15M,
-    ),
-)
+ETH_RULES_15M: tuple[MispriceRule, ...] = ()
 
-# Backward-compatible aliases used by current ETH-focused tests.
-RULES_5M: tuple[MispriceRule, ...] = ETH_RULES_5M
-RULES_15M: tuple[MispriceRule, ...] = ETH_RULES_15M
+# Backward-compatible aliases used by tests/helpers.
+RULES_5M: tuple[MispriceRule, ...] = BTC_RULES_5M
+RULES_15M: tuple[MispriceRule, ...] = BTC_RULES_15M
 
 
 def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
@@ -224,10 +128,6 @@ def rules_for_asset(pair: str, window_minutes: int) -> tuple[MispriceRule, ...]:
         raise ValueError(f"unsupported asset pair {pair!r} (expected BTC, ETH, XRP, SOL, DOGE, BNB, HYPE, or LINK)")
     if p == "BTC":
         return BTC_RULES_5M if int(window_minutes) <= 5 else BTC_RULES_15M
-    if p == "ETH":
-        return ETH_RULES_5M if int(window_minutes) <= 5 else ETH_RULES_15M
-    if p not in {"BTC", "ETH"}:
-        return ()
     return ()
 
 
