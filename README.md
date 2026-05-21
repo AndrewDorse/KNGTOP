@@ -1,37 +1,32 @@
 # KNGTOP
 
-Dockerized Polymarket Up/Down runner for BTC, ETH, XRP, SOL, DOGE, BNB, HYPE, and LINK across 5m and 15m windows.
+Dockerized Polymarket Up/Down runner. Current default live entrypoint is the BTC 5m `S0184` bot.
 
 - Prices: Polymarket WebSocket market channel for UP/DOWN mids.
 - Binance: live spot from WebSocket and window-open start price from REST kline open at the slug epoch.
 
 ## Current strategy
 
-Current live entrypoint is `BTC` `5m` only and runs the `KILEMO_2` `H2725` hedge family.
+Current live entrypoint is `BTC` `5m` only and runs `S0184`.
 
-- Seed side: current BTC winner side only
-- Seed gate:
-  - winner-side Polymarket ask in `0.35-0.50`
-  - BTC move over `10s >= $2` in the winner-side direction
-- Seed order:
+- Side: current BTC winner side only
+- Entry gate:
+  - first `20s` of the 5m window only
+  - winner-side ask in `0.46-0.56`
+  - BTC absolute move from window open `>= $1`
+- Order:
   - FAK buy
-  - per-order size = `KNGTOP_NOTIONAL_USD` default `$2`
-- Hedge flow:
-  - after a seed fill, track `PnL if UP wins` and `PnL if DOWN wins`
-  - hedge the weaker outcome side only
-  - hedge side ask must be `<= 0.35`
-  - size is recalculated from the current deficit, and capped at the configured base size
-  - if the beneficial hedge size is below the exchange minimum, it is rounded up to the minimum instead of being skipped
+  - per-order size = `$1`
+  - max price = displayed ask `+ 0.05`, capped at `0.99`
 - Limits:
-  - `KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE` default `2`
-  - total window budget cap `$30`
+  - one buy per window
+  - no hedge leg
   - no artificial delay in live bot
 
 ## Sizing
 
-- `KNGTOP_NOTIONAL_USD` default `$2`
-- Hedge buys are dynamic from `$1` up to `KNGTOP_NOTIONAL_USD`
-- `KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE` default `2`
+- current live bot uses a single `$1` taker entry
+- `KNGTOP_NOTIONAL_USD=1.0` is the intended deploy setting in `.env`
 
 ## Run
 
@@ -40,7 +35,7 @@ cp .env.example .env
 docker compose --env-file .env up --build -d
 ```
 
-On deploy, the bot waits `60` seconds before entering the trading loop so the feeds can warm up.
+Container command is `python -m kngtop`, which now resolves to the current `S0184` live bot in `kngtop.live_kilemo2`.
 
 ## Local
 

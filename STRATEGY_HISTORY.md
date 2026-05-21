@@ -7,6 +7,22 @@ This file keeps a short memory of recent live strategy configurations.
 ### 2026-05-21
 - Scope: `BTC` only
 - Windows: `5m` only
+- Family: `S0184`
+- Flow:
+  - buy the current winner side only
+  - only within the first `20s` of the window
+  - winner-side ask must be in `0.46-0.56`
+  - BTC absolute move from the window open must be `>= $1`
+- Order:
+  - FAK buys only
+  - no artificial delay in live
+  - one buy per window
+  - notional = `$1`
+  - max price = displayed ask `+ 0.05`, capped at `0.99`
+
+### 2026-05-21 earlier
+- Scope: `BTC` only
+- Windows: `5m` only
 - Family: `KILEMO_2`
 - Variant: `H2725`
 - Flow:
@@ -25,7 +41,7 @@ This file keeps a short memory of recent live strategy configurations.
   - sub-minimum but beneficial hedge sizes are rounded up to the exchange minimum instead of being skipped
   - total live budget cap `$30` per window
 
-### 2026-05-21 earlier
+### 2026-05-21 earlier still
 - Scope: `BTC` only
 - Windows: `5m` only
 - Family: `cheap_hit_close_volume_and_move`

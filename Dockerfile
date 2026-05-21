@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# KNGTOP - BTC/ETH/XRP/SOL cheap-side trading bot (5m + 15m), $1 v2 market buys
+# KNGTOP - Docker image for the current BTC 5m S0184 live bot.
 FROM python:3.12-slim-bookworm
 
 WORKDIR /app
