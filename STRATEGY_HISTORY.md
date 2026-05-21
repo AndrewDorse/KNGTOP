@@ -7,6 +7,25 @@ This file keeps a short memory of recent live strategy configurations.
 ### 2026-05-21
 - Scope: `BTC` only
 - Windows: `5m` only
+- Family: `KILEMO_2`
+- Variant: `H2725`
+- Flow:
+  - seed the current winner side only
+  - seed ask must be in `0.35-0.50`
+  - BTC winner-side move over `10s >= $2`
+  - after a seed fill, keep recomputing `PnL if UP wins` and `PnL if DOWN wins`
+  - hedge only the weaker outcome side
+  - hedge side ask must be `<= 0.35`
+- Order:
+  - FAK buys only
+  - no artificial delay in live
+  - per-order notional = `KNGTOP_NOTIONAL_USD` default `$1`
+  - max `5` buys per side via `KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE`
+  - total live budget cap `$30` per window
+
+### 2026-05-21 earlier
+- Scope: `BTC` only
+- Windows: `5m` only
 - Family: `cheap_hit_close_volume_and_move`
 - Variant: `close<=30 + vol20>=1.4x AND move20>=2usd_or_open`
 - Signal:

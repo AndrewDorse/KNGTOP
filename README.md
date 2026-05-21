@@ -7,22 +7,29 @@ Dockerized Polymarket Up/Down runner for BTC, ETH, XRP, SOL, DOGE, BNB, HYPE, an
 
 ## Current strategy
 
-Current live entrypoint is `BTC` `5m` only and runs the `cheap-hit + close-to-open + volume AND move` family.
+Current live entrypoint is `BTC` `5m` only and runs the `KILEMO_2` `H2725` hedge family.
 
-- Trigger: first side whose Polymarket mid is `<= 0.15`
-- Side choice: buy the cheaper of `UP` / `DOWN`
-- Close gate: Binance spot must stay within `$30` of the window open
-- BTC gate: `volume spike AND move`
-- Volume gate: current Binance trade-size volume / previous `20s` average `>= 1.4x`, with cheap-side-favor alignment over `5s` or already beyond window open
-- Move gate: cheap-side-favor BTC move over `20s >= $2`, or already beyond window open
-- Order: `$1` FAK buy capped at `0.25`
-- Delay: none in live bot
-
-Only one buy attempt is made per window.
+- Seed side: current BTC winner side only
+- Seed gate:
+  - winner-side Polymarket ask in `0.35-0.50`
+  - BTC move over `10s >= $2` in the winner-side direction
+- Seed order:
+  - FAK buy
+  - per-order size = `KNGTOP_NOTIONAL_USD` default `$1`
+- Hedge flow:
+  - after a seed fill, track `PnL if UP wins` and `PnL if DOWN wins`
+  - hedge the weaker outcome side only
+  - hedge side ask must be `<= 0.35`
+  - size is recalculated from the current deficit, with a minimum of the configured base notional and a live cap of `2x` that base size per hedge buy
+- Limits:
+  - `KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE` default `5`
+  - total window budget cap `$30`
+  - no artificial delay in live bot
 
 ## Sizing
 
-- Fixed `$1` notional per live order for the current BTC `5m` strategy
+- `KNGTOP_NOTIONAL_USD` default `$1` per live order
+- `KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE` default `5`
 
 ## Run
 

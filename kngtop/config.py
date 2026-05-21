@@ -70,6 +70,7 @@ class KngtopConfig:
     poly_mid_max_age_sec: float
     ws_rest_poll_enabled: bool
     ws_rest_poll_interval_sec: float
+    hedge_max_orders_per_side: int
 
     @staticmethod
     def from_env() -> "KngtopConfig":
@@ -105,4 +106,5 @@ class KngtopConfig:
                     120.0,
                 ),
             ),
+            hedge_max_orders_per_side=max(1, int(os.environ.get("KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE") or "5")),
         )

@@ -135,6 +135,7 @@ def _cfg() -> KngtopConfig:
         poly_mid_max_age_sec=5.0,
         ws_rest_poll_enabled=False,
         ws_rest_poll_interval_sec=1.0,
+        hedge_max_orders_per_side=5,
     )
 
 
