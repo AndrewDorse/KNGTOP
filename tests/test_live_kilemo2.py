@@ -21,7 +21,7 @@ def _cfg() -> KngtopConfig:
         poll_interval_sec=0.2,
         eval_debounce_sec=0.0,
         request_timeout_sec=5.0,
-        notional_usd=1.0,
+        notional_usd=2.0,
         trading_pairs=(("BTC", "BTCUSDT"),),
         log_level="INFO",
         order_cutoff_remaining_sec=20.0,
@@ -31,7 +31,7 @@ def _cfg() -> KngtopConfig:
         poly_mid_max_age_sec=5.0,
         ws_rest_poll_enabled=False,
         ws_rest_poll_interval_sec=1.0,
-        hedge_max_orders_per_side=5,
+        hedge_max_orders_per_side=2,
     )
 
 
@@ -147,11 +147,11 @@ def test_tick_runner_submits_seed_without_delay() -> None:
         fake_dt.now.return_value = datetime.fromtimestamp(start + 60, timezone.utc)
         _tick_runner(runner, poly=poly, binance=binance, clob=fake_clob, cfg=cfg)
 
-    assert fake_clob.calls[0] == ("up-token", 1.0, 0.45)
+    assert fake_clob.calls[0] == ("up-token", 2.0, 0.45)
     assert runner.positions is not None
     assert runner.positions.orders_up == 1
     assert runner.positions.orders_down == 0
-    assert runner.positions.spent_total == 1.0
+    assert runner.positions.spent_total == 2.0
     assert runner.positions.pnl_if_up() > 0.0
     assert runner.positions.pnl_if_down() < 0.0
 
@@ -170,7 +170,7 @@ def test_tick_runner_rounds_small_beneficial_hedge_to_exchange_minimum() -> None
         ),
         window_minutes=5,
         window_open_px=100_000.0,
-        positions=PositionState(spent_up=1.0, shares_up=1.0 / 0.45, spent_down=0.0, shares_down=0.0, orders_up=1, orders_down=0),
+        positions=PositionState(spent_up=2.0, shares_up=3.0, spent_down=0.0, shares_down=0.0, orders_up=1, orders_down=0),
     )
     fake_clob = _FakeClob()
     cfg = _cfg()

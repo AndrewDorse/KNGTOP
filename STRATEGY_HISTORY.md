@@ -19,8 +19,9 @@ This file keeps a short memory of recent live strategy configurations.
 - Order:
   - FAK buys only
   - no artificial delay in live
-  - per-order notional = `KNGTOP_NOTIONAL_USD` default `$1`
-  - max `5` buys per side via `KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE`
+  - seed/base notional = `KNGTOP_NOTIONAL_USD` default `$2`
+  - hedge buy range = `$1` up to `KNGTOP_NOTIONAL_USD`
+  - max `2` buys per side via `KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE`
   - sub-minimum but beneficial hedge sizes are rounded up to the exchange minimum instead of being skipped
   - total live budget cap `$30` per window
 

@@ -15,22 +15,23 @@ Current live entrypoint is `BTC` `5m` only and runs the `KILEMO_2` `H2725` hedge
   - BTC move over `10s >= $2` in the winner-side direction
 - Seed order:
   - FAK buy
-  - per-order size = `KNGTOP_NOTIONAL_USD` default `$1`
+  - per-order size = `KNGTOP_NOTIONAL_USD` default `$2`
 - Hedge flow:
   - after a seed fill, track `PnL if UP wins` and `PnL if DOWN wins`
   - hedge the weaker outcome side only
   - hedge side ask must be `<= 0.35`
-  - size is recalculated from the current deficit, with a live cap of `2x` the base size per hedge buy
+  - size is recalculated from the current deficit, and capped at the configured base size
   - if the beneficial hedge size is below the exchange minimum, it is rounded up to the minimum instead of being skipped
 - Limits:
-  - `KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE` default `5`
+  - `KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE` default `2`
   - total window budget cap `$30`
   - no artificial delay in live bot
 
 ## Sizing
 
-- `KNGTOP_NOTIONAL_USD` default `$1` per live order
-- `KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE` default `5`
+- `KNGTOP_NOTIONAL_USD` default `$2`
+- Hedge buys are dynamic from `$1` up to `KNGTOP_NOTIONAL_USD`
+- `KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE` default `2`
 
 ## Run
 

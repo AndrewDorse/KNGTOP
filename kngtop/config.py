@@ -90,7 +90,7 @@ class KngtopConfig:
             poll_interval_sec=float(os.environ.get("KNGTOP_POLL_INTERVAL_SECONDS") or "0.2"),
             eval_debounce_sec=0.0,
             request_timeout_sec=float(os.environ.get("KNGTOP_REQUEST_TIMEOUT_SECONDS") or "5.0"),
-            notional_usd=float(os.environ.get("KNGTOP_NOTIONAL_USD") or "1.0"),
+            notional_usd=float(os.environ.get("KNGTOP_NOTIONAL_USD") or "2.0"),
             trading_pairs=pairs,
             log_level=(os.environ.get("KNGTOP_LOG_LEVEL") or "INFO").strip().upper(),
             order_cutoff_remaining_sec=float(os.environ.get("KNGTOP_ORDER_CUTOFF_REMAINING_SEC") or "20.0"),
@@ -106,5 +106,5 @@ class KngtopConfig:
                     120.0,
                 ),
             ),
-            hedge_max_orders_per_side=max(1, int(os.environ.get("KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE") or "5")),
+            hedge_max_orders_per_side=max(1, int(os.environ.get("KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE") or "2")),
         )

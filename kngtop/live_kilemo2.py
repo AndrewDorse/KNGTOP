@@ -432,7 +432,7 @@ def _maybe_hedge_trade(
         price=ask_px,
         target_roi=TARGET_ROI,
         rebalance_mult=REBALANCE_MULT,
-        max_order_usd=max(base_order_usd, 2.0 * base_order_usd),
+        max_order_usd=base_order_usd,
         imbalance_slack_usd=IMBALANCE_SLACK_USD,
     )
     if raw_order_usd <= 1e-12:
@@ -735,6 +735,7 @@ def main() -> None:
         order_type="fak",
         order_notional_usd=f"{float(cfg.notional_usd):.2f}",
         hedge_max_orders_per_side=str(cfg.hedge_max_orders_per_side),
+        hedge_order_range_usd=f"{EXCHANGE_MIN_ORDER_USD:.2f}-{float(cfg.notional_usd):.2f}",
         seed_band=f"{SEED_PRICE_MIN:.2f}-{SEED_PRICE_MAX:.2f}",
         seed_move10_usd=f"{SEED_MOVE_MIN_USD:.2f}",
         hedge_price_cap=f"{HEDGE_PRICE_CAP:.2f}",
