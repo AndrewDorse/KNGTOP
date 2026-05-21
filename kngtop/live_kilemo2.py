@@ -37,7 +37,7 @@ ENTRY_MAX_ELAPSED_SEC = 25.0
 MOVE_FROM_OPEN_MIN_USD = 1.0
 MIN_ORDER_NOTIONAL_USD = 1.0
 ORDER_SIZE_BALANCE_FRACTION = 0.10
-FAK_PRICE_BUFFER = 0.03
+BUY_FAK_PRICE = 0.58
 MAX_TAKER_PRICE = 0.99
 EXIT_SELL_PRICE: float | None = None
 
@@ -165,7 +165,7 @@ def evaluate_signal(
         btc_spot=float(spot_px),
         window_open_px=float(window_open_px),
         btc_move_from_open=btc_move_from_open,
-        max_price=min(MAX_TAKER_PRICE, ask_px + FAK_PRICE_BUFFER),
+        max_price=min(MAX_TAKER_PRICE, BUY_FAK_PRICE),
     )
 
 
@@ -474,7 +474,7 @@ def main() -> None:
         ask_band=f"{ENTRY_MIN_PRICE:.2f}-{ENTRY_MAX_PRICE:.2f}",
         btc_move_min_usd=f"{MOVE_FROM_OPEN_MIN_USD:.2f}",
         entry_max_elapsed_sec=f"{ENTRY_MAX_ELAPSED_SEC:.1f}",
-        fak_price_buffer=f"{FAK_PRICE_BUFFER:.2f}",
+        fak_buy_price=f"{BUY_FAK_PRICE:.2f}",
         exit_sell_price="disabled" if EXIT_SELL_PRICE is None else f"{EXIT_SELL_PRICE:.2f}",
     )
 
