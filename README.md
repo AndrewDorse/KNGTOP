@@ -11,18 +11,17 @@ Current live entrypoint is `BTC` `5m` only and runs `S0184`.
 
 - Side: current BTC winner side only
 - Entry gate:
-  - first `20s` of the 5m window only
-  - winner-side ask in `0.46-0.56`
+  - first `25s` of the 5m window only
+  - winner-side ask in `0.45-0.55`
   - BTC absolute move from window open `>= $1`
 - Order:
   - FAK buy
   - per-window order size = `10%` of available balance, floored at `$1`
-  - max price = displayed ask `+ 0.05`, capped at `0.99`
-- Exit:
-  - after entry, if the held side bid reaches `0.85+`, send a FAK sell at `0.85`
+  - max price = displayed ask `+ 0.03`, capped at `0.99`
 - Limits:
   - one buy per window
   - no hedge leg
+  - no take-profit exit
   - no artificial delay in live bot
 
 ## Sizing

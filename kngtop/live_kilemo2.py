@@ -31,15 +31,15 @@ WINDOW_SECONDS = TRADE_WINDOW_MINUTES * 60
 NEXT_WINDOW_LOOKAHEAD_SEC = 20
 WS_UPDATE_LOG_COOLDOWN_SEC = 1.0
 
-ENTRY_MIN_PRICE = 0.46
-ENTRY_MAX_PRICE = 0.56
-ENTRY_MAX_ELAPSED_SEC = 20.0
+ENTRY_MIN_PRICE = 0.45
+ENTRY_MAX_PRICE = 0.55
+ENTRY_MAX_ELAPSED_SEC = 25.0
 MOVE_FROM_OPEN_MIN_USD = 1.0
 MIN_ORDER_NOTIONAL_USD = 1.0
 ORDER_SIZE_BALANCE_FRACTION = 0.10
-FAK_PRICE_BUFFER = 0.05
+FAK_PRICE_BUFFER = 0.03
 MAX_TAKER_PRICE = 0.99
-EXIT_SELL_PRICE = 0.85
+EXIT_SELL_PRICE: float | None = None
 
 
 @dataclass(slots=True)
@@ -344,7 +344,7 @@ def _tick_runner(
         if runner.exited or runner.attempt_side is None:
             return
         held_bid = float(up_bid) if runner.attempt_side == "UP" else float(down_bid)
-        if held_bid + 1e-12 >= EXIT_SELL_PRICE:
+        if EXIT_SELL_PRICE is not None and held_bid + 1e-12 >= EXIT_SELL_PRICE:
             if _send_fak_sell(runner=runner, clob=clob, cfg=cfg, bid_px=held_bid):
                 runner.exited = True
                 runner.stop_reason = "take_profit_exit"
@@ -475,7 +475,7 @@ def main() -> None:
         btc_move_min_usd=f"{MOVE_FROM_OPEN_MIN_USD:.2f}",
         entry_max_elapsed_sec=f"{ENTRY_MAX_ELAPSED_SEC:.1f}",
         fak_price_buffer=f"{FAK_PRICE_BUFFER:.2f}",
-        exit_sell_price=f"{EXIT_SELL_PRICE:.2f}",
+        exit_sell_price="disabled" if EXIT_SELL_PRICE is None else f"{EXIT_SELL_PRICE:.2f}",
     )
 
     while True:

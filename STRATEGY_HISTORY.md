@@ -10,16 +10,16 @@ This file keeps a short memory of recent live strategy configurations.
 - Family: `S0184`
 - Flow:
   - buy the current winner side only
-  - only within the first `20s` of the window
-  - winner-side ask must be in `0.46-0.56`
+  - only within the first `25s` of the window
+  - winner-side ask must be in `0.45-0.55`
   - BTC absolute move from the window open must be `>= $1`
 - Order:
   - FAK buys only
   - no artificial delay in live
   - one buy per window
   - order size = `10%` of available balance, floored at `$1`, checked once at window start
-  - max price = displayed ask `+ 0.05`, capped at `0.99`
-  - if held-side bid reaches `0.85+`, send a FAK sell at `0.85`
+  - max price = displayed ask `+ 0.03`, capped at `0.99`
+  - no take-profit exit; hold to resolution
 
 ### 2026-05-21 earlier
 - Scope: `BTC` only
