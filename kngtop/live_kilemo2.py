@@ -35,9 +35,11 @@ ENTRY_MIN_PRICE = 0.46
 ENTRY_MAX_PRICE = 0.56
 ENTRY_MAX_ELAPSED_SEC = 20.0
 MOVE_FROM_OPEN_MIN_USD = 1.0
-ORDER_NOTIONAL_USD = 1.0
+MIN_ORDER_NOTIONAL_USD = 1.0
+ORDER_SIZE_BALANCE_FRACTION = 0.10
 FAK_PRICE_BUFFER = 0.05
 MAX_TAKER_PRICE = 0.99
+EXIT_SELL_PRICE = 0.85
 
 
 @dataclass(slots=True)
@@ -53,6 +55,10 @@ class WindowRunner:
     trigger_ask_px: float | None = None
     trigger_max_price: float | None = None
     btc_move_from_open: float | None = None
+    order_notional_usd: float = MIN_ORDER_NOTIONAL_USD
+    estimated_shares: float = 0.0
+    exited: bool = False
+    exit_order_id: str | None = None
     order_id: str | None = None
     stop_reason: str | None = None
 
@@ -172,6 +178,15 @@ def _token_for_side(runner: WindowRunner, side: str) -> TokenMarket:
     return runner.contract.up if str(side).upper() == "UP" else runner.contract.down
 
 
+def _window_order_notional_usd(*, clob: KngtopClob | None, cfg: KngtopConfig) -> float:
+    if cfg.dry_run or clob is None:
+        return max(MIN_ORDER_NOTIONAL_USD, float(cfg.notional_usd))
+    available = clob.available_balance_usdc()
+    if available is None:
+        return max(MIN_ORDER_NOTIONAL_USD, float(cfg.notional_usd))
+    return max(MIN_ORDER_NOTIONAL_USD, float(available) * ORDER_SIZE_BALANCE_FRACTION)
+
+
 def _send_fak_buy(
     *,
     runner: WindowRunner,
@@ -187,7 +202,7 @@ def _send_fak_buy(
             slug=runner.contract.slug,
             side=side,
             mode="dry_run",
-            notional_usd=f"{ORDER_NOTIONAL_USD:.2f}",
+            notional_usd=f"{runner.order_notional_usd:.2f}",
             ask_px=f"{decision.ask_px:.4f}",
             max_price=f"{decision.max_price:.4f}",
         )
@@ -198,14 +213,14 @@ def _send_fak_buy(
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            payload = clob.market_buy_usdc(token, ORDER_NOTIONAL_USD, max_price=decision.max_price)
+            payload = clob.market_buy_usdc(token, runner.order_notional_usd, max_price=decision.max_price)
             runner.order_id = _extract_order_id(payload)
             _log_tag(
                 "FAK BUY",
                 slug=runner.contract.slug,
                 side=side,
                 attempt=str(attempt),
-                notional_usd=f"{ORDER_NOTIONAL_USD:.2f}",
+                notional_usd=f"{runner.order_notional_usd:.2f}",
                 ask_px=f"{decision.ask_px:.4f}",
                 max_price=f"{decision.max_price:.4f}",
                 order_id=runner.order_id or "-",
@@ -227,11 +242,69 @@ def _send_fak_buy(
     return False
 
 
+def _send_fak_sell(
+    *,
+    runner: WindowRunner,
+    clob: KngtopClob | None,
+    cfg: KngtopConfig,
+    bid_px: float,
+) -> bool:
+    side = runner.attempt_side
+    if side is None or runner.estimated_shares <= 0:
+        return False
+    token = _token_for_side(runner, side)
+    if cfg.dry_run or clob is None:
+        _log_tag(
+            "FAK SELL",
+            slug=runner.contract.slug,
+            side=side,
+            mode="dry_run",
+            shares=f"{runner.estimated_shares:.4f}",
+            bid_px=f"{bid_px:.4f}",
+            min_price=f"{EXIT_SELL_PRICE:.2f}",
+        )
+        runner.exit_order_id = None
+        return True
+
+    attempts = max(1, int(cfg.order_retry_on_error) + 1)
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            payload = clob.market_sell_shares_fak(token, shares=runner.estimated_shares, min_price=EXIT_SELL_PRICE)
+            runner.exit_order_id = _extract_order_id(payload)
+            _log_tag(
+                "FAK SELL",
+                slug=runner.contract.slug,
+                side=side,
+                attempt=str(attempt),
+                shares=f"{runner.estimated_shares:.4f}",
+                bid_px=f"{bid_px:.4f}",
+                min_price=f"{EXIT_SELL_PRICE:.2f}",
+                order_id=runner.exit_order_id or "-",
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            _log_tag(
+                "FAK SELL",
+                slug=runner.contract.slug,
+                side=side,
+                status="error",
+                attempt=str(attempt),
+                error=str(exc),
+            )
+            time.sleep(0.1)
+    if last_error is not None:
+        _log_tag("WINDOW", slug=runner.contract.slug, state="sell_failed", side=side, error=str(last_error))
+    return False
+
+
 def _discover_target_windows(
     cfg: KngtopConfig,
     *,
     runners: dict[int, WindowRunner],
     binance_symbol: str,
+    clob: KngtopClob | None,
 ) -> None:
     now_ts = int(datetime.now(timezone.utc).timestamp())
     for start_sec in _candidate_window_starts(now_ts):
@@ -257,6 +330,7 @@ def _discover_target_windows(
             contract=contract,
             window_minutes=TRADE_WINDOW_MINUTES,
             window_open_px=window_open_px,
+            order_notional_usd=_window_order_notional_usd(clob=clob, cfg=cfg),
         )
         _log_tag(
             "WINDOW",
@@ -264,6 +338,7 @@ def _discover_target_windows(
             state="discovered",
             start_sec=str(start_sec),
             window_open_px="-" if window_open_px is None else f"{window_open_px:.2f}",
+            order_notional_usd=f"{runners[start_sec].order_notional_usd:.2f}",
         )
 
 
@@ -302,18 +377,6 @@ def _tick_runner(
     if elapsed < 0:
         _log_tag("WINDOW", slug=runner.contract.slug, state="prestart_watch")
         return
-    if runner.attempted:
-        return
-    if elapsed > ENTRY_MAX_ELAPSED_SEC + 1e-12:
-        runner.attempted = True
-        runner.stop_reason = "entry_window_closed"
-        _log_tag("WINDOW", slug=runner.contract.slug, state="entry_window_closed", elapsed_sec=f"{elapsed:.1f}")
-        return
-    if remaining <= float(cfg.order_cutoff_remaining_sec):
-        _log_tag("WINDOW", slug=runner.contract.slug, state="late_window", remaining_sec=f"{remaining:.1f}")
-        runner.attempted = True
-        runner.stop_reason = "late_window"
-        return
     if runner.window_open_px is None:
         start_sec = runner.start_sec()
         if start_sec is None:
@@ -336,8 +399,27 @@ def _tick_runner(
     if up_quote is None or down_quote is None:
         _log_tag("SKIP BUY", slug=runner.contract.slug, reason="poly_stale")
         return
-    _up_bid, up_ask = up_quote
-    _down_bid, down_ask = down_quote
+    up_bid, up_ask = up_quote
+    down_bid, down_ask = down_quote
+    if runner.attempted:
+        if runner.exited or runner.attempt_side is None:
+            return
+        held_bid = float(up_bid) if runner.attempt_side == "UP" else float(down_bid)
+        if held_bid + 1e-12 >= EXIT_SELL_PRICE:
+            if _send_fak_sell(runner=runner, clob=clob, cfg=cfg, bid_px=held_bid):
+                runner.exited = True
+                runner.stop_reason = "take_profit_exit"
+        return
+    if elapsed > ENTRY_MAX_ELAPSED_SEC + 1e-12:
+        runner.attempted = True
+        runner.stop_reason = "entry_window_closed"
+        _log_tag("WINDOW", slug=runner.contract.slug, state="entry_window_closed", elapsed_sec=f"{elapsed:.1f}")
+        return
+    if remaining <= float(cfg.order_cutoff_remaining_sec):
+        _log_tag("WINDOW", slug=runner.contract.slug, state="late_window", remaining_sec=f"{remaining:.1f}")
+        runner.attempted = True
+        runner.stop_reason = "late_window"
+        return
     decision = evaluate_signal(
         window_open_px=float(runner.window_open_px),
         spot_px=float(spot),
@@ -364,6 +446,7 @@ def _tick_runner(
         runner.trigger_ask_px = decision.ask_px
         runner.trigger_max_price = decision.max_price
         runner.btc_move_from_open = decision.btc_move_from_open
+        runner.estimated_shares = runner.order_notional_usd / max(decision.max_price, 1e-9)
         runner.stop_reason = "signal_submitted"
 
 
@@ -376,7 +459,7 @@ def _run_iteration(
     clob: KngtopClob | None,
 ) -> None:
     binance_symbol = dict(cfg.trading_pairs).get(TRADE_PAIR_KEY, "BTCUSDT")
-    _discover_target_windows(cfg, runners=runners, binance_symbol=binance_symbol)
+    _discover_target_windows(cfg, runners=runners, binance_symbol=binance_symbol, clob=clob)
     _refresh_subscriptions(runners=runners, poly=poly)
     for runner in list(runners.values()):
         try:
@@ -443,11 +526,12 @@ def main() -> None:
         heartbeat_sec=str(cfg.poll_interval_sec),
         strategy="s0184_start_window_winner",
         order_type="fak",
-        order_notional_usd=f"{ORDER_NOTIONAL_USD:.2f}",
+        order_size_rule="10pct_balance_min1",
         ask_band=f"{ENTRY_MIN_PRICE:.2f}-{ENTRY_MAX_PRICE:.2f}",
         btc_move_min_usd=f"{MOVE_FROM_OPEN_MIN_USD:.2f}",
         entry_max_elapsed_sec=f"{ENTRY_MAX_ELAPSED_SEC:.1f}",
         fak_price_buffer=f"{FAK_PRICE_BUFFER:.2f}",
+        exit_sell_price=f"{EXIT_SELL_PRICE:.2f}",
     )
 
     while True:

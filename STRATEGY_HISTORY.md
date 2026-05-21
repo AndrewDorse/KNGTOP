@@ -17,8 +17,9 @@ This file keeps a short memory of recent live strategy configurations.
   - FAK buys only
   - no artificial delay in live
   - one buy per window
-  - notional = `$1`
+  - order size = `10%` of available balance, floored at `$1`, checked once at window start
   - max price = displayed ask `+ 0.05`, capped at `0.99`
+  - if held-side bid reaches `0.85+`, send a FAK sell at `0.85`
 
 ### 2026-05-21 earlier
 - Scope: `BTC` only

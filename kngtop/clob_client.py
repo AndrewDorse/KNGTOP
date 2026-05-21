@@ -262,6 +262,31 @@ class KngtopClob:
             signed = self.client.create_order(order)
             return self.client.post_order(signed, OrderType.FAK)
 
+    def market_sell_shares_fak(
+        self, token: TokenMarket, *, shares: float, min_price: float
+    ) -> dict[str, Any]:
+        sz = float(shares)
+        px = float(min_price)
+        if sz <= 0:
+            raise ValueError("shares must be > 0")
+        if px <= 0 or px >= 1:
+            raise ValueError("min_price must be between 0 and 1")
+        order = OrderArgs(
+            token_id=token.token_id,
+            price=_round_order_price(px),
+            size=_round_order_shares(sz),
+            side=self._sell,
+        )
+        create_and_post = getattr(self.client, "create_and_post_order", None)
+        with self._taker_lock:
+            if callable(create_and_post):
+                try:
+                    return create_and_post(order_args=order, options=None, order_type=OrderType.FAK, post_only=False)
+                except TypeError:
+                    return create_and_post(order, None, OrderType.FAK)
+            signed = self.client.create_order(order)
+            return self.client.post_order(signed, OrderType.FAK)
+
     def limit_buy(self, token: TokenMarket, *, price: float, usdc: float, post_only: bool = True) -> dict[str, Any]:
         u = float(usdc)
         px = float(price)

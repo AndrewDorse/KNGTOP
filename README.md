@@ -16,8 +16,10 @@ Current live entrypoint is `BTC` `5m` only and runs `S0184`.
   - BTC absolute move from window open `>= $1`
 - Order:
   - FAK buy
-  - per-order size = `$1`
+  - per-window order size = `10%` of available balance, floored at `$1`
   - max price = displayed ask `+ 0.05`, capped at `0.99`
+- Exit:
+  - after entry, if the held side bid reaches `0.85+`, send a FAK sell at `0.85`
 - Limits:
   - one buy per window
   - no hedge leg
@@ -25,8 +27,9 @@ Current live entrypoint is `BTC` `5m` only and runs `S0184`.
 
 ## Sizing
 
-- current live bot uses a single `$1` taker entry
-- `KNGTOP_NOTIONAL_USD=1.0` is the intended deploy setting in `.env`
+- order size is checked once at each new window start
+- live size = `max($1, 10% of available balance)`
+- `KNGTOP_NOTIONAL_USD` is only a fallback for dry-run or balance fetch failure
 
 ## Run
 
