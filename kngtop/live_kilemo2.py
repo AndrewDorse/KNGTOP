@@ -204,7 +204,7 @@ def _send_fak_buy(
             return True
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            time.sleep(0.1)
+            time.sleep(0.5)
     if last_error is not None:
         _log_tag("ERROR", slug=runner.contract.slug, stage="buy", side=side, error=str(last_error))
     return False
@@ -234,7 +234,7 @@ def _send_fak_sell(
             return True
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            time.sleep(0.1)
+            time.sleep(0.5)
     if last_error is not None:
         _log_tag("ERROR", slug=runner.contract.slug, stage="sell", side=side, error=str(last_error))
     return False
