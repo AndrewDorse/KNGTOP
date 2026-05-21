@@ -83,7 +83,7 @@ def _setup_logging(level: str) -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    for noisy_name in ("websocket", "urllib3"):
+    for noisy_name in ("websocket", "urllib3", "httpx", "httpcore", "py_clob_client_v2", "py_clob_client_v2.http_helpers.helpers"):
         noisy = logging.getLogger(noisy_name)
         noisy.setLevel(logging.CRITICAL)
         noisy.propagate = False
@@ -95,16 +95,11 @@ def _log_tag(tag: str, **fields: object) -> None:
 
 
 def _ws_reconnected_event(feed: str, downtime_sec: float) -> None:
-    _log_tag("WS UPDATE", feed=feed, event="reconnected", downtime_sec=f"{downtime_sec:.3f}")
+    del feed, downtime_sec
 
 
 def _log_ws_update(runtime_state: dict[str, Any], *, feed: str, symbol: str | None = None) -> None:
-    now_monotonic = time.perf_counter()
-    gate_key = f"ws_log_not_before:{feed}:{symbol or '-'}"
-    if now_monotonic < float(runtime_state.get(gate_key, 0.0)):
-        return
-    runtime_state[gate_key] = now_monotonic + WS_UPDATE_LOG_COOLDOWN_SEC
-    _log_tag("WS UPDATE", feed=feed, symbol=symbol or "-")
+    del runtime_state, feed, symbol
 
 
 def _extract_order_id(payload: object) -> str | None:
@@ -197,15 +192,6 @@ def _send_fak_buy(
     side = decision.side
     token = _token_for_side(runner, side)
     if cfg.dry_run or clob is None:
-        _log_tag(
-            "FAK BUY",
-            slug=runner.contract.slug,
-            side=side,
-            mode="dry_run",
-            notional_usd=f"{runner.order_notional_usd:.2f}",
-            ask_px=f"{decision.ask_px:.4f}",
-            max_price=f"{decision.max_price:.4f}",
-        )
         runner.order_id = None
         return True
 
@@ -215,30 +201,12 @@ def _send_fak_buy(
         try:
             payload = clob.market_buy_usdc(token, runner.order_notional_usd, max_price=decision.max_price)
             runner.order_id = _extract_order_id(payload)
-            _log_tag(
-                "FAK BUY",
-                slug=runner.contract.slug,
-                side=side,
-                attempt=str(attempt),
-                notional_usd=f"{runner.order_notional_usd:.2f}",
-                ask_px=f"{decision.ask_px:.4f}",
-                max_price=f"{decision.max_price:.4f}",
-                order_id=runner.order_id or "-",
-            )
             return True
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            _log_tag(
-                "FAK BUY",
-                slug=runner.contract.slug,
-                side=side,
-                status="error",
-                attempt=str(attempt),
-                error=str(exc),
-            )
             time.sleep(0.1)
     if last_error is not None:
-        _log_tag("WINDOW", slug=runner.contract.slug, state="buy_failed", error=str(last_error))
+        _log_tag("ERROR", slug=runner.contract.slug, stage="buy", side=side, error=str(last_error))
     return False
 
 
@@ -254,15 +222,6 @@ def _send_fak_sell(
         return False
     token = _token_for_side(runner, side)
     if cfg.dry_run or clob is None:
-        _log_tag(
-            "FAK SELL",
-            slug=runner.contract.slug,
-            side=side,
-            mode="dry_run",
-            shares=f"{runner.estimated_shares:.4f}",
-            bid_px=f"{bid_px:.4f}",
-            min_price=f"{EXIT_SELL_PRICE:.2f}",
-        )
         runner.exit_order_id = None
         return True
 
@@ -272,30 +231,12 @@ def _send_fak_sell(
         try:
             payload = clob.market_sell_shares_fak(token, shares=runner.estimated_shares, min_price=EXIT_SELL_PRICE)
             runner.exit_order_id = _extract_order_id(payload)
-            _log_tag(
-                "FAK SELL",
-                slug=runner.contract.slug,
-                side=side,
-                attempt=str(attempt),
-                shares=f"{runner.estimated_shares:.4f}",
-                bid_px=f"{bid_px:.4f}",
-                min_price=f"{EXIT_SELL_PRICE:.2f}",
-                order_id=runner.exit_order_id or "-",
-            )
             return True
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            _log_tag(
-                "FAK SELL",
-                slug=runner.contract.slug,
-                side=side,
-                status="error",
-                attempt=str(attempt),
-                error=str(exc),
-            )
             time.sleep(0.1)
     if last_error is not None:
-        _log_tag("WINDOW", slug=runner.contract.slug, state="sell_failed", side=side, error=str(last_error))
+        _log_tag("ERROR", slug=runner.contract.slug, stage="sell", side=side, error=str(last_error))
     return False
 
 
@@ -332,14 +273,7 @@ def _discover_target_windows(
             window_open_px=window_open_px,
             order_notional_usd=_window_order_notional_usd(clob=clob, cfg=cfg),
         )
-        _log_tag(
-            "WINDOW",
-            slug=contract.slug,
-            state="discovered",
-            start_sec=str(start_sec),
-            window_open_px="-" if window_open_px is None else f"{window_open_px:.2f}",
-            order_notional_usd=f"{runners[start_sec].order_notional_usd:.2f}",
-        )
+        _log_tag("INIT", slug=contract.slug, start_sec=str(start_sec), order_notional_usd=f"{runners[start_sec].order_notional_usd:.2f}")
 
 
 def _refresh_subscriptions(*, runners: dict[int, WindowRunner], poly: MarketWsFeed) -> None:
@@ -359,7 +293,16 @@ def _purge_finished_windows(*, runners: dict[int, WindowRunner]) -> None:
         if remaining > 0:
             continue
         runners.pop(start_sec, None)
-        _log_tag("WINDOW", slug=runner.contract.slug, state="dropped", reason="expired")
+        if runner.attempt_side is not None and not runner.exited:
+            _log_tag(
+                "DEAL END",
+                slug=runner.contract.slug,
+                side=runner.attempt_side,
+                result="loss",
+                reason="expired_without_tp",
+                order_notional_usd=f"{runner.order_notional_usd:.2f}",
+                pnl_usd_est=f"{-runner.order_notional_usd:.2f}",
+            )
 
 
 def _tick_runner(
@@ -375,7 +318,6 @@ def _tick_runner(
     if elapsed is None or remaining is None:
         return
     if elapsed < 0:
-        _log_tag("WINDOW", slug=runner.contract.slug, state="prestart_watch")
         return
     if runner.window_open_px is None:
         start_sec = runner.start_sec()
@@ -388,16 +330,13 @@ def _tick_runner(
             timeout=cfg.request_timeout_sec,
         )
         if runner.window_open_px is None:
-            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="window_open_missing")
             return
     spot = binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec)
     if spot is None:
-        _log_tag("SKIP BUY", slug=runner.contract.slug, reason="binance_stale")
         return
     up_quote = poly.best_bid_ask_for(runner.contract.up.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     down_quote = poly.best_bid_ask_for(runner.contract.down.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     if up_quote is None or down_quote is None:
-        _log_tag("SKIP BUY", slug=runner.contract.slug, reason="poly_stale")
         return
     up_bid, up_ask = up_quote
     down_bid, down_ask = down_quote
@@ -409,14 +348,23 @@ def _tick_runner(
             if _send_fak_sell(runner=runner, clob=clob, cfg=cfg, bid_px=held_bid):
                 runner.exited = True
                 runner.stop_reason = "take_profit_exit"
+                pnl_usd = runner.estimated_shares * EXIT_SELL_PRICE - runner.order_notional_usd
+                _log_tag(
+                    "DEAL END",
+                    slug=runner.contract.slug,
+                    side=runner.attempt_side,
+                    result="success",
+                    reason="tp85",
+                    order_notional_usd=f"{runner.order_notional_usd:.2f}",
+                    exit_price=f"{EXIT_SELL_PRICE:.2f}",
+                    pnl_usd_est=f"{pnl_usd:.2f}",
+                )
         return
     if elapsed > ENTRY_MAX_ELAPSED_SEC + 1e-12:
         runner.attempted = True
         runner.stop_reason = "entry_window_closed"
-        _log_tag("WINDOW", slug=runner.contract.slug, state="entry_window_closed", elapsed_sec=f"{elapsed:.1f}")
         return
     if remaining <= float(cfg.order_cutoff_remaining_sec):
-        _log_tag("WINDOW", slug=runner.contract.slug, state="late_window", remaining_sec=f"{remaining:.1f}")
         runner.attempted = True
         runner.stop_reason = "late_window"
         return
@@ -428,17 +376,6 @@ def _tick_runner(
     )
     if decision is None:
         return
-    _log_tag(
-        "SIGNAL",
-        slug=runner.contract.slug,
-        side=decision.side,
-        ask_px=f"{decision.ask_px:.4f}",
-        max_price=f"{decision.max_price:.4f}",
-        btc_spot=f"{decision.btc_spot:.2f}",
-        window_open_px=f"{decision.window_open_px:.2f}",
-        btc_move_from_open=f"{decision.btc_move_from_open:.2f}",
-        elapsed_sec=f"{elapsed:.1f}",
-    )
     if _send_fak_buy(runner=runner, decision=decision, clob=clob, cfg=cfg):
         runner.attempted = True
         runner.attempt_side = decision.side
@@ -448,6 +385,15 @@ def _tick_runner(
         runner.btc_move_from_open = decision.btc_move_from_open
         runner.estimated_shares = runner.order_notional_usd / max(decision.max_price, 1e-9)
         runner.stop_reason = "signal_submitted"
+        _log_tag(
+            "DEAL START",
+            slug=runner.contract.slug,
+            side=decision.side,
+            order_notional_usd=f"{runner.order_notional_usd:.2f}",
+            ask_px=f"{decision.ask_px:.4f}",
+            max_price=f"{decision.max_price:.4f}",
+            btc_move_from_open=f"{decision.btc_move_from_open:.2f}",
+        )
 
 
 def _run_iteration(
@@ -465,7 +411,7 @@ def _run_iteration(
         try:
             _tick_runner(runner, poly=poly, binance=binance, clob=clob, cfg=cfg)
         except Exception as exc:  # noqa: BLE001
-            _log_tag("WINDOW", slug=runner.contract.slug, state="tick_error", error=str(exc))
+            _log_tag("ERROR", slug=runner.contract.slug, stage="tick", error=str(exc))
     _purge_finished_windows(runners=runners)
 
 
@@ -519,11 +465,9 @@ def main() -> None:
 
     runners: dict[int, WindowRunner] = {}
     _log_tag(
-        "WINDOW",
-        state="boot",
+        "INIT",
         pair=TRADE_PAIR_KEY,
         window_minutes=str(TRADE_WINDOW_MINUTES),
-        heartbeat_sec=str(cfg.poll_interval_sec),
         strategy="s0184_start_window_winner",
         order_type="fak",
         order_size_rule="10pct_balance_min1",
@@ -539,7 +483,7 @@ def main() -> None:
             coord.wait_for_turn()
             _run_iteration(cfg, runners=runners, poly=poly, binance=binance, clob=clob)
         except Exception as exc:  # noqa: BLE001
-            _log_tag("WINDOW", state="main_loop_error", error=str(exc))
+            _log_tag("ERROR", stage="main_loop", error=str(exc))
 
 
 if __name__ == "__main__":
