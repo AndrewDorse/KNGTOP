@@ -1,4 +1,4 @@
-"""BTC 5m live bot for the KILEMO_1 cheap-hit + volume OR move strategy."""
+"""BTC 5m live bot for the KILEMO_1 cheap-hit + close-to-open + volume AND move strategy."""
 
 from __future__ import annotations
 
@@ -34,11 +34,12 @@ WS_UPDATE_LOG_COOLDOWN_SEC = 1.0
 CHEAP_TRIGGER_MAX = 0.15
 ORDER_LIMIT_PRICE = 0.25
 ORDER_NOTIONAL_USD = 1.0
-VOLUME_LOOKBACK_SEC = 10
+CLOSE_TO_OPEN_MAX_USD = 30.0
+VOLUME_LOOKBACK_SEC = 20
 VOLUME_RATIO_MIN = 1.4
 VOLUME_ALIGN_LOOKBACK_SEC = 5
-MOVE_LOOKBACK_SEC = 30
-MOVE_MIN_USD = 1.0
+MOVE_LOOKBACK_SEC = 20
+MOVE_MIN_USD = 2.0
 
 
 @dataclass(slots=True)
@@ -63,9 +64,10 @@ class WindowRunner:
 class SignalDecision:
     side: str
     cheap_mid: float
+    abs_from_open: float
     side_vs_open: float
     align_5s: float
-    align_30s: float
+    align_20s: float
     volume_ratio: float
     move_gate: bool
     volume_gate: bool
@@ -157,34 +159,38 @@ def evaluate_signal(
     mid_up: float,
     mid_dn: float,
     price_then_now_5s: tuple[float, float] | None,
-    price_then_now_30s: tuple[float, float] | None,
-    volume_ratio_10s: float | None,
+    price_then_now_20s: tuple[float, float] | None,
+    volume_ratio_20s: float | None,
 ) -> SignalDecision | None:
     cheap = _cheap_side(mid_up, mid_dn)
     if cheap is None:
         return None
     side, cheap_mid = cheap
     sign = _side_sign(side)
+    abs_from_open = abs(float(spot_px) - float(window_open_px))
+    if abs_from_open > CLOSE_TO_OPEN_MAX_USD + 1e-12:
+        return None
     side_vs_open = float(sign) * (float(spot_px) - float(window_open_px))
     align_5s = 0.0
     if price_then_now_5s is not None:
         now_5, past_5 = price_then_now_5s
         align_5s = float(sign) * (float(now_5) - float(past_5))
-    align_30s = 0.0
-    if price_then_now_30s is not None:
-        now_30, past_30 = price_then_now_30s
-        align_30s = float(sign) * (float(now_30) - float(past_30))
-    vol_ratio = 0.0 if volume_ratio_10s is None else float(volume_ratio_10s)
+    align_20s = 0.0
+    if price_then_now_20s is not None:
+        now_20, past_20 = price_then_now_20s
+        align_20s = float(sign) * (float(now_20) - float(past_20))
+    vol_ratio = 0.0 if volume_ratio_20s is None else float(volume_ratio_20s)
     volume_gate = vol_ratio + 1e-12 >= VOLUME_RATIO_MIN and (align_5s >= -1e-12 or side_vs_open >= -1e-12)
-    move_gate = align_30s + 1e-12 >= MOVE_MIN_USD or side_vs_open >= -1e-12
-    if not (volume_gate or move_gate):
+    move_gate = align_20s + 1e-12 >= MOVE_MIN_USD or side_vs_open >= -1e-12
+    if not (volume_gate and move_gate):
         return None
     return SignalDecision(
         side=side,
         cheap_mid=cheap_mid,
+        abs_from_open=abs_from_open,
         side_vs_open=side_vs_open,
         align_5s=align_5s,
-        align_30s=align_30s,
+        align_20s=align_20s,
         volume_ratio=vol_ratio,
         move_gate=move_gate,
         volume_gate=volume_gate,
@@ -364,12 +370,12 @@ def _tick_runner(
         lookback_sec=VOLUME_ALIGN_LOOKBACK_SEC,
         max_age_sec=cfg.binance_max_age_sec,
     )
-    price_then_now_30s = binance.price_then_now(
+    price_then_now_20s = binance.price_then_now(
         runner.binance_symbol,
         lookback_sec=MOVE_LOOKBACK_SEC,
         max_age_sec=cfg.binance_max_age_sec,
     )
-    volume_ratio_10s = binance.current_volume_ratio(
+    volume_ratio_20s = binance.current_volume_ratio(
         runner.binance_symbol,
         lookback_sec=VOLUME_LOOKBACK_SEC,
         max_age_sec=cfg.binance_max_age_sec,
@@ -380,8 +386,8 @@ def _tick_runner(
         mid_up=mid_up,
         mid_dn=mid_down,
         price_then_now_5s=price_then_now_5s,
-        price_then_now_30s=price_then_now_30s,
-        volume_ratio_10s=volume_ratio_10s,
+        price_then_now_20s=price_then_now_20s,
+        volume_ratio_20s=volume_ratio_20s,
     )
     if decision is None:
         return
@@ -394,9 +400,10 @@ def _tick_runner(
         ask_px=f"{side_ask:.4f}",
         btc_spot=f"{spot:.2f}",
         window_open_px=f"{float(runner.window_open_px):.2f}",
+        abs_from_open=f"{decision.abs_from_open:.2f}",
         side_vs_open=f"{decision.side_vs_open:.2f}",
         align_5s=f"{decision.align_5s:.2f}",
-        align_30s=f"{decision.align_30s:.2f}",
+        align_20s=f"{decision.align_20s:.2f}",
         volume_ratio=f"{decision.volume_ratio:.4f}",
         volume_gate=str(decision.volume_gate).lower(),
         move_gate=str(decision.move_gate).lower(),
@@ -483,7 +490,7 @@ def main() -> None:
         pair=TRADE_PAIR_KEY,
         window_minutes=str(TRADE_WINDOW_MINUTES),
         heartbeat_sec=str(cfg.poll_interval_sec),
-        strategy="cheap_hit_volume_or_move",
+        strategy="cheap_hit_close_volume_and_move",
         order_type="fak",
         order_notional_usd=f"{ORDER_NOTIONAL_USD:.2f}",
         order_limit_px=f"{ORDER_LIMIT_PRICE:.2f}",

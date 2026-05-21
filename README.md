@@ -7,13 +7,14 @@ Dockerized Polymarket Up/Down runner for BTC, ETH, XRP, SOL, DOGE, BNB, HYPE, an
 
 ## Current strategy
 
-Current live entrypoint is `BTC` `5m` only and runs the `cheap-hit + volume OR move` family.
+Current live entrypoint is `BTC` `5m` only and runs the `cheap-hit + close-to-open + volume AND move` family.
 
 - Trigger: first side whose Polymarket mid is `<= 0.15`
 - Side choice: buy the cheaper of `UP` / `DOWN`
-- BTC gate: `volume spike OR move`
-- Volume gate: current Binance trade-size volume / previous `10s` average `>= 1.4x`, with cheap-side-favor alignment over `5s` or already beyond window open
-- Move gate: cheap-side-favor BTC move over `30s >= $1`, or already beyond window open
+- Close gate: Binance spot must stay within `$30` of the window open
+- BTC gate: `volume spike AND move`
+- Volume gate: current Binance trade-size volume / previous `20s` average `>= 1.4x`, with cheap-side-favor alignment over `5s` or already beyond window open
+- Move gate: cheap-side-favor BTC move over `20s >= $2`, or already beyond window open
 - Order: `$1` FAK buy capped at `0.25`
 - Delay: none in live bot
 

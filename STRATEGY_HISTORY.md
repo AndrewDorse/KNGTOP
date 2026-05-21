@@ -7,14 +7,15 @@ This file keeps a short memory of recent live strategy configurations.
 ### 2026-05-21
 - Scope: `BTC` only
 - Windows: `5m` only
-- Family: `cheap_hit_volume_or_move`
-- Variant: `vol10>=1.4x OR move30>=1usd_or_open`
+- Family: `cheap_hit_close_volume_and_move`
+- Variant: `close<=30 + vol20>=1.4x AND move20>=2usd_or_open`
 - Signal:
   - first cheap side mid `<= 0.15`
   - side is whichever of `UP` / `DOWN` is cheaper at the trigger
-  - Binance gate passes when either:
-    - current trade-size volume / previous `10s` mean `>= 1.4x` and cheap-side BTC alignment over `5s` is non-negative, or side is already beyond window open
-    - cheap-side BTC move over `30s >= $1`, or side is already beyond window open
+  - Binance spot must remain within `$30` of the window open
+  - current trade-size volume / previous `20s` mean `>= 1.4x`
+  - cheap-side BTC alignment over `5s` must be non-negative, or side must already be beyond window open
+  - cheap-side BTC move over `20s >= $2`, or side must already be beyond window open
 - Order:
   - `$1` FAK buy
   - hard cap `0.25`

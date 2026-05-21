@@ -16,13 +16,13 @@ def test_signal_fires_on_move_gate_for_cheap_up() -> None:
         mid_up=0.14,
         mid_dn=0.86,
         price_then_now_5s=(100_002.0, 100_001.0),
-        price_then_now_30s=(100_002.0, 100_000.5),
-        volume_ratio_10s=1.0,
+        price_then_now_20s=(100_002.0, 100_000.0),
+        volume_ratio_20s=1.5,
     )
     assert decision is not None
     assert decision.side == "UP"
     assert decision.move_gate is True
-    assert decision.volume_gate is False
+    assert decision.volume_gate is True
 
 
 def test_signal_fires_on_volume_gate_for_cheap_down() -> None:
@@ -32,8 +32,8 @@ def test_signal_fires_on_volume_gate_for_cheap_down() -> None:
         mid_up=0.88,
         mid_dn=0.12,
         price_then_now_5s=(99_998.5, 100_000.0),
-        price_then_now_30s=(99_998.5, 99_999.2),
-        volume_ratio_10s=1.5,
+        price_then_now_20s=(99_998.5, 100_001.0),
+        volume_ratio_20s=1.5,
     )
     assert decision is not None
     assert decision.side == "DOWN"
@@ -48,8 +48,8 @@ def test_signal_requires_cheap_hit() -> None:
         mid_up=0.18,
         mid_dn=0.82,
         price_then_now_5s=(100_003.0, 100_001.0),
-        price_then_now_30s=(100_003.0, 99_999.0),
-        volume_ratio_10s=2.0,
+        price_then_now_20s=(100_003.0, 99_999.0),
+        volume_ratio_20s=2.0,
     )
     assert decision is None
 
@@ -61,8 +61,21 @@ def test_signal_rejects_when_move_and_volume_disagree() -> None:
         mid_up=0.15,
         mid_dn=0.85,
         price_then_now_5s=(99_999.0, 100_000.0),
-        price_then_now_30s=(99_999.0, 100_001.5),
-        volume_ratio_10s=1.1,
+        price_then_now_20s=(99_999.0, 100_001.5),
+        volume_ratio_20s=1.6,
+    )
+    assert decision is None
+
+
+def test_signal_requires_close_to_open_gate() -> None:
+    decision = evaluate_signal(
+        window_open_px=100_000.0,
+        spot_px=100_040.0,
+        mid_up=0.14,
+        mid_dn=0.86,
+        price_then_now_5s=(100_040.0, 100_038.0),
+        price_then_now_20s=(100_040.0, 100_036.0),
+        volume_ratio_20s=1.8,
     )
     assert decision is None
 
