@@ -80,7 +80,6 @@ def test_target_amount_for_side_rebalances_weaker_leg() -> None:
         target_roi=0.0,
         rebalance_mult=1.0,
         max_order_usd=1.0,
-        min_order_usd=1.0,
         imbalance_slack_usd=0.5,
     )
     assert amount == 1.0
@@ -155,6 +154,52 @@ def test_tick_runner_submits_seed_without_delay() -> None:
     assert runner.positions.spent_total == 1.0
     assert runner.positions.pnl_if_up() > 0.0
     assert runner.positions.pnl_if_down() < 0.0
+
+
+def test_tick_runner_rounds_small_beneficial_hedge_to_exchange_minimum() -> None:
+    start = 1_700_000_000
+    runner = WindowRunner(
+        pair_key="BTC",
+        binance_symbol="BTCUSDT",
+        contract=ActiveContract(
+            slug=f"btc-updown-5m-{start}",
+            question="",
+            end_time=datetime.fromtimestamp(start + 300, timezone.utc),
+            up=TokenMarket(token_id="up-token", outcome="UP", minimum_tick_size="0.01", neg_risk=False),
+            down=TokenMarket(token_id="down-token", outcome="DOWN", minimum_tick_size="0.01", neg_risk=False),
+        ),
+        window_minutes=5,
+        window_open_px=100_000.0,
+        positions=PositionState(spent_up=1.0, shares_up=1.0 / 0.45, spent_down=0.0, shares_down=0.0, orders_up=1, orders_down=0),
+    )
+    fake_clob = _FakeClob()
+    cfg = _cfg()
+
+    class _PolyOnlyDownCheap:
+        def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            del max_age_sec
+            if asset_id == "up-token":
+                return 0.73, 0.75
+            return 0.23, 0.25
+
+    class _BinanceFixed:
+        def last_price(self, symbol: str, max_age_sec: float = 6.0):  # noqa: ANN201
+            del symbol, max_age_sec
+            return 100_003.0
+
+        def price_then_now(self, symbol: str, *, lookback_sec: int, max_age_sec: float = 6.0):  # noqa: ANN201
+            del symbol, lookback_sec, max_age_sec
+            return 100_003.0, 100_000.0
+
+    with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(start + 70, timezone.utc)
+        _tick_runner(runner, poly=_PolyOnlyDownCheap(), binance=_BinanceFixed(), clob=fake_clob, cfg=cfg)
+
+    assert fake_clob.calls == [("down-token", 1.0, 0.25)]
+    assert runner.positions is not None
+    assert runner.positions.orders_down == 1
+    assert runner.positions.pnl_if_up() >= -1e-12
+    assert runner.positions.pnl_if_down() > 0.0
 
 
 def test_tick_runner_submits_hedge_when_deficit_needs_full_order() -> None:

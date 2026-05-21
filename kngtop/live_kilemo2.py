@@ -40,6 +40,7 @@ TARGET_ROI = 0.0
 REBALANCE_MULT = 1.0
 IMBALANCE_SLACK_USD = 0.5
 MAX_BUDGET_USD = 30.0
+EXCHANGE_MIN_ORDER_USD = 1.0
 
 
 @dataclass(slots=True)
@@ -230,7 +231,6 @@ def target_amount_for_side(
     target_roi: float,
     rebalance_mult: float,
     max_order_usd: float,
-    min_order_usd: float,
     imbalance_slack_usd: float,
 ) -> float:
     spent = state.spent_total
@@ -242,11 +242,9 @@ def target_amount_for_side(
     need_to_target = max(0.0, (float(target_roi) * spent - pnl_side) / denom)
     equalize_raw = max(0.0, float(price) * (pnl_other - pnl_side))
     desired = max(need_to_target, equalize_raw * float(rebalance_mult))
-    if desired < float(min_order_usd) - 1e-12:
-        desired = 0.0
     cap_by_other = max(0.0, (pnl_other - float(target_roi) * spent + float(imbalance_slack_usd)) / (1.0 + float(target_roi)))
     desired = min(desired, float(max_order_usd), cap_by_other, MAX_BUDGET_USD - spent)
-    if desired + 1e-12 < float(min_order_usd):
+    if desired <= 1e-12:
         return 0.0
     return float(desired)
 
@@ -330,14 +328,27 @@ def _record_fill(*, state: PositionState, side: str, price: float, notional_usd:
         state.orders_down += 1
 
 
-def _can_buy_more(*, state: PositionState, side: str, cfg: KngtopConfig, notional_usd: float) -> bool:
-    if float(notional_usd) + 1e-12 < float(cfg.notional_usd):
+def _can_buy_more(*, state: PositionState, side: str, cfg: KngtopConfig, notional_usd: float, min_order_usd: float) -> bool:
+    if float(notional_usd) + 1e-12 < float(min_order_usd):
         return False
     if state.spent_total + float(notional_usd) > MAX_BUDGET_USD + 1e-12:
         return False
     if side == "UP":
         return state.orders_up < int(cfg.hedge_max_orders_per_side)
     return state.orders_down < int(cfg.hedge_max_orders_per_side)
+
+
+def _floor_pnl_after_buy(*, state: PositionState, side: str, price: float, notional_usd: float) -> float:
+    test = PositionState(
+        spent_up=state.spent_up,
+        spent_down=state.spent_down,
+        shares_up=state.shares_up,
+        shares_down=state.shares_down,
+        orders_up=state.orders_up,
+        orders_down=state.orders_down,
+    )
+    _record_fill(state=test, side=side, price=price, notional_usd=notional_usd)
+    return min(test.pnl_if_up(), test.pnl_if_down())
 
 
 def _maybe_seed_trade(
@@ -354,8 +365,15 @@ def _maybe_seed_trade(
         runner.positions = state
     if state.spent_total > 1e-12:
         return False
-    order_usd = min(float(cfg.notional_usd), MAX_BUDGET_USD - state.spent_total)
-    if not _can_buy_more(state=state, side=decision.side, cfg=cfg, notional_usd=order_usd):
+    base_order_usd = max(float(cfg.notional_usd), EXCHANGE_MIN_ORDER_USD)
+    order_usd = min(base_order_usd, MAX_BUDGET_USD - state.spent_total)
+    if not _can_buy_more(
+        state=state,
+        side=decision.side,
+        cfg=cfg,
+        notional_usd=order_usd,
+        min_order_usd=EXCHANGE_MIN_ORDER_USD,
+    ):
         return False
     if not _send_fak_buy(
         runner=runner,
@@ -407,17 +425,49 @@ def _maybe_hedge_trade(
     bid_px = float(up_bid) if side == "UP" else float(down_bid)
     if ask_px > HEDGE_PRICE_CAP + 1e-12:
         return False
-    order_usd = target_amount_for_side(
+    base_order_usd = max(float(cfg.notional_usd), EXCHANGE_MIN_ORDER_USD)
+    raw_order_usd = target_amount_for_side(
         state=state,
         side=side,
         price=ask_px,
         target_roi=TARGET_ROI,
         rebalance_mult=REBALANCE_MULT,
-        max_order_usd=max(float(cfg.notional_usd), 2.0 * float(cfg.notional_usd)),
-        min_order_usd=float(cfg.notional_usd),
+        max_order_usd=max(base_order_usd, 2.0 * base_order_usd),
         imbalance_slack_usd=IMBALANCE_SLACK_USD,
     )
-    if not _can_buy_more(state=state, side=side, cfg=cfg, notional_usd=order_usd):
+    if raw_order_usd <= 1e-12:
+        return False
+    min_order_usd = EXCHANGE_MIN_ORDER_USD
+    order_usd = raw_order_usd
+    if 0.0 < raw_order_usd < min_order_usd - 1e-12:
+        floor_before = min(snapshot.pnl_if_up, snapshot.pnl_if_down)
+        floor_after_min = _floor_pnl_after_buy(
+            state=state,
+            side=side,
+            price=ask_px,
+            notional_usd=min_order_usd,
+        )
+        if floor_after_min + 1e-12 < floor_before:
+            _log_tag(
+                "HEDGE SKIP",
+                slug=runner.contract.slug,
+                side=side,
+                ask_px=f"{ask_px:.4f}",
+                raw_buy_usd=f"{raw_order_usd:.4f}",
+                rounded_buy_usd=f"{min_order_usd:.2f}",
+                reason="rounded_min_worsens_floor",
+                pnl_if_up=f"{snapshot.pnl_if_up:.4f}",
+                pnl_if_down=f"{snapshot.pnl_if_down:.4f}",
+            )
+            return False
+        order_usd = min_order_usd
+    if not _can_buy_more(
+        state=state,
+        side=side,
+        cfg=cfg,
+        notional_usd=order_usd,
+        min_order_usd=min_order_usd,
+    ):
         return False
     if not _send_fak_buy(
         runner=runner,
