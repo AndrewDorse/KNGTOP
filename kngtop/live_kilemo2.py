@@ -221,6 +221,10 @@ def _order_amount_usd(*, ask_px: float, state: PositionState, cfg: KngtopConfig)
     return MIN_ORDER_USD
 
 
+def _bootstrap_amount_usd(cfg: KngtopConfig) -> float:
+    return max(MIN_ORDER_USD, min(float(cfg.notional_usd), LARGE_ORDER_USD))
+
+
 def _can_buy(state: PositionState, side: str, amount_usd: float) -> bool:
     if amount_usd + 1e-12 < MIN_ORDER_USD:
         return False
@@ -436,7 +440,7 @@ def _maybe_bootstrap_first_leg(
         runner=runner,
         side=side,
         ask_px=ask_px,
-        amount_usd=MIN_ORDER_USD,
+        amount_usd=_bootstrap_amount_usd(cfg),
         reason="bootstrap_cheaper",
         elapsed=elapsed,
         clob=clob,
@@ -476,7 +480,7 @@ def _maybe_bootstrap_second_leg(
                 remaining=f"{remaining:.1f}",
             )
         return False
-    amount_usd = max(MIN_ORDER_USD, min(float(cfg.notional_usd), LARGE_ORDER_USD)) if ask_px <= 0.35 + 1e-12 else MIN_ORDER_USD
+    amount_usd = LARGE_ORDER_USD if ask_px <= 0.35 + 1e-12 else _bootstrap_amount_usd(cfg)
     return _send_fak_buy(
         runner=runner,
         side=missing,
