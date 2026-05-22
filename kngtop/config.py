@@ -94,7 +94,7 @@ class KngtopConfig:
             trading_pairs=pairs,
             log_level=(os.environ.get("KNGTOP_LOG_LEVEL") or "INFO").strip().upper(),
             order_cutoff_remaining_sec=float(os.environ.get("KNGTOP_ORDER_CUTOFF_REMAINING_SEC") or "20.0"),
-    order_retry_on_error=max(0, int(os.environ.get("KNGTOP_ORDER_RETRY_ON_ERROR") or "9")),
+            order_retry_on_error=max(0, int(os.environ.get("KNGTOP_ORDER_RETRY_ON_ERROR") or "9")),
             market_buy_max_price=float(os.environ.get("KNGTOP_MARKET_BUY_MAX_PRICE") or "0.85"),
             binance_max_age_sec=float(os.environ.get("KNGTOP_BINANCE_MAX_AGE_SEC") or "6.0"),
             poly_mid_max_age_sec=float(os.environ.get("KNGTOP_POLY_MID_MAX_AGE_SEC") or "5.0"),

@@ -1,11 +1,11 @@
-"""BTC 5m live bot for the current S0184 winner-side start-window rule."""
+"""BTC 5m live bot for bootstrap_active_repair_C + rescue_60_cap080."""
 
 from __future__ import annotations
 
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,17 +29,60 @@ TRADE_PAIR_KEY = "BTC"
 TRADE_WINDOW_MINUTES = 5
 WINDOW_SECONDS = TRADE_WINDOW_MINUTES * 60
 NEXT_WINDOW_LOOKAHEAD_SEC = 20
-WS_UPDATE_LOG_COOLDOWN_SEC = 1.0
 
-ENTRY_MIN_PRICE = 0.45
-ENTRY_MAX_PRICE = 0.55
-ENTRY_MAX_ELAPSED_SEC = 25.0
-MOVE_FROM_OPEN_MIN_USD = 1.0
-MIN_ORDER_NOTIONAL_USD = 1.0
-ORDER_SIZE_BALANCE_FRACTION = 0.10
-BUY_FAK_PRICE = 0.58
-MAX_TAKER_PRICE = 0.99
-EXIT_SELL_PRICE: float | None = None
+MIN_ORDER_USD = 1.0
+LARGE_ORDER_USD = 2.0
+MAX_TOTAL_DEALS = 15
+MAX_ORDERS_PER_SIDE = 8
+
+BOOTSTRAP_CHEAP_CAP = 0.55
+BOOTSTRAP_OPPOSITE_CAP = 0.70
+ACTIVE_REPAIR_INTERVAL_SEC = 15
+IMBALANCE_TRIGGER = 0.20
+DROP_TRIGGER = 0.02
+AVG_SUM_CAP = 0.95
+BALANCED_CHEAP_PRICE = 0.35
+REPAIR_CHEAP_CAP = 0.45
+LAST30_FORCE_CAP = 0.80
+RESCUE_60_CAP = 0.80
+LARGE_ORDER_PRICE_THRESHOLD = 0.30
+LARGE_ORDER_IMBALANCE_THRESHOLD = 0.40
+MAX_ORDER_PRICE = 0.99
+
+
+@dataclass(slots=True)
+class PositionState:
+    spent_up: float = 0.0
+    spent_down: float = 0.0
+    shares_up: float = 0.0
+    shares_down: float = 0.0
+    orders_up: int = 0
+    orders_down: int = 0
+    total_deals: int = 0
+
+    def spent_total(self) -> float:
+        return self.spent_up + self.spent_down
+
+    def pnl_if_up(self) -> float:
+        return self.shares_up - self.spent_total()
+
+    def pnl_if_down(self) -> float:
+        return self.shares_down - self.spent_total()
+
+    def avg_up(self) -> float:
+        return self.spent_up / self.shares_up if self.shares_up > 1e-12 else 0.0
+
+    def avg_down(self) -> float:
+        return self.spent_down / self.shares_down if self.shares_down > 1e-12 else 0.0
+
+    def share_imbalance(self) -> float:
+        total = self.shares_up + self.shares_down
+        if total <= 1e-12:
+            return 0.0
+        return abs(self.shares_up - self.shares_down) / total
+
+    def both_sides_traded(self) -> bool:
+        return self.orders_up > 0 and self.orders_down > 0
 
 
 @dataclass(slots=True)
@@ -49,31 +92,14 @@ class WindowRunner:
     contract: ActiveContract
     window_minutes: int
     window_open_px: float | None = None
-    attempted: bool = False
-    attempt_side: str | None = None
-    attempt_elapsed_sec: float | None = None
-    trigger_ask_px: float | None = None
-    trigger_max_price: float | None = None
-    btc_move_from_open: float | None = None
-    order_notional_usd: float = MIN_ORDER_NOTIONAL_USD
-    estimated_shares: float = 0.0
-    exited: bool = False
-    exit_order_id: str | None = None
-    order_id: str | None = None
+    positions: PositionState = field(default_factory=PositionState)
+    bootstrap_second_attempted: bool = False
+    rescue_60_attempted: bool = False
+    last_repair_slot: int = -1
     stop_reason: str | None = None
 
     def start_sec(self) -> int | None:
         return window_start_ts_from_slug(self.contract.slug)
-
-
-@dataclass(frozen=True, slots=True)
-class SignalDecision:
-    side: str
-    ask_px: float
-    btc_spot: float
-    window_open_px: float
-    btc_move_from_open: float
-    max_price: float
 
 
 def _setup_logging(level: str) -> None:
@@ -134,110 +160,261 @@ def _window_elapsed_remaining(runner: WindowRunner, now_ts: float) -> tuple[floa
     return elapsed, remaining
 
 
-def _winner_side(*, spot_px: float, window_open_px: float) -> str | None:
-    delta = float(spot_px) - float(window_open_px)
-    if delta > 1e-12:
-        return "UP"
-    if delta < -1e-12:
-        return "DOWN"
-    return None
-
-
-def evaluate_signal(
-    *,
-    window_open_px: float,
-    spot_px: float,
-    up_ask: float,
-    down_ask: float,
-) -> SignalDecision | None:
-    side = _winner_side(spot_px=float(spot_px), window_open_px=float(window_open_px))
-    if side is None:
-        return None
-    ask_px = float(up_ask) if side == "UP" else float(down_ask)
-    if ask_px < ENTRY_MIN_PRICE - 1e-12 or ask_px > ENTRY_MAX_PRICE + 1e-12:
-        return None
-    btc_move_from_open = abs(float(spot_px) - float(window_open_px))
-    if btc_move_from_open + 1e-12 < MOVE_FROM_OPEN_MIN_USD:
-        return None
-    return SignalDecision(
-        side=side,
-        ask_px=ask_px,
-        btc_spot=float(spot_px),
-        window_open_px=float(window_open_px),
-        btc_move_from_open=btc_move_from_open,
-        max_price=min(MAX_TAKER_PRICE, BUY_FAK_PRICE),
-    )
-
-
 def _token_for_side(runner: WindowRunner, side: str) -> TokenMarket:
     return runner.contract.up if str(side).upper() == "UP" else runner.contract.down
 
 
-def _window_order_notional_usd(*, clob: KngtopClob | None, cfg: KngtopConfig) -> float:
-    if cfg.dry_run or clob is None:
-        return max(MIN_ORDER_NOTIONAL_USD, float(cfg.notional_usd))
-    available = clob.available_balance_usdc()
-    if available is None:
-        return max(MIN_ORDER_NOTIONAL_USD, float(cfg.notional_usd))
-    return max(MIN_ORDER_NOTIONAL_USD, float(available) * ORDER_SIZE_BALANCE_FRACTION)
+def _order_amount_usd(*, ask_px: float, state: PositionState, cfg: KngtopConfig) -> float:
+    large_order = max(MIN_ORDER_USD, min(float(cfg.notional_usd), LARGE_ORDER_USD))
+    if ask_px <= LARGE_ORDER_PRICE_THRESHOLD + 1e-12 or state.share_imbalance() > LARGE_ORDER_IMBALANCE_THRESHOLD + 1e-12:
+        return large_order
+    return MIN_ORDER_USD
+
+
+def _can_buy(state: PositionState, side: str, amount_usd: float) -> bool:
+    if amount_usd + 1e-12 < MIN_ORDER_USD:
+        return False
+    if state.spent_total() + amount_usd > 20.0 + 1e-12:
+        return False
+    if state.total_deals >= MAX_TOTAL_DEALS:
+        return False
+    if side == "UP":
+        return state.orders_up < MAX_ORDERS_PER_SIDE
+    return state.orders_down < MAX_ORDERS_PER_SIDE
+
+
+def _avg_sum(state: PositionState) -> float:
+    return state.avg_up() + state.avg_down()
+
+
+def _avg_after_buy(state: PositionState, side: str, ask_px: float, amount_usd: float) -> float:
+    shares = amount_usd / max(ask_px, 1e-9)
+    if side == "UP":
+        new_avg_up = (state.spent_up + amount_usd) / (state.shares_up + shares)
+        return new_avg_up + state.avg_down()
+    new_avg_down = (state.spent_down + amount_usd) / (state.shares_down + shares)
+    return state.avg_up() + new_avg_down
+
+
+def _smaller_share_side(state: PositionState) -> str:
+    return "UP" if state.shares_up < state.shares_down else "DOWN"
+
+
+def _apply_position_buy(state: PositionState, side: str, ask_px: float, amount_usd: float) -> None:
+    shares = amount_usd / max(ask_px, 1e-9)
+    if side == "UP":
+        state.spent_up += amount_usd
+        state.shares_up += shares
+        state.orders_up += 1
+    else:
+        state.spent_down += amount_usd
+        state.shares_down += shares
+        state.orders_down += 1
+    state.total_deals += 1
 
 
 def _send_fak_buy(
     *,
     runner: WindowRunner,
-    decision: SignalDecision,
+    side: str,
+    ask_px: float,
+    amount_usd: float,
+    reason: str,
     clob: KngtopClob | None,
     cfg: KngtopConfig,
+    enforce_avg_cap: bool = True,
 ) -> bool:
-    side = decision.side
-    token = _token_for_side(runner, side)
-    if cfg.dry_run or clob is None:
-        runner.order_id = None
-        return True
-
-    attempts = max(1, int(cfg.order_retry_on_error) + 1)
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            payload = clob.market_buy_usdc(token, runner.order_notional_usd, max_price=decision.max_price)
-            runner.order_id = _extract_order_id(payload)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            time.sleep(0.5)
-    if last_error is not None:
-        _log_tag("ERROR", slug=runner.contract.slug, stage="buy", side=side, error=str(last_error))
-    return False
-
-
-def _send_fak_sell(
-    *,
-    runner: WindowRunner,
-    clob: KngtopClob | None,
-    cfg: KngtopConfig,
-    bid_px: float,
-) -> bool:
-    side = runner.attempt_side
-    if side is None or runner.estimated_shares <= 0:
+    if ask_px <= 0.0 or ask_px > min(MAX_ORDER_PRICE, float(cfg.market_buy_max_price)) + 1e-12:
         return False
-    token = _token_for_side(runner, side)
-    if cfg.dry_run or clob is None:
-        runner.exit_order_id = None
-        return True
+    if not _can_buy(runner.positions, side, amount_usd):
+        return False
+    after_avg_sum = _avg_after_buy(runner.positions, side, ask_px, amount_usd)
+    if enforce_avg_cap and after_avg_sum > AVG_SUM_CAP + 1e-12:
+        return False
 
-    attempts = max(1, int(cfg.order_retry_on_error) + 1)
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            payload = clob.market_sell_shares_fak(token, shares=runner.estimated_shares, min_price=EXIT_SELL_PRICE)
-            runner.exit_order_id = _extract_order_id(payload)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            time.sleep(0.5)
-    if last_error is not None:
-        _log_tag("ERROR", slug=runner.contract.slug, stage="sell", side=side, error=str(last_error))
-    return False
+    token = _token_for_side(runner, side)
+    if not cfg.dry_run and clob is not None:
+        attempts = max(1, int(cfg.order_retry_on_error) + 1)
+        last_error: Exception | None = None
+        for _attempt in range(1, attempts + 1):
+            try:
+                payload = clob.market_buy_usdc(token, amount_usd, max_price=min(MAX_ORDER_PRICE, float(cfg.market_buy_max_price), ask_px))
+                _ = _extract_order_id(payload)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                time.sleep(0.5)
+        else:
+            if last_error is not None:
+                _log_tag("ERROR", slug=runner.contract.slug, stage="buy", side=side, reason=reason, error=str(last_error))
+            return False
+
+    _apply_position_buy(runner.positions, side, ask_px, amount_usd)
+    _log_tag(
+        "BUY",
+        slug=runner.contract.slug,
+        side=side,
+        reason=reason,
+        ask_px=f"{ask_px:.4f}",
+        amount_usd=f"{amount_usd:.2f}",
+        orders=str(runner.positions.total_deals),
+        avg_sum=f"{_avg_sum(runner.positions):.4f}",
+        imbalance=f"{runner.positions.share_imbalance():.4f}",
+    )
+    return True
+
+
+def _choose_active_repair_side(runner: WindowRunner, *, up_ask: float, down_ask: float, remaining: float) -> str | None:
+    state = runner.positions
+    smaller = _smaller_share_side(state)
+    bigger = "DOWN" if smaller == "UP" else "UP"
+    smaller_ask = up_ask if smaller == "UP" else down_ask
+    bigger_ask = down_ask if smaller == "UP" else up_ask
+
+    if remaining <= 60.0:
+        return smaller
+    if state.share_imbalance() > IMBALANCE_TRIGGER + 1e-12:
+        return smaller
+
+    smaller_avg = state.avg_up() if smaller == "UP" else state.avg_down()
+    bigger_avg = state.avg_down() if smaller == "UP" else state.avg_up()
+    if smaller_avg > 1e-12 and smaller_ask <= smaller_avg - DROP_TRIGGER + 1e-12:
+        return smaller
+    if bigger_avg > 1e-12 and bigger_ask <= bigger_avg - DROP_TRIGGER + 1e-12:
+        return bigger
+
+    if _avg_sum(state) <= AVG_SUM_CAP + 1e-12:
+        if smaller_ask <= REPAIR_CHEAP_CAP + 1e-12:
+            return smaller
+        if bigger_ask <= REPAIR_CHEAP_CAP + 1e-12:
+            return bigger
+
+    if state.share_imbalance() <= IMBALANCE_TRIGGER + 1e-12:
+        if up_ask <= BALANCED_CHEAP_PRICE + 1e-12 and up_ask <= down_ask + 1e-12:
+            return "UP"
+        if down_ask <= BALANCED_CHEAP_PRICE + 1e-12:
+            return "DOWN"
+    return None
+
+
+def _maybe_bootstrap_first_leg(
+    runner: WindowRunner,
+    *,
+    up_ask: float,
+    down_ask: float,
+    elapsed: float,
+    clob: KngtopClob | None,
+    cfg: KngtopConfig,
+) -> None:
+    if runner.positions.total_deals > 0 or elapsed >= 15.0:
+        return
+    side = "UP" if up_ask <= down_ask else "DOWN"
+    ask_px = up_ask if side == "UP" else down_ask
+    if ask_px > BOOTSTRAP_CHEAP_CAP + 1e-12:
+        return
+    _send_fak_buy(
+        runner=runner,
+        side=side,
+        ask_px=ask_px,
+        amount_usd=MIN_ORDER_USD,
+        reason="bootstrap_cheaper",
+        clob=clob,
+        cfg=cfg,
+        enforce_avg_cap=False,
+    )
+
+
+def _maybe_bootstrap_second_leg(
+    runner: WindowRunner,
+    *,
+    up_ask: float,
+    down_ask: float,
+    elapsed: float,
+    clob: KngtopClob | None,
+    cfg: KngtopConfig,
+) -> None:
+    if runner.bootstrap_second_attempted or elapsed < 15.0:
+        return
+    runner.bootstrap_second_attempted = True
+    if runner.positions.both_sides_traded() or runner.positions.total_deals == 0:
+        return
+    missing = "UP" if runner.positions.orders_up == 0 else "DOWN"
+    ask_px = up_ask if missing == "UP" else down_ask
+    if ask_px > BOOTSTRAP_OPPOSITE_CAP + 1e-12:
+        return
+    _send_fak_buy(
+        runner=runner,
+        side=missing,
+        ask_px=ask_px,
+        amount_usd=MIN_ORDER_USD,
+        reason="bootstrap_opposite",
+        clob=clob,
+        cfg=cfg,
+        enforce_avg_cap=False,
+    )
+
+
+def _maybe_active_repair(
+    runner: WindowRunner,
+    *,
+    up_ask: float,
+    down_ask: float,
+    elapsed: float,
+    remaining: float,
+    clob: KngtopClob | None,
+    cfg: KngtopConfig,
+) -> None:
+    if not runner.positions.both_sides_traded():
+        return
+    slot = int(elapsed) // ACTIVE_REPAIR_INTERVAL_SEC
+    if slot <= runner.last_repair_slot:
+        return
+    runner.last_repair_slot = slot
+
+    side = _choose_active_repair_side(runner, up_ask=up_ask, down_ask=down_ask, remaining=remaining)
+    if side is None:
+        return
+    smaller = _smaller_share_side(runner.positions)
+    ask_px = up_ask if side == "UP" else down_ask
+    amount_usd = _order_amount_usd(ask_px=ask_px, state=runner.positions, cfg=cfg)
+    if remaining <= 60.0 and side != smaller:
+        return
+    if remaining <= 30.0 and side == smaller and runner.positions.share_imbalance() > 0.15 + 1e-12 and ask_px > LAST30_FORCE_CAP + 1e-12:
+        return
+    current_avg_sum = _avg_sum(runner.positions)
+    after_avg_sum = _avg_after_buy(runner.positions, side, ask_px, amount_usd)
+    if after_avg_sum > AVG_SUM_CAP + 1e-12:
+        return
+    if side != smaller and current_avg_sum > 1e-12 and after_avg_sum > current_avg_sum + 0.02 + 1e-12:
+        return
+    _send_fak_buy(runner=runner, side=side, ask_px=ask_px, amount_usd=amount_usd, reason="active_repair", clob=clob, cfg=cfg)
+
+
+def _maybe_rescue_missing_side(
+    runner: WindowRunner,
+    *,
+    up_ask: float,
+    down_ask: float,
+    remaining: float,
+    clob: KngtopClob | None,
+    cfg: KngtopConfig,
+) -> None:
+    if runner.rescue_60_attempted or remaining > 60.0:
+        return
+    runner.rescue_60_attempted = True
+    if runner.positions.total_deals <= 0 or runner.positions.both_sides_traded():
+        return
+    missing = "UP" if runner.positions.orders_up == 0 else "DOWN"
+    ask_px = up_ask if missing == "UP" else down_ask
+    if ask_px > RESCUE_60_CAP + 1e-12:
+        return
+    amount_usd = max(MIN_ORDER_USD, min(float(cfg.notional_usd), LARGE_ORDER_USD)) if ask_px <= 0.40 + 1e-12 else MIN_ORDER_USD
+    _send_fak_buy(runner=runner, side=missing, ask_px=ask_px, amount_usd=amount_usd, reason="rescue_60_missing", clob=clob, cfg=cfg)
+
+
+def _window_order_notional_usd(*, clob: KngtopClob | None, cfg: KngtopConfig) -> float:
+    del clob
+    return max(MIN_ORDER_USD, float(cfg.notional_usd))
 
 
 def _discover_target_windows(
@@ -271,9 +448,13 @@ def _discover_target_windows(
             contract=contract,
             window_minutes=TRADE_WINDOW_MINUTES,
             window_open_px=window_open_px,
-            order_notional_usd=_window_order_notional_usd(clob=clob, cfg=cfg),
         )
-        _log_tag("INIT", slug=contract.slug, start_sec=str(start_sec), order_notional_usd=f"{runners[start_sec].order_notional_usd:.2f}")
+        _log_tag(
+            "INIT",
+            slug=contract.slug,
+            start_sec=str(start_sec),
+            default_notional_usd=f"{_window_order_notional_usd(clob=clob, cfg=cfg):.2f}",
+        )
 
 
 def _refresh_subscriptions(*, runners: dict[int, WindowRunner], poly: MarketWsFeed) -> None:
@@ -293,15 +474,14 @@ def _purge_finished_windows(*, runners: dict[int, WindowRunner]) -> None:
         if remaining > 0:
             continue
         runners.pop(start_sec, None)
-        if runner.attempt_side is not None and not runner.exited:
+        if runner.positions.total_deals > 0:
             _log_tag(
-                "DEAL END",
+                "WINDOW END",
                 slug=runner.contract.slug,
-                side=runner.attempt_side,
-                result="loss",
-                reason="expired_without_tp",
-                order_notional_usd=f"{runner.order_notional_usd:.2f}",
-                pnl_usd_est=f"{-runner.order_notional_usd:.2f}",
+                deals=str(runner.positions.total_deals),
+                both_sides=str(int(runner.positions.both_sides_traded())),
+                pnl_if_up=f"{runner.positions.pnl_if_up():.4f}",
+                pnl_if_down=f"{runner.positions.pnl_if_down():.4f}",
             )
 
 
@@ -331,69 +511,34 @@ def _tick_runner(
         )
         if runner.window_open_px is None:
             return
-    spot = binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec)
-    if spot is None:
+    if binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec) is None:
         return
     up_quote = poly.best_bid_ask_for(runner.contract.up.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     down_quote = poly.best_bid_ask_for(runner.contract.down.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     if up_quote is None or down_quote is None:
         return
-    up_bid, up_ask = up_quote
-    down_bid, down_ask = down_quote
-    if runner.attempted:
-        if runner.exited or runner.attempt_side is None:
-            return
-        held_bid = float(up_bid) if runner.attempt_side == "UP" else float(down_bid)
-        if EXIT_SELL_PRICE is not None and held_bid + 1e-12 >= EXIT_SELL_PRICE:
-            if _send_fak_sell(runner=runner, clob=clob, cfg=cfg, bid_px=held_bid):
-                runner.exited = True
-                runner.stop_reason = "take_profit_exit"
-                pnl_usd = runner.estimated_shares * EXIT_SELL_PRICE - runner.order_notional_usd
-                _log_tag(
-                    "DEAL END",
-                    slug=runner.contract.slug,
-                    side=runner.attempt_side,
-                    result="success",
-                    reason="tp85",
-                    order_notional_usd=f"{runner.order_notional_usd:.2f}",
-                    exit_price=f"{EXIT_SELL_PRICE:.2f}",
-                    pnl_usd_est=f"{pnl_usd:.2f}",
-                )
-        return
-    if elapsed > ENTRY_MAX_ELAPSED_SEC + 1e-12:
-        runner.attempted = True
-        runner.stop_reason = "entry_window_closed"
-        return
-    if remaining <= float(cfg.order_cutoff_remaining_sec):
-        runner.attempted = True
-        runner.stop_reason = "late_window"
-        return
-    decision = evaluate_signal(
-        window_open_px=float(runner.window_open_px),
-        spot_px=float(spot),
+    _up_bid, up_ask = up_quote
+    _down_bid, down_ask = down_quote
+
+    _maybe_bootstrap_first_leg(runner, up_ask=float(up_ask), down_ask=float(down_ask), elapsed=elapsed, clob=clob, cfg=cfg)
+    _maybe_bootstrap_second_leg(runner, up_ask=float(up_ask), down_ask=float(down_ask), elapsed=elapsed, clob=clob, cfg=cfg)
+    _maybe_active_repair(
+        runner,
         up_ask=float(up_ask),
         down_ask=float(down_ask),
+        elapsed=elapsed,
+        remaining=remaining,
+        clob=clob,
+        cfg=cfg,
     )
-    if decision is None:
-        return
-    if _send_fak_buy(runner=runner, decision=decision, clob=clob, cfg=cfg):
-        runner.attempted = True
-        runner.attempt_side = decision.side
-        runner.attempt_elapsed_sec = elapsed
-        runner.trigger_ask_px = decision.ask_px
-        runner.trigger_max_price = decision.max_price
-        runner.btc_move_from_open = decision.btc_move_from_open
-        runner.estimated_shares = runner.order_notional_usd / max(decision.max_price, 1e-9)
-        runner.stop_reason = "signal_submitted"
-        _log_tag(
-            "DEAL START",
-            slug=runner.contract.slug,
-            side=decision.side,
-            order_notional_usd=f"{runner.order_notional_usd:.2f}",
-            ask_px=f"{decision.ask_px:.4f}",
-            max_price=f"{decision.max_price:.4f}",
-            btc_move_from_open=f"{decision.btc_move_from_open:.2f}",
-        )
+    _maybe_rescue_missing_side(
+        runner,
+        up_ask=float(up_ask),
+        down_ask=float(down_ask),
+        remaining=remaining,
+        clob=clob,
+        cfg=cfg,
+    )
 
 
 def _run_iteration(
@@ -468,14 +613,12 @@ def main() -> None:
         "INIT",
         pair=TRADE_PAIR_KEY,
         window_minutes=str(TRADE_WINDOW_MINUTES),
-        strategy="s0184_start_window_winner",
-        order_type="fak",
-        order_size_rule="10pct_balance_min1",
-        ask_band=f"{ENTRY_MIN_PRICE:.2f}-{ENTRY_MAX_PRICE:.2f}",
-        btc_move_min_usd=f"{MOVE_FROM_OPEN_MIN_USD:.2f}",
-        entry_max_elapsed_sec=f"{ENTRY_MAX_ELAPSED_SEC:.1f}",
-        fak_buy_price=f"{BUY_FAK_PRICE:.2f}",
-        exit_sell_price="disabled" if EXIT_SELL_PRICE is None else f"{EXIT_SELL_PRICE:.2f}",
+        strategy="bootstrap_active_repair_C_rescue_60_cap080",
+        bootstrap="cheap<=0.55_then_opposite15s<=0.70",
+        active_repair="15s_imb20_drop02",
+        rescue="remaining60_missing<=0.80",
+        min_order_usd=f"{MIN_ORDER_USD:.2f}",
+        large_order_usd=f"{min(float(cfg.notional_usd), LARGE_ORDER_USD):.2f}",
     )
 
     while True:
