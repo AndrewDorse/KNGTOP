@@ -32,6 +32,8 @@ def _cfg() -> KngtopConfig:
         ws_rest_poll_interval_sec=1.0,
         hedge_max_orders_per_side=2,
         max_shares_per_side=15.0,
+        max_share_gap=2.0,
+        repair_avg_sum_cap=0.95,
     )
 
 
@@ -145,7 +147,7 @@ def test_initial_buy_skips_when_lower_ask_above_bootstrap_cap() -> None:
     assert runner.positions.total_deals == 0
 
 
-def test_weak_outcome_cheap_repair_uses_1_usd_when_not_imbalanced_or_very_cheap() -> None:
+def test_weak_outcome_cheap_repair_blocks_when_projected_avg_sum_is_bad() -> None:
     state = PositionState(spent_up=2.0, shares_up=3.8461538, spent_down=2.0, shares_down=4.0816326, orders_up=1, orders_down=1, total_deals=2)
     runner = _runner(1_700_000_000, positions=state)
     clob = _tick(
@@ -165,8 +167,8 @@ def test_weak_outcome_cheap_repair_uses_1_usd_when_not_imbalanced_or_very_cheap(
         ],
     )
 
-    assert clob.calls == [("up-token", 1.0, 0.43)]
-    assert runner.positions.orders_up == 2
+    assert clob.calls == []
+    assert runner.positions.orders_up == 1
 
 
 def test_weak_outcome_cheap_repair_uses_projected_size_when_ask_at_or_below_030() -> None:
@@ -189,7 +191,7 @@ def test_weak_outcome_cheap_repair_uses_projected_size_when_ask_at_or_below_030(
         ],
     )
 
-    assert clob.calls == [("up-token", 1.6, 0.30)]
+    assert clob.calls == [("up-token", 2.0, 0.30)]
 
 
 def test_high_guard_060_allows_guarded_high_repair_below_or_equal_060() -> None:
@@ -212,7 +214,7 @@ def test_high_guard_060_allows_guarded_high_repair_below_or_equal_060() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.0, 0.60)]
+    assert clob.calls == []
 
 
 def test_high_price_above_065_is_blocked_before_240s() -> None:
@@ -254,7 +256,7 @@ def test_final_60_allows_dangerously_weak_side_up_to_080() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 2.0, 0.80)]
+    assert clob.calls == [("up-token", 1.0, 0.80)]
 
 
 def test_locked_profit_only_allows_cheap_or_imbalanced_buys() -> None:
@@ -326,7 +328,7 @@ def test_order_count_does_not_block_when_share_room_remains() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.2, 0.44)]
+    assert clob.calls == []
     assert runner.positions.shares_up <= 15.0
 
 
@@ -348,6 +350,69 @@ def test_share_cap_blocks_new_buy_even_if_order_count_lags() -> None:
 
     assert clob.calls == []
     assert runner.positions.shares_up == 14.5
+
+
+def test_overloaded_17_vs_12_does_not_buy_larger_up_side() -> None:
+    state = PositionState(spent_up=8.5, shares_up=17.0, spent_down=6.0, shares_down=12.0, orders_up=6, orders_down=4, total_deals=10)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.30,
+        down=0.70,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=17.0, avg_price=0.50),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=12.0, avg_price=0.50),
+            ]
+        ],
+    )
+
+    assert all(call[0] != "up-token" for call in clob.calls)
+    assert runner.positions.shares_up == 17.0
+
+
+def test_14_5_vs_12_can_only_repair_smaller_down_side() -> None:
+    state = PositionState(spent_up=6.5, shares_up=14.5, spent_down=5.0, shares_down=12.0, orders_up=5, orders_down=4, total_deals=9)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.30,
+        down=0.40,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=14.5, avg_price=6.5 / 14.5),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=12.0, avg_price=5.0 / 12.0),
+            ],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=14.5, avg_price=6.5 / 14.5),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=14.5, avg_price=6.0 / 14.5),
+            ],
+        ],
+    )
+
+    assert clob.calls == [("down-token", 1.2, 0.40)]
+    assert runner.positions.shares_down == 14.5
+
+
+def test_repair_avg_sum_guard_blocks_projected_bad_avg_sum() -> None:
+    state = PositionState(spent_up=4.75, shares_up=5.0, spent_down=4.75, shares_down=5.0, orders_up=3, orders_down=3, total_deals=6)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.44,
+        down=0.45,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.95),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=5.0, avg_price=0.95),
+            ]
+        ],
+    )
+
+    assert clob.calls == []
 
 
 def test_bootstrap_amount_is_capped_by_max_shares_per_side() -> None:
@@ -506,7 +571,7 @@ def test_later_sizing_can_use_fractional_amount_to_optimize_projected_pnl() -> N
         ],
     )
 
-    assert clob.calls == [("up-token", 1.2, 0.35)]
+    assert clob.calls == [("up-token", 2.0, 0.35)]
 
 
 def test_balance_or_allowance_error_stops_window() -> None:

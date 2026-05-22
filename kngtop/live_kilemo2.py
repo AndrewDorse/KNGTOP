@@ -34,11 +34,13 @@ NEXT_WINDOW_LOOKAHEAD_SEC = 20
 MIN_ORDER_USD = 1.0
 LARGE_ORDER_USD = 2.0
 MAX_SHARES_PER_SIDE = 15.0
+MAX_SHARE_GAP = 2.0
 
 BOOTSTRAP_CHEAP_CAP = 0.55
 ACTIVE_REPAIR_INTERVAL_SEC = 5
 IMBALANCE_TRIGGER = 0.20
 AVG_SUM_CAP = 0.95
+REPAIR_AVG_SUM_CAP = 0.95
 WEAK_REPAIR_CHEAP_CAP = 0.45
 HIGH_REPAIR_GUARD = 0.60
 HIGH_REPAIR_PRE240_CAP = 0.65
@@ -307,6 +309,14 @@ def _configured_max_shares_per_side(cfg: KngtopConfig) -> float:
     return max(1.0, float(getattr(cfg, "max_shares_per_side", MAX_SHARES_PER_SIDE)))
 
 
+def _configured_max_share_gap(cfg: KngtopConfig) -> float:
+    return max(0.0, float(getattr(cfg, "max_share_gap", MAX_SHARE_GAP)))
+
+
+def _configured_repair_avg_sum_cap(cfg: KngtopConfig) -> float:
+    return max(0.0, float(getattr(cfg, "repair_avg_sum_cap", REPAIR_AVG_SUM_CAP)))
+
+
 def _share_room(state: PositionState, side: str, cfg: KngtopConfig) -> float:
     return max(0.0, _configured_max_shares_per_side(cfg) - _shares_for_side(state, side))
 
@@ -320,26 +330,75 @@ def _cap_amount_to_share_room(state: PositionState, side: str, ask_px: float, am
     return max(MIN_ORDER_USD, min(capped, float(amount_usd)))
 
 
-def _choose_order_amount_usd(*, side: str, ask_px: float, state: PositionState, cfg: KngtopConfig) -> float | None:
-    current_worst = min(state.pnl_if_up(), state.pnl_if_down())
-    current_gap = _current_gap(state)
+def _share_gap_after_buy(state: PositionState, side: str, ask_px: float, amount_usd: float) -> float:
+    shares = amount_usd / max(ask_px, 1e-9)
+    up_shares = state.shares_up + (shares if side == "UP" else 0.0)
+    down_shares = state.shares_down + (shares if side == "DOWN" else 0.0)
+    return abs(up_shares - down_shares)
+
+
+def _choose_order_amount_usd(
+    *,
+    side: str,
+    ask_px: float,
+    state: PositionState,
+    cfg: KngtopConfig,
+    enforce_repair_guards: bool = False,
+) -> float | None:
     best_amount: float | None = None
-    best_score: tuple[float, float, float, float] | None = None
+    best_score: tuple[int, float, float, float] | None = None
     for amount in _candidate_amounts(cfg):
         if not _can_buy(state, side, amount, ask_px=ask_px, cfg=cfg):
             continue
-        _pnl_up, _pnl_down, projected_worst, projected_gap, projected_share_gap, _projected_avg_sum = _projected_after_buy(
+        pnl_up, pnl_down, _projected_worst, _projected_gap, projected_share_gap, projected_avg_sum = _projected_after_buy(
             state, side, ask_px, amount
         )
-        improves_worst = projected_worst - current_worst
-        improves_gap = current_gap - projected_gap
-        # Prefer the amount that best repairs the weaker outcome. Gap and share balance are
-        # secondary so cheap fills do not build one side blindly.
-        score = (improves_worst, improves_gap, -projected_share_gap, -amount)
+        projected_abs_share_gap = _share_gap_after_buy(state, side, ask_px, amount)
+        if enforce_repair_guards:
+            if projected_avg_sum > _configured_repair_avg_sum_cap(cfg) + 1e-12:
+                continue
+            current_abs_share_gap = abs(state.shares_up - state.shares_down)
+            if (
+                projected_abs_share_gap > _configured_max_share_gap(cfg) + 1e-12
+                and projected_abs_share_gap >= current_abs_share_gap - 1e-12
+            ):
+                continue
+        both_profitable = int(pnl_up >= -1e-12 and pnl_down >= -1e-12)
+        score = (both_profitable, -projected_avg_sum, -projected_share_gap, -amount)
         if best_score is None or score > best_score:
             best_score = score
             best_amount = amount
     return best_amount
+
+
+def _repair_candidate_skip_reason(*, side: str, ask_px: float, state: PositionState, cfg: KngtopConfig) -> str:
+    saw_buyable = False
+    saw_avg_sum_pass = False
+    saw_share_gap_pass = False
+    for amount in _candidate_amounts(cfg):
+        if not _can_buy(state, side, amount, ask_px=ask_px, cfg=cfg):
+            continue
+        saw_buyable = True
+        _pnl_up, _pnl_down, _projected_worst, _projected_gap, _projected_share_gap, projected_avg_sum = _projected_after_buy(
+            state, side, ask_px, amount
+        )
+        del _pnl_up, _pnl_down, _projected_worst, _projected_gap, _projected_share_gap
+        if projected_avg_sum <= _configured_repair_avg_sum_cap(cfg) + 1e-12:
+            saw_avg_sum_pass = True
+        current_abs_share_gap = abs(state.shares_up - state.shares_down)
+        projected_abs_share_gap = _share_gap_after_buy(state, side, ask_px, amount)
+        if (
+            projected_abs_share_gap <= _configured_max_share_gap(cfg) + 1e-12
+            or projected_abs_share_gap < current_abs_share_gap - 1e-12
+        ):
+            saw_share_gap_pass = True
+    if not saw_buyable:
+        return "no_valid_amount"
+    if not saw_avg_sum_pass:
+        return "avg_sum_guard"
+    if not saw_share_gap_pass:
+        return "share_gap_guard"
+    return "repair_candidate_guard"
 
 
 def _bootstrap_amount_usd(cfg: KngtopConfig) -> float:
@@ -526,13 +585,14 @@ def _record_confirmed_order(runner: WindowRunner, *, side: str) -> None:
     runner.positions.total_deals = runner.positions.orders_up + runner.positions.orders_down
 
 
-def _locked_profit_stop_reached(state: PositionState) -> bool:
+def _locked_profit_stop_reached(state: PositionState, cfg: KngtopConfig) -> bool:
     return (
         state.both_sides_traded()
         and state.pnl_if_up() >= LOCKED_PROFIT_STOP_PNL - 1e-12
         and state.pnl_if_down() >= LOCKED_PROFIT_STOP_PNL - 1e-12
         and _avg_sum(state) <= LOCKED_PROFIT_STOP_AVG_SUM + 1e-12
         and state.share_imbalance() <= LOCKED_PROFIT_STOP_IMBALANCE + 1e-12
+        and abs(state.shares_up - state.shares_down) <= _configured_max_share_gap(cfg) + 1e-12
     )
 
 
@@ -557,6 +617,9 @@ def _log_pnl_projection(runner: WindowRunner, *, side: str, ask_px: float, amoun
     proj_up, proj_down, proj_worst, proj_gap, proj_share_gap, proj_avg_sum = _projected_after_buy(
         runner.positions, side, ask_px, amount_usd
     )
+    shares = amount_usd / max(ask_px, 1e-9)
+    projected_up_shares = runner.positions.shares_up + (shares if side == "UP" else 0.0)
+    projected_down_shares = runner.positions.shares_down + (shares if side == "DOWN" else 0.0)
     _log_tag(
         "PNL_PROJECTION",
         slug=runner.contract.slug,
@@ -568,6 +631,9 @@ def _log_pnl_projection(runner: WindowRunner, *, side: str, ask_px: float, amoun
         projected_worst=f"{proj_worst:.4f}",
         projected_gap=f"{proj_gap:.4f}",
         projected_share_gap=f"{proj_share_gap:.4f}",
+        projected_abs_share_gap=f"{abs(projected_up_shares - projected_down_shares):.4f}",
+        projected_up_shares=f"{projected_up_shares:.6f}",
+        projected_down_shares=f"{projected_down_shares:.6f}",
         projected_avg_sum=f"{proj_avg_sum:.4f}",
     )
 
@@ -870,7 +936,7 @@ def _choose_guarded_pnl_buy(
     state = runner.positions
     if state.total_deals == 0:
         return _choose_initial_buy(runner, up_ask=up_ask, down_ask=down_ask, elapsed=elapsed, cfg=cfg)
-    if _locked_profit_stop_reached(state):
+    if _locked_profit_stop_reached(state, cfg):
         runner.stop_reason = "locked_profit"
         _log_tag(
             "STOP",
@@ -884,19 +950,53 @@ def _choose_guarded_pnl_buy(
         return None
 
     missing_side = _missing_position_side(state)
-    side = missing_side or _weak_outcome_side(state)
+    if missing_side is not None:
+        side = missing_side
+    elif state.both_sides_traded() and abs(state.shares_up - state.shares_down) > _configured_max_share_gap(cfg) + 1e-12:
+        side = "UP" if state.shares_up < state.shares_down else "DOWN"
+    else:
+        side = _weak_outcome_side(state)
     if side is None:
         side = "UP" if up_ask <= down_ask else "DOWN"
     ask_px = up_ask if side == "UP" else down_ask
     other = _other_side(side)
     weak_side = _weak_outcome_side(state)
+    balancing_overloaded_side = (
+        state.both_sides_traded()
+        and abs(state.shares_up - state.shares_down) > _configured_max_share_gap(cfg) + 1e-12
+        and _shares_for_side(state, side) < _shares_for_side(state, other)
+    )
     if missing_side is not None and has_real_position(state, other):
         pass
-    elif weak_side is not None and side != weak_side:
+    elif weak_side is not None and side != weak_side and not balancing_overloaded_side:
         _log_tag("SKIP", slug=runner.contract.slug, side=side, reason="would_increase_stronger_outcome", weak_side=weak_side)
         return None
-    amount_usd = _choose_order_amount_usd(side=side, ask_px=ask_px, state=state, cfg=cfg)
+    enforce_repair_guards = missing_side is None and state.both_sides_traded()
+    amount_usd = _choose_order_amount_usd(
+        side=side,
+        ask_px=ask_px,
+        state=state,
+        cfg=cfg,
+        enforce_repair_guards=enforce_repair_guards,
+    )
     if amount_usd is None:
+        _log_tag(
+            "SKIP",
+            slug=runner.contract.slug,
+            side=side,
+            reason=(
+                _repair_candidate_skip_reason(side=side, ask_px=ask_px, state=state, cfg=cfg)
+                if enforce_repair_guards
+                else "no_valid_amount"
+            ),
+            ask=f"{ask_px:.4f}",
+            shares_up=f"{state.shares_up:.6f}",
+            shares_down=f"{state.shares_down:.6f}",
+            abs_share_gap=f"{abs(state.shares_up - state.shares_down):.4f}",
+            max_share_gap=f"{_configured_max_share_gap(cfg):.4f}",
+            avg_sum=f"{_avg_sum(state):.4f}",
+            avg_sum_cap=f"{_configured_repair_avg_sum_cap(cfg):.4f}",
+        )
         return None
 
     locked_profit = state.pnl_if_up() >= LOCKED_PROFIT_PNL - 1e-12 and state.pnl_if_down() >= LOCKED_PROFIT_PNL - 1e-12

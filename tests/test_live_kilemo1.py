@@ -137,6 +137,8 @@ def _cfg() -> KngtopConfig:
         ws_rest_poll_interval_sec=1.0,
         hedge_max_orders_per_side=5,
         max_shares_per_side=15.0,
+        max_share_gap=2.0,
+        repair_avg_sum_cap=0.95,
     )
 
 

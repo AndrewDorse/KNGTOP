@@ -65,6 +65,22 @@ def test_max_shares_per_side_config(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.max_shares_per_side == 12.5
 
 
+def test_balance_guard_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
+    monkeypatch.delenv("KNGTOP_MAX_SHARE_GAP", raising=False)
+    monkeypatch.delenv("KNGTOP_REPAIR_AVG_SUM_CAP", raising=False)
+    cfg = KngtopConfig.from_env()
+    assert cfg.max_share_gap == 2.0
+    assert cfg.repair_avg_sum_cap == 0.95
+
+    monkeypatch.setenv("KNGTOP_MAX_SHARE_GAP", "1.5")
+    monkeypatch.setenv("KNGTOP_REPAIR_AVG_SUM_CAP", "0.93")
+    cfg = KngtopConfig.from_env()
+    assert cfg.max_share_gap == 1.5
+    assert cfg.repair_avg_sum_cap == 0.93
+
+
 def test_ws_rest_poll_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
     monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)

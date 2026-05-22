@@ -14,12 +14,14 @@ This file keeps a short memory of recent live strategy configurations.
   - if that first FAK no-fills or fails, do not repeat the same `$2`; later zero-position attempts are `$1` and require another side, a better price, or the retry wait
   - reevaluate every `5s`
   - after each fill, compute `pnl_if_up`, `pnl_if_down`, and the weaker outcome side
-  - buy only the weaker outcome side
+  - if both sides are open and one side is already too large, repair the smaller-share side first
+  - otherwise buy only the weaker outcome side
   - cheap weak repair: ask `<= 0.45`
   - guarded high repair C: high guard `<= 0.60`
   - if ask `> 0.60`, allow only when projected worst PnL reaches `>= -0.25` or projected share gap reaches `<= 10%`
   - pre-240s hard high cap `0.65`
   - final `60s`: up to `0.80` only if the weak outcome is dangerously weak
+  - post-open repair candidates must keep projected avg sum `<= 0.95` and projected share gap `<= 2.0` by default
   - if both outcome PnLs are already `>= +0.50`, buy only cheap asks `<= 0.45` or share imbalance `> 25%`
 - Order:
   - FAK buys only
@@ -32,6 +34,8 @@ This file keeps a short memory of recent live strategy configurations.
   - order retry on error defaults to `0`
   - max `$20` spent per window
   - max `15` PM-confirmed shares per side via `KNGTOP_MAX_SHARES_PER_SIDE`
+  - max post-open share gap `2.0` via `KNGTOP_MAX_SHARE_GAP`
+  - max post-open repair avg sum `0.95` via `KNGTOP_REPAIR_AVG_SUM_CAP`
 
 ### 2026-05-21
 - Scope: `BTC` only

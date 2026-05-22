@@ -72,6 +72,8 @@ class KngtopConfig:
     ws_rest_poll_interval_sec: float
     hedge_max_orders_per_side: int
     max_shares_per_side: float
+    max_share_gap: float
+    repair_avg_sum_cap: float
 
     @staticmethod
     def from_env() -> "KngtopConfig":
@@ -112,4 +114,6 @@ class KngtopConfig:
                 1.0,
                 float(os.environ.get("KNGTOP_MAX_SHARES_PER_SIDE") or os.environ.get("MAX_SHARES_PER_SIDE") or "15.0"),
             ),
+            max_share_gap=max(0.0, float(os.environ.get("KNGTOP_MAX_SHARE_GAP") or "2.0")),
+            repair_avg_sum_cap=max(0.0, float(os.environ.get("KNGTOP_REPAIR_AVG_SUM_CAP") or "0.95")),
         )

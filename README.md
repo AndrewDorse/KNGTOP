@@ -15,11 +15,13 @@ Current live entrypoint is `BTC` `5m` only and runs guarded PnL-balance candidat
   - if that first FAK no-fills or fails, the bot does not repeat the same `$2`; later zero-position attempts are `$1` and require another side, a better price, or the retry wait
 - Guarded PnL repair:
   - after every fill, compute `pnl_if_up`, `pnl_if_down`, and the weaker outcome side
-  - buy only the weaker outcome side
+  - if both sides are open and one side is already too large, repair the smaller-share side first
+  - otherwise buy only the weaker outcome side
   - cheap weak repair: if weak-side ask `<= 0.45`, buy it
   - high guard C: if weak-side ask `> 0.45`, normal guard cap is `<= 0.60`
   - pre-240s hard high cap is `0.65`
   - final 60s can buy up to `0.80` only when that outcome is dangerously weak
+  - post-open repair candidates must keep projected avg sum `<= 0.95` and projected share gap `<= 2.0` by default
   - if both outcomes are already `>= +0.50`, buy only cheap `<= 0.45` or when share imbalance is `> 25%`
 - Order:
   - FAK buys only
@@ -36,6 +38,8 @@ Current live entrypoint is `BTC` `5m` only and runs guarded PnL-balance candidat
 - minimum live order is `$1`
 - `KNGTOP_NOTIONAL_USD` currently acts as the upper bound for the first buy and projected repair buys
 - `KNGTOP_MAX_SHARES_PER_SIDE` defaults to `15.0`; buys are blocked if the remaining share room cannot fit at least the `$1` minimum order
+- `KNGTOP_MAX_SHARE_GAP` defaults to `2.0`; post-open repair buys are blocked when projected shares would remain too unbalanced
+- `KNGTOP_REPAIR_AVG_SUM_CAP` defaults to `0.95`; post-open repair buys are blocked when projected avg sum is worse than this cap
 - order retry on error defaults to `0`; failed/no-fill FAK attempts do not update position state
 - balance/allowance errors stop the current window instead of retrying the same order
 
