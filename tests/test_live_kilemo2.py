@@ -83,21 +83,57 @@ class _Poly:
         return (max(0.0, ask - 0.01), ask)
 
 
-def _tick(runner: WindowRunner, *, elapsed: int, up: float, down: float, clob: _FakeClob | None = None) -> _FakeClob:
+def _positions_row(*, slug: str, outcome: str, token_id: str, size: float, avg_price: float) -> dict[str, object]:
+    return {
+        "slug": slug,
+        "outcome": outcome,
+        "asset": token_id,
+        "size": size,
+        "avgPrice": avg_price,
+    }
+
+
+def _tick(
+    runner: WindowRunner,
+    *,
+    elapsed: int,
+    up: float,
+    down: float,
+    clob: _FakeClob | None = None,
+    positions_seq: list[list[dict[str, object]]] | None = None,
+) -> _FakeClob:
     fake_clob = clob or _FakeClob()
+    seq = list(positions_seq or [[]])
+
+    def _fake_positions(*, user: str, timeout: float, limit: int = 500):  # noqa: ANN202
+        del user, timeout, limit
+        if len(seq) > 1:
+            return seq.pop(0)
+        return seq[0]
+
     with patch("kngtop.live_kilemo2.datetime") as fake_dt:
         fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_000 + elapsed, timezone.utc)
-        _tick_runner(runner, poly=_Poly(up=up, down=down), binance=_FakeBinance(), clob=fake_clob, cfg=_cfg())
+        with patch("kngtop.live_kilemo2.fetch_user_positions", side_effect=_fake_positions):
+            _tick_runner(runner, poly=_Poly(up=up, down=down), binance=_FakeBinance(), clob=fake_clob, cfg=_cfg())
     return fake_clob
 
 
 def test_initial_buy_is_2_usd_lower_ask_under_bootstrap_cap() -> None:
     runner = _runner(1_700_000_000)
-    clob = _tick(runner, elapsed=0, up=0.52, down=0.49)
+    clob = _tick(
+        runner,
+        elapsed=0,
+        up=0.52,
+        down=0.49,
+        positions_seq=[
+            [],
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.081632653, avg_price=0.49)],
+        ],
+    )
 
     assert clob.calls == [("down-token", 2.0, 0.49)]
     assert runner.positions.orders_down == 1
-    assert runner.positions.spent_total() == 2.0
+    assert abs(runner.positions.spent_total() - 2.0) < 1e-6
 
 
 def test_initial_buy_skips_when_lower_ask_above_bootstrap_cap() -> None:
@@ -111,7 +147,22 @@ def test_initial_buy_skips_when_lower_ask_above_bootstrap_cap() -> None:
 def test_weak_outcome_cheap_repair_uses_1_usd_when_not_imbalanced_or_very_cheap() -> None:
     state = PositionState(spent_up=2.0, shares_up=3.8461538, spent_down=2.0, shares_down=4.0816326, orders_up=1, orders_down=1, total_deals=2)
     runner = _runner(1_700_000_000, positions=state)
-    clob = _tick(runner, elapsed=10, up=0.43, down=0.60)
+    clob = _tick(
+        runner,
+        elapsed=10,
+        up=0.43,
+        down=0.60,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=3.8461538, avg_price=0.52),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0816326, avg_price=0.49),
+            ],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.171735195, avg_price=0.485176547),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0816326, avg_price=0.49),
+            ],
+        ],
+    )
 
     assert clob.calls == [("up-token", 1.0, 0.43)]
     assert runner.positions.orders_up == 2
@@ -120,7 +171,22 @@ def test_weak_outcome_cheap_repair_uses_1_usd_when_not_imbalanced_or_very_cheap(
 def test_weak_outcome_cheap_repair_uses_projected_size_when_ask_at_or_below_030() -> None:
     state = PositionState(spent_up=2.0, shares_up=3.0, spent_down=2.0, shares_down=8.0, orders_up=1, orders_down=1, total_deals=2)
     runner = _runner(1_700_000_000, positions=state)
-    clob = _tick(runner, elapsed=10, up=0.30, down=0.70)
+    clob = _tick(
+        runner,
+        elapsed=10,
+        up=0.30,
+        down=0.70,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=3.0, avg_price=2.0 / 3.0),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=8.0, avg_price=0.25),
+            ],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=8.333333333, avg_price=0.432),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=8.0, avg_price=0.25),
+            ],
+        ],
+    )
 
     assert clob.calls == [("up-token", 1.6, 0.30)]
 
@@ -128,15 +194,41 @@ def test_weak_outcome_cheap_repair_uses_projected_size_when_ask_at_or_below_030(
 def test_high_guard_060_allows_guarded_high_repair_below_or_equal_060() -> None:
     state = PositionState(spent_up=2.0, shares_up=3.8461538, spent_down=2.0, shares_down=4.0816326, orders_up=1, orders_down=1, total_deals=2)
     runner = _runner(1_700_000_000, positions=state)
-    clob = _tick(runner, elapsed=10, up=0.60, down=0.40)
+    clob = _tick(
+        runner,
+        elapsed=10,
+        up=0.60,
+        down=0.40,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=3.8461538, avg_price=0.52),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0816326, avg_price=0.49),
+            ],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.512820467, avg_price=0.544651163),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0816326, avg_price=0.49),
+            ],
+        ],
+    )
 
     assert clob.calls == [("up-token", 1.0, 0.60)]
 
 
 def test_high_price_above_065_is_blocked_before_240s() -> None:
-    state = PositionState(spent_up=2.0, shares_up=3.8461538, spent_down=2.0, shares_down=4.0816326, orders_up=1, orders_down=1, total_deals=2)
+    state = PositionState(spent_up=2.0, shares_up=2.0, spent_down=2.0, shares_down=4.0816326, orders_up=1, orders_down=1, total_deals=2)
     runner = _runner(1_700_000_000, positions=state)
-    clob = _tick(runner, elapsed=120, up=0.70, down=0.40)
+    clob = _tick(
+        runner,
+        elapsed=120,
+        up=0.70,
+        down=0.40,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=2.0, avg_price=1.0),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0816326, avg_price=0.49),
+            ]
+        ],
+    )
 
     assert clob.calls == []
 
@@ -144,7 +236,22 @@ def test_high_price_above_065_is_blocked_before_240s() -> None:
 def test_final_60_allows_dangerously_weak_side_up_to_080() -> None:
     state = PositionState(spent_up=2.0, shares_up=1.0, spent_down=8.0, shares_down=25.0, orders_up=1, orders_down=4, total_deals=5)
     runner = _runner(1_700_000_000, positions=state)
-    clob = _tick(runner, elapsed=250, up=0.80, down=0.20)
+    clob = _tick(
+        runner,
+        elapsed=250,
+        up=0.80,
+        down=0.20,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=1.0, avg_price=2.0),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=25.0, avg_price=0.32),
+            ],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=3.5, avg_price=1.142857),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=25.0, avg_price=0.32),
+            ],
+        ],
+    )
 
     assert clob.calls == [("up-token", 2.0, 0.80)]
 
@@ -152,7 +259,18 @@ def test_final_60_allows_dangerously_weak_side_up_to_080() -> None:
 def test_locked_profit_only_allows_cheap_or_imbalanced_buys() -> None:
     state = PositionState(spent_up=3.0, shares_up=8.0, spent_down=3.0, shares_down=8.2, orders_up=3, orders_down=3, total_deals=6)
     runner = _runner(1_700_000_000, positions=state)
-    clob = _tick(runner, elapsed=100, up=0.58, down=0.52)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.58,
+        down=0.52,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=8.0, avg_price=0.375),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=8.2, avg_price=3.0 / 8.2),
+            ]
+        ],
+    )
 
     assert runner.positions.pnl_if_up() >= 0.5
     assert runner.positions.pnl_if_down() >= 0.5
@@ -200,7 +318,17 @@ def test_failed_order_does_not_update_position_and_waits_before_retry() -> None:
 
     _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
     _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
-    _tick(runner, elapsed=10, up=0.52, down=0.49, clob=clob)
+    _tick(
+        runner,
+        elapsed=10,
+        up=0.52,
+        down=0.49,
+        clob=clob,
+        positions_seq=[
+            [],
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.245)],
+        ],
+    )
 
     assert clob.calls == [("down-token", 2.0, 0.49), ("down-token", 1.0, 0.49)]
     assert runner.positions.total_deals == 1
@@ -212,18 +340,42 @@ def test_initial_two_usd_attempt_happens_only_once_after_nofill() -> None:
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 0.0}, {"orderID": "buy-2", "size_matched": 2.0}])
 
     _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
-    _tick(runner, elapsed=5, up=0.52, down=0.49, clob=clob)
+    _tick(
+        runner,
+        elapsed=5,
+        up=0.52,
+        down=0.49,
+        clob=clob,
+        positions_seq=[
+            [],
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=1.923076923, avg_price=0.52)],
+        ],
+    )
 
     assert clob.calls == [("down-token", 2.0, 0.49), ("up-token", 1.0, 0.52)]
     assert runner.initial_intent_attempted is True
     assert all(call[1] < 2.0 for call in clob.calls[1:])
-    assert runner.positions.spent_total() == 1.0
+    assert abs(runner.positions.spent_total() - 1.0) < 1e-6
+    assert runner.intent_count_down == 1
+    assert runner.intent_count_up == 1
 
 
 def test_after_one_side_fill_next_buy_is_missing_side_not_more_same_side() -> None:
     state = PositionState(spent_down=2.0, shares_down=8.0, orders_down=1, total_deals=1)
     runner = _runner(1_700_000_000, positions=state)
-    clob = _tick(runner, elapsed=10, up=0.44, down=0.20)
+    clob = _tick(
+        runner,
+        elapsed=10,
+        up=0.44,
+        down=0.20,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=8.0, avg_price=0.25)],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=8.0, avg_price=0.25),
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=4.545454545, avg_price=0.44),
+            ],
+        ],
+    )
 
     assert clob.calls == [("up-token", 2.0, 0.44)]
     assert runner.positions.orders_up == 1
@@ -232,7 +384,22 @@ def test_after_one_side_fill_next_buy_is_missing_side_not_more_same_side() -> No
 def test_later_sizing_can_use_fractional_amount_to_optimize_projected_pnl() -> None:
     state = PositionState(spent_up=2.0, shares_up=5.0, spent_down=2.0, shares_down=8.43, orders_up=1, orders_down=1, total_deals=2)
     runner = _runner(1_700_000_000, positions=state)
-    clob = _tick(runner, elapsed=10, up=0.35, down=0.70)
+    clob = _tick(
+        runner,
+        elapsed=10,
+        up=0.35,
+        down=0.70,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.4),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=8.43, avg_price=2.0 / 8.43),
+            ],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=8.428571429, avg_price=0.379661017),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=8.43, avg_price=2.0 / 8.43),
+            ],
+        ],
+    )
 
     assert clob.calls == [("up-token", 1.2, 0.35)]
 
@@ -246,6 +413,34 @@ def test_balance_or_allowance_error_stops_window() -> None:
 
     assert len(clob.calls) == 1
     assert runner.stop_reason == "balance_or_allowance"
+
+
+def test_initial_retry_stops_after_two_failures_per_side() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob(
+        responses=[
+            {"orderID": "buy-1", "size_matched": 0.0},
+            {"orderID": "buy-2", "size_matched": 0.0},
+            {"orderID": "buy-3", "size_matched": 0.0},
+            {"orderID": "buy-4", "size_matched": 0.0},
+        ]
+    )
+
+    _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
+    _tick(runner, elapsed=5, up=0.52, down=0.50, clob=clob)
+    _tick(runner, elapsed=10, up=0.48, down=0.49, clob=clob)
+    _tick(runner, elapsed=15, up=0.48, down=0.49, clob=clob)
+    _tick(runner, elapsed=20, up=0.48, down=0.49, clob=clob)
+
+    assert clob.calls == [
+        ("down-token", 2.0, 0.49),
+        ("up-token", 1.0, 0.52),
+        ("up-token", 1.0, 0.48),
+        ("down-token", 1.0, 0.49),
+    ]
+    assert runner.stop_reason == "bootstrap_exhausted"
+    assert runner.intent_count_down == 2
+    assert runner.intent_count_up == 2
 
 
 def test_nofill_does_not_update_position() -> None:
@@ -262,7 +457,17 @@ def test_partial_fill_updates_from_confirmed_filled_shares_conservatively() -> N
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 2.0}])
 
-    _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
+    _tick(
+        runner,
+        elapsed=0,
+        up=0.52,
+        down=0.49,
+        clob=clob,
+        positions_seq=[
+            [],
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=2.0, avg_price=0.49)],
+        ],
+    )
 
     assert runner.positions.shares_down == 2.0
     assert runner.positions.spent_down == 0.98

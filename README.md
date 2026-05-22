@@ -23,11 +23,13 @@ Current live entrypoint is `BTC` `5m` only and runs guarded PnL-balance candidat
   - if both outcomes are already `>= +0.50`, buy only cheap `<= 0.45` or when share imbalance is `> 25%`
 - Order:
   - FAK buys only
+  - one order intent at a time; no overlapping sends while a request is in flight
+  - live fills are counted only after Polymarket Data API position size confirms the fill
   - `$2` first intent only
   - later order size is projected from `$1.00` to `$2.00` in `$0.20` steps to improve worst-case outcome PnL and reduce outcome gap
   - max `$20` spent per window
-  - max `15` filled buys per window
-  - max `5` filled buys per side
+  - max `15` confirmed fills per window
+  - max `5` confirmed fills per side
   - live max price = displayed ask, bounded by `KNGTOP_MARKET_BUY_MAX_PRICE`
 
 ## Sizing

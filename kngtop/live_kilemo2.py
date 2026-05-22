@@ -20,6 +20,7 @@ from kngtop.gamma import (
     discover_updown_window_by_start,
     window_start_ts_from_slug,
 )
+from kngtop.pm_data import fetch_user_positions
 from kngtop.rest_poll import run_ws_rest_fallback_loop
 from kngtop.ws_market import MarketWsFeed
 
@@ -50,8 +51,11 @@ HIGH_REPAIR_SHARE_GAP_TARGET = 0.10
 DANGEROUS_WEAK_PNL = -2.0
 INITIAL_RETRY_WAIT_SEC = 10.0
 INITIAL_RETRY_PRICE_IMPROVEMENT = 0.02
+MAX_INITIAL_RETRIES_PER_SIDE = 2
 REPAIR_AMOUNT_STEPS = (1.0, 1.2, 1.4, 1.6, 1.8, 2.0)
 MAX_ORDER_PRICE = 0.99
+POST_ORDER_RECONCILE_TIMEOUT_SEC = 2.0
+POST_ORDER_RECONCILE_POLL_SEC = 0.25
 READY = "READY"
 ORDER_IN_FLIGHT = "ORDER_IN_FLIGHT"
 WAIT_NEXT_DECISION = "WAIT_NEXT_DECISION"
@@ -127,6 +131,8 @@ class WindowRunner:
     last_initial_attempt_elapsed: float = -10_000.0
     initial_failed_up: int = 0
     initial_failed_down: int = 0
+    intent_count_up: int = 0
+    intent_count_down: int = 0
 
     def start_sec(self) -> int | None:
         return window_start_ts_from_slug(self.contract.slug)
@@ -243,6 +249,10 @@ def _orders_for_side(state: PositionState, side: str) -> int:
     return state.orders_up if side == "UP" else state.orders_down
 
 
+def _initial_failures_for_side(runner: WindowRunner, side: str) -> int:
+    return runner.initial_failed_up if side == "UP" else runner.initial_failed_down
+
+
 def _missing_position_side(state: PositionState) -> str | None:
     up = has_real_position(state, "UP")
     down = has_real_position(state, "DOWN")
@@ -356,6 +366,76 @@ def _apply_position_fill(state: PositionState, side: str, ask_px: float, amount_
     state.total_deals += 1
 
 
+def _refresh_positions_from_pm(
+    runner: WindowRunner,
+    *,
+    cfg: KngtopConfig,
+) -> PositionState:
+    rows = fetch_user_positions(user=cfg.funder, timeout=cfg.request_timeout_sec)
+    token_by_side = {"UP": runner.contract.up.token_id, "DOWN": runner.contract.down.token_id}
+    shares_by_side = {"UP": 0.0, "DOWN": 0.0}
+    cost_by_side = {"UP": 0.0, "DOWN": 0.0}
+    for row in rows:
+        slug = str(row.get("slug") or row.get("marketSlug") or row.get("market_slug") or "")
+        asset_id = str(row.get("asset") or row.get("asset_id") or row.get("token_id") or "")
+        outcome = str(row.get("outcome") or "").strip().upper()
+        side: str | None = None
+        if slug and slug == runner.contract.slug and outcome in {"UP", "DOWN"}:
+            side = outcome
+        else:
+            for candidate_side, token_id in token_by_side.items():
+                if asset_id and asset_id == token_id:
+                    side = candidate_side
+                    break
+        if side is None:
+            continue
+        size = _extract_numeric(row, "size", "amount", "shares")
+        avg_price = _extract_numeric(row, "avgPrice", "averagePrice", "avg_price", "price")
+        if size is None or size <= 0:
+            continue
+        shares_by_side[side] += float(size)
+        if avg_price is not None and 0.0 < float(avg_price) < 1.0:
+            cost_by_side[side] += float(size) * float(avg_price)
+
+    refreshed = PositionState(
+        spent_up=cost_by_side["UP"],
+        spent_down=cost_by_side["DOWN"],
+        shares_up=shares_by_side["UP"],
+        shares_down=shares_by_side["DOWN"],
+        orders_up=runner.positions.orders_up,
+        orders_down=runner.positions.orders_down,
+        total_deals=runner.positions.total_deals,
+    )
+    runner.positions.spent_up = refreshed.spent_up
+    runner.positions.spent_down = refreshed.spent_down
+    runner.positions.shares_up = refreshed.shares_up
+    runner.positions.shares_down = refreshed.shares_down
+    return refreshed
+
+
+def _confirm_fill_from_pm(
+    runner: WindowRunner,
+    *,
+    side: str,
+    pre_state: PositionState,
+    cfg: KngtopConfig,
+) -> bool:
+    deadline = time.monotonic() + POST_ORDER_RECONCILE_TIMEOUT_SEC
+    while time.monotonic() <= deadline:
+        refreshed = _refresh_positions_from_pm(runner, cfg=cfg)
+        prev_shares = pre_state.shares_up if side == "UP" else pre_state.shares_down
+        new_shares = refreshed.shares_up if side == "UP" else refreshed.shares_down
+        if new_shares > prev_shares + 1e-6:
+            if side == "UP":
+                runner.positions.orders_up += 1
+            else:
+                runner.positions.orders_down += 1
+            runner.positions.total_deals += 1
+            return True
+        time.sleep(POST_ORDER_RECONCILE_POLL_SEC)
+    return False
+
+
 def _next_retry_delay(reason: str) -> float:
     if reason in {"initial_lower_ask", "cheap_weak_repair", "guarded_high_repair"}:
         return 1.0
@@ -396,6 +476,13 @@ def _initial_retry_allowed(runner: WindowRunner, *, side: str, ask_px: float, el
     if ask_px <= runner.last_initial_attempt_price - INITIAL_RETRY_PRICE_IMPROVEMENT + 1e-12:
         return True
     return elapsed - runner.last_initial_attempt_elapsed >= INITIAL_RETRY_WAIT_SEC - 1e-12
+
+
+def _record_order_intent(runner: WindowRunner, *, side: str) -> None:
+    if side == "UP":
+        runner.intent_count_up += 1
+    else:
+        runner.intent_count_down += 1
 
 
 def _log_current_pnl_state(runner: WindowRunner) -> None:
@@ -446,6 +533,15 @@ def _send_fak_buy(
     cfg: KngtopConfig,
     enforce_avg_cap: bool = True,
 ) -> bool:
+    pre_state = PositionState(
+        spent_up=runner.positions.spent_up,
+        spent_down=runner.positions.spent_down,
+        shares_up=runner.positions.shares_up,
+        shares_down=runner.positions.shares_down,
+        orders_up=runner.positions.orders_up,
+        orders_down=runner.positions.orders_down,
+        total_deals=runner.positions.total_deals,
+    )
     if ask_px <= 0.0 or ask_px > min(MAX_ORDER_PRICE, float(cfg.market_buy_max_price)) + 1e-12:
         return False
     if not _can_buy(runner.positions, side, amount_usd):
@@ -475,6 +571,7 @@ def _send_fak_buy(
     _log_current_pnl_state(runner)
     _log_pnl_projection(runner, side=side, ask_px=ask_px, amount_usd=amount_usd)
     _log_tag("INTENT CREATED", slug=runner.contract.slug, side=side, reason=reason, ask=f"{ask_px:.4f}", amount=f"{amount_usd:.2f}")
+    _record_order_intent(runner, side=side)
     if _is_initial_reason(reason) and runner.positions.total_deals == 0:
         _record_initial_intent(runner, side=side, ask_px=ask_px, elapsed=elapsed)
     runner.pending_order = True
@@ -550,8 +647,25 @@ def _send_fak_buy(
                     _schedule_next_decision(runner, now_ts=datetime.now(timezone.utc).timestamp(), reason=reason)
                 return False
 
-        filled_shares_for_state = None if cfg.dry_run or clob is None else filled_shares
-        _apply_position_fill(runner.positions, side, ask_px, amount_usd, filled_shares_for_state)
+        if cfg.dry_run or clob is None:
+            filled_shares_for_state = None
+            _apply_position_fill(runner.positions, side, ask_px, amount_usd, filled_shares_for_state)
+            fill_confirmed = True
+        else:
+            fill_confirmed = _confirm_fill_from_pm(runner, side=side, pre_state=pre_state, cfg=cfg)
+        if not fill_confirmed:
+            _log_tag(
+                "ORDER UNCONFIRMED",
+                slug=runner.contract.slug,
+                side=side,
+                reason=reason,
+                ask=f"{ask_px:.4f}",
+                amount=f"{amount_usd:.2f}",
+            )
+            if _is_initial_reason(reason) and runner.positions.total_deals == 0:
+                _record_initial_failure(runner, side=side)
+            _schedule_next_decision(runner, now_ts=datetime.now(timezone.utc).timestamp(), reason=reason)
+            return False
         if _is_initial_reason(reason):
             runner.initial_filled = True
         runner.last_successful_buy_ts = elapsed
@@ -618,9 +732,13 @@ def _choose_initial_buy(
 ) -> BuyAction | None:
     ordered = (("UP", up_ask), ("DOWN", down_ask))
     ordered = tuple(sorted(ordered, key=lambda item: item[1]))
+    available_sides = 0
     for side, ask_px in ordered:
         if ask_px > BOOTSTRAP_CHEAP_CAP + 1e-12:
             continue
+        if _initial_failures_for_side(runner, side) >= MAX_INITIAL_RETRIES_PER_SIDE:
+            continue
+        available_sides += 1
         if not runner.initial_intent_attempted:
             return BuyAction(
                 side=side,
@@ -637,6 +755,17 @@ def _choose_initial_buy(
             amount_usd=MIN_ORDER_USD,
             reason="initial_retry",
             enforce_avg_cap=False,
+        )
+    if runner.initial_intent_attempted and available_sides == 0:
+        runner.stop_reason = "bootstrap_exhausted"
+        _log_tag(
+            "STOP",
+            slug=runner.contract.slug,
+            reason="bootstrap_exhausted",
+            up_failures=str(runner.initial_failed_up),
+            down_failures=str(runner.initial_failed_down),
+            up_intents=str(runner.intent_count_up),
+            down_intents=str(runner.intent_count_down),
         )
     return None
 
@@ -851,6 +980,12 @@ def _tick_runner(
         return
     if elapsed < 0:
         return
+    if not cfg.dry_run:
+        try:
+            _refresh_positions_from_pm(runner, cfg=cfg)
+        except Exception as exc:  # noqa: BLE001
+            _log_tag("RECONCILE", slug=runner.contract.slug, status="error", error=str(exc))
+            return
     if runner.window_open_px is None:
         start_sec = runner.start_sec()
         if start_sec is None:

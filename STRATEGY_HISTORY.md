@@ -26,13 +26,13 @@ This file keeps a short memory of recent live strategy configurations.
   - `$2` first intent only
   - later buy size is projected from `$1.00` to `$2.00` in `$0.20` steps
   - one order intent at a time
-  - position updates only from confirmed fills
+  - live position updates only after Polymarket Data API confirms position-size growth
   - no-fill/error attempts do not update orders, spent, or shares
   - balance/allowance errors stop the current window
   - order retry on error defaults to `0`
   - max `$20` spent per window
-  - max `15` total buys per window
-  - max `5` buys per side
+  - max `15` confirmed fills per window
+  - max `5` confirmed fills per side
 
 ### 2026-05-21
 - Scope: `BTC` only
