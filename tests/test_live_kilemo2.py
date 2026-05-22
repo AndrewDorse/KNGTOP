@@ -253,7 +253,7 @@ def test_final_60_allows_dangerously_weak_side_up_to_080() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.0, 0.80)]
+    assert clob.calls == [("up-token", 2.0, 0.80)]
 
 
 def test_locked_profit_only_allows_cheap_or_imbalanced_buys() -> None:
@@ -336,7 +336,7 @@ def test_order_count_does_not_block_when_share_room_remains() -> None:
         ],
     )
 
-    assert clob.calls == []
+    assert clob.calls == [("up-token", 1.2, 0.44)]
     assert runner.positions.shares_up <= 15.0
 
 
