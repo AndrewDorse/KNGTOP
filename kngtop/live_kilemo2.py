@@ -371,6 +371,10 @@ def _refresh_positions_from_pm(
     *,
     cfg: KngtopConfig,
 ) -> PositionState:
+    prev_shares_up = runner.positions.shares_up
+    prev_shares_down = runner.positions.shares_down
+    prev_orders_up = runner.positions.orders_up
+    prev_orders_down = runner.positions.orders_down
     rows = fetch_user_positions(user=cfg.funder, timeout=cfg.request_timeout_sec)
     token_by_side = {"UP": runner.contract.up.token_id, "DOWN": runner.contract.down.token_id}
     shares_by_side = {"UP": 0.0, "DOWN": 0.0}
@@ -397,19 +401,33 @@ def _refresh_positions_from_pm(
         if avg_price is not None and 0.0 < float(avg_price) < 1.0:
             cost_by_side[side] += float(size) * float(avg_price)
 
+    orders_up = prev_orders_up
+    orders_down = prev_orders_down
+    if shares_by_side["UP"] > prev_shares_up + 1e-6:
+        orders_up += 1
+    elif shares_by_side["UP"] > 1e-6 and orders_up == 0:
+        orders_up = 1
+    if shares_by_side["DOWN"] > prev_shares_down + 1e-6:
+        orders_down += 1
+    elif shares_by_side["DOWN"] > 1e-6 and orders_down == 0:
+        orders_down = 1
+
     refreshed = PositionState(
         spent_up=cost_by_side["UP"],
         spent_down=cost_by_side["DOWN"],
         shares_up=shares_by_side["UP"],
         shares_down=shares_by_side["DOWN"],
-        orders_up=runner.positions.orders_up,
-        orders_down=runner.positions.orders_down,
-        total_deals=runner.positions.total_deals,
+        orders_up=orders_up,
+        orders_down=orders_down,
+        total_deals=orders_up + orders_down,
     )
     runner.positions.spent_up = refreshed.spent_up
     runner.positions.spent_down = refreshed.spent_down
     runner.positions.shares_up = refreshed.shares_up
     runner.positions.shares_down = refreshed.shares_down
+    runner.positions.orders_up = refreshed.orders_up
+    runner.positions.orders_down = refreshed.orders_down
+    runner.positions.total_deals = refreshed.total_deals
     return refreshed
 
 
@@ -426,11 +444,6 @@ def _confirm_fill_from_pm(
         prev_shares = pre_state.shares_up if side == "UP" else pre_state.shares_down
         new_shares = refreshed.shares_up if side == "UP" else refreshed.shares_down
         if new_shares > prev_shares + 1e-6:
-            if side == "UP":
-                runner.positions.orders_up += 1
-            else:
-                runner.positions.orders_down += 1
-            runner.positions.total_deals += 1
             return True
         time.sleep(POST_ORDER_RECONCILE_POLL_SEC)
     return False
@@ -583,6 +596,7 @@ def _send_fak_buy(
 
     try:
         token = _token_for_side(runner, side)
+        confirmed_by_reconcile = False
         if not cfg.dry_run and clob is not None:
             attempts = max(1, int(cfg.order_retry_on_error) + 1)
             last_error: Exception | None = None
@@ -591,6 +605,17 @@ def _send_fak_buy(
                     payload = clob.market_buy_usdc(token, amount_usd, max_price=min(MAX_ORDER_PRICE, float(cfg.market_buy_max_price), ask_px))
                     filled_shares = _extract_filled_shares(payload)
                     if filled_shares <= 0.000001:
+                        if _confirm_fill_from_pm(runner, side=side, pre_state=pre_state, cfg=cfg):
+                            confirmed_by_reconcile = True
+                            _log_tag(
+                                "ORDER CONFIRMED_AFTER_NOFILL",
+                                slug=runner.contract.slug,
+                                side=side,
+                                reason=reason,
+                                ask=f"{ask_px:.4f}",
+                                amount=f"{amount_usd:.2f}",
+                            )
+                            break
                         _log_tag(
                             "ORDER NOFILL",
                             slug=runner.contract.slug,
@@ -607,6 +632,18 @@ def _send_fak_buy(
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
                     if "no orders found to match with FAK order" in str(exc):
+                        if _confirm_fill_from_pm(runner, side=side, pre_state=pre_state, cfg=cfg):
+                            confirmed_by_reconcile = True
+                            _log_tag(
+                                "ORDER CONFIRMED_AFTER_ERROR",
+                                slug=runner.contract.slug,
+                                side=side,
+                                reason=reason,
+                                ask=f"{ask_px:.4f}",
+                                amount=f"{amount_usd:.2f}",
+                                error=str(exc),
+                            )
+                            break
                         _log_tag(
                             "ORDER FAILED",
                             slug=runner.contract.slug,
@@ -652,7 +689,7 @@ def _send_fak_buy(
             _apply_position_fill(runner.positions, side, ask_px, amount_usd, filled_shares_for_state)
             fill_confirmed = True
         else:
-            fill_confirmed = _confirm_fill_from_pm(runner, side=side, pre_state=pre_state, cfg=cfg)
+            fill_confirmed = confirmed_by_reconcile or _confirm_fill_from_pm(runner, side=side, pre_state=pre_state, cfg=cfg)
         if not fill_confirmed:
             _log_tag(
                 "ORDER UNCONFIRMED",
@@ -756,7 +793,12 @@ def _choose_initial_buy(
             reason="initial_retry",
             enforce_avg_cap=False,
         )
-    if runner.initial_intent_attempted and available_sides == 0:
+    if (
+        runner.initial_intent_attempted
+        and runner.positions.total_deals == 0
+        and runner.initial_failed_up >= MAX_INITIAL_RETRIES_PER_SIDE
+        and runner.initial_failed_down >= MAX_INITIAL_RETRIES_PER_SIDE
+    ):
         runner.stop_reason = "bootstrap_exhausted"
         _log_tag(
             "STOP",

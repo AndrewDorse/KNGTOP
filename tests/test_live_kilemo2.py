@@ -443,6 +443,152 @@ def test_initial_retry_stops_after_two_failures_per_side() -> None:
     assert runner.intent_count_up == 2
 
 
+def test_bootstrap_waits_for_other_side_after_first_side_exhausted() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob(
+        responses=[
+            {"orderID": "buy-1", "size_matched": 0.0},
+            Exception("no orders found to match with FAK order"),
+            {"orderID": "buy-3", "size_matched": 2.0},
+        ]
+    )
+
+    _tick(runner, elapsed=0, up=0.34, down=0.66, clob=clob)
+    _tick(runner, elapsed=5, up=0.29, down=0.71, clob=clob)
+    _tick(runner, elapsed=10, up=0.30, down=0.60, clob=clob)
+    assert runner.stop_reason is None
+
+    _tick(
+        runner,
+        elapsed=15,
+        up=0.49,
+        down=0.50,
+        clob=clob,
+        positions_seq=[
+            [],
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=2.0, avg_price=0.50)],
+        ],
+    )
+
+    assert clob.calls == [
+        ("up-token", 2.0, 0.34),
+        ("up-token", 1.0, 0.29),
+        ("down-token", 1.0, 0.50),
+    ]
+    assert runner.positions.orders_down == 1
+    assert runner.stop_reason is None
+
+
+def test_nofill_response_still_counts_fill_when_pm_confirms_position() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 0.0}])
+
+    _tick(
+        runner,
+        elapsed=0,
+        up=0.34,
+        down=0.66,
+        clob=clob,
+        positions_seq=[
+            [],
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.882352941, avg_price=0.34)],
+        ],
+    )
+
+    assert clob.calls == [("up-token", 2.0, 0.34)]
+    assert runner.positions.orders_up == 1
+    assert runner.positions.total_deals == 1
+    assert runner.initial_failed_up == 0
+    assert runner.initial_filled is True
+
+
+def test_no_match_error_still_counts_fill_when_pm_confirms_position() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob(responses=[Exception("no orders found to match with FAK order")])
+
+    _tick(
+        runner,
+        elapsed=0,
+        up=0.33,
+        down=0.67,
+        clob=clob,
+        positions_seq=[
+            [],
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.060606061, avg_price=0.33)],
+        ],
+    )
+
+    assert clob.calls == [("up-token", 2.0, 0.33)]
+    assert runner.positions.orders_up == 1
+    assert runner.positions.total_deals == 1
+    assert runner.initial_failed_up == 0
+    assert runner.initial_filled is True
+
+
+def test_pm_discovered_bootstrap_fill_triggers_missing_side_buy() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob(
+        responses=[
+            {"orderID": "buy-1", "size_matched": 0.0},
+            {"orderID": "buy-2", "size_matched": 2.0},
+        ]
+    )
+
+    _tick(
+        runner,
+        elapsed=0,
+        up=0.33,
+        down=0.67,
+        clob=clob,
+        positions_seq=[
+            [],
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.060606061, avg_price=0.33)],
+        ],
+    )
+    _tick(
+        runner,
+        elapsed=5,
+        up=0.50,
+        down=0.50,
+        clob=clob,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.060606061, avg_price=0.33)],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.060606061, avg_price=0.33),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.50),
+            ],
+        ],
+    )
+
+    assert clob.calls == [("up-token", 2.0, 0.33), ("down-token", 2.0, 0.50)]
+    assert runner.positions.orders_up == 1
+    assert runner.positions.orders_down == 1
+    assert runner.positions.total_deals == 2
+
+
+def test_pm_refresh_promotes_existing_position_to_open_side() -> None:
+    runner = _runner(1_700_000_000)
+
+    clob = _tick(
+        runner,
+        elapsed=5,
+        up=0.60,
+        down=0.50,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.0, avg_price=0.33)],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.0, avg_price=0.33),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.50),
+            ],
+        ],
+    )
+
+    assert clob.calls == [("down-token", 2.0, 0.50)]
+    assert runner.positions.orders_up == 1
+    assert runner.positions.orders_down == 1
+    assert runner.positions.total_deals == 2
+
+
 def test_nofill_does_not_update_position() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 0.0}])
