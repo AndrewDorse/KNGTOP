@@ -106,5 +106,5 @@ class KngtopConfig:
                     120.0,
                 ),
             ),
-            hedge_max_orders_per_side=max(1, int(os.environ.get("KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE") or "2")),
+            hedge_max_orders_per_side=max(1, int(os.environ.get("KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE") or "5")),
         )

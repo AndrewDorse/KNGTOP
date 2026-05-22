@@ -10,7 +10,8 @@ This file keeps a short memory of recent live strategy configurations.
 - Family: `KILEMO_2`
 - Variant: `guarded_pnl_balance_C`
 - Flow:
-  - first buy is the lower-ask side for `$2` if ask `<= 0.55`
+  - first buy intent is the lower-ask side for `$2` if ask `<= 0.55`
+  - if that first FAK no-fills or fails, do not repeat the same `$2`; later zero-position attempts are `$1` and require another side, a better price, or the retry wait
   - reevaluate every `5s`
   - after each fill, compute `pnl_if_up`, `pnl_if_down`, and the weaker outcome side
   - buy only the weaker outcome side
@@ -22,16 +23,16 @@ This file keeps a short memory of recent live strategy configurations.
   - if both outcome PnLs are already `>= +0.50`, buy only cheap asks `<= 0.45` or share imbalance `> 25%`
 - Order:
   - FAK buys only
-  - default repair buy size `$1`
-  - initial buy size `$2`
-  - later `$2` only when ask `<= 0.30` or share imbalance `> 40%`
+  - `$2` first intent only
+  - later buy size is projected from `$1.00` to `$2.00` in `$0.20` steps
   - one order intent at a time
   - position updates only from confirmed fills
   - no-fill/error attempts do not update orders, spent, or shares
+  - balance/allowance errors stop the current window
   - order retry on error defaults to `0`
   - max `$20` spent per window
   - max `15` total buys per window
-  - max `8` buys per side
+  - max `5` buys per side
 
 ### 2026-05-21
 - Scope: `BTC` only

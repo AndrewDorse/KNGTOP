@@ -117,12 +117,12 @@ def test_weak_outcome_cheap_repair_uses_1_usd_when_not_imbalanced_or_very_cheap(
     assert runner.positions.orders_up == 2
 
 
-def test_weak_outcome_cheap_repair_uses_2_usd_when_ask_at_or_below_030() -> None:
+def test_weak_outcome_cheap_repair_uses_projected_size_when_ask_at_or_below_030() -> None:
     state = PositionState(spent_up=2.0, shares_up=3.0, spent_down=2.0, shares_down=8.0, orders_up=1, orders_down=1, total_deals=2)
     runner = _runner(1_700_000_000, positions=state)
     clob = _tick(runner, elapsed=10, up=0.30, down=0.70)
 
-    assert clob.calls == [("up-token", 2.0, 0.30)]
+    assert clob.calls == [("up-token", 1.6, 0.30)]
 
 
 def test_high_guard_060_allows_guarded_high_repair_below_or_equal_060() -> None:
@@ -177,12 +177,12 @@ def test_budget_cap_blocks_new_buy() -> None:
 
 
 def test_order_cap_blocks_new_buy() -> None:
-    state = PositionState(spent_up=8.0, shares_up=12.0, spent_down=8.0, shares_down=20.0, orders_up=8, orders_down=4, total_deals=12)
+    state = PositionState(spent_up=8.0, shares_up=12.0, spent_down=8.0, shares_down=20.0, orders_up=5, orders_down=4, total_deals=9)
     runner = _runner(1_700_000_000, positions=state)
     clob = _tick(runner, elapsed=100, up=0.44, down=0.52)
 
     assert clob.calls == []
-    assert runner.positions.orders_up == 8
+    assert runner.positions.orders_up == 5
 
 
 def test_pending_order_blocks_new_buy() -> None:
@@ -200,11 +200,52 @@ def test_failed_order_does_not_update_position_and_waits_before_retry() -> None:
 
     _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
     _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
-    _tick(runner, elapsed=5, up=0.52, down=0.49, clob=clob)
+    _tick(runner, elapsed=10, up=0.52, down=0.49, clob=clob)
 
-    assert clob.calls == [("down-token", 2.0, 0.49), ("down-token", 2.0, 0.49)]
+    assert clob.calls == [("down-token", 2.0, 0.49), ("down-token", 1.0, 0.49)]
     assert runner.positions.total_deals == 1
     assert runner.positions.orders_down == 1
+
+
+def test_initial_two_usd_attempt_happens_only_once_after_nofill() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 0.0}, {"orderID": "buy-2", "size_matched": 2.0}])
+
+    _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
+    _tick(runner, elapsed=5, up=0.52, down=0.49, clob=clob)
+
+    assert clob.calls == [("down-token", 2.0, 0.49), ("up-token", 1.0, 0.52)]
+    assert runner.initial_intent_attempted is True
+    assert all(call[1] < 2.0 for call in clob.calls[1:])
+    assert runner.positions.spent_total() == 1.0
+
+
+def test_after_one_side_fill_next_buy_is_missing_side_not_more_same_side() -> None:
+    state = PositionState(spent_down=2.0, shares_down=8.0, orders_down=1, total_deals=1)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(runner, elapsed=10, up=0.44, down=0.20)
+
+    assert clob.calls == [("up-token", 2.0, 0.44)]
+    assert runner.positions.orders_up == 1
+
+
+def test_later_sizing_can_use_fractional_amount_to_optimize_projected_pnl() -> None:
+    state = PositionState(spent_up=2.0, shares_up=5.0, spent_down=2.0, shares_down=8.43, orders_up=1, orders_down=1, total_deals=2)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(runner, elapsed=10, up=0.35, down=0.70)
+
+    assert clob.calls == [("up-token", 1.2, 0.35)]
+
+
+def test_balance_or_allowance_error_stops_window() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob(responses=[Exception("not enough balance / allowance: balance is not enough")])
+
+    _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
+    _tick(runner, elapsed=10, up=0.52, down=0.49, clob=clob)
+
+    assert len(clob.calls) == 1
+    assert runner.stop_reason == "balance_or_allowance"
 
 
 def test_nofill_does_not_update_position() -> None:

@@ -11,7 +11,8 @@ Current live entrypoint is `BTC` `5m` only and runs guarded PnL-balance candidat
 
 - Initial buy:
   - every decision slot is `5s`
-  - first buy is the lower-ask side for `$2` if ask `<= 0.55`
+  - first buy intent is the lower-ask side for `$2` if ask `<= 0.55`
+  - if that first FAK no-fills or fails, the bot does not repeat the same `$2`; later zero-position attempts are `$1` and require another side, a better price, or the retry wait
 - Guarded PnL repair:
   - after every fill, compute `pnl_if_up`, `pnl_if_down`, and the weaker outcome side
   - buy only the weaker outcome side
@@ -22,20 +23,19 @@ Current live entrypoint is `BTC` `5m` only and runs guarded PnL-balance candidat
   - if both outcomes are already `>= +0.50`, buy only cheap `<= 0.45` or when share imbalance is `> 25%`
 - Order:
   - FAK buys only
-  - `$1` default repair orders
-  - `$2` initial buy
-  - `$2` later only if ask `<= 0.30` or share imbalance `> 40%`
+  - `$2` first intent only
+  - later order size is projected from `$1.00` to `$2.00` in `$0.20` steps to improve worst-case outcome PnL and reduce outcome gap
   - max `$20` spent per window
   - max `15` filled buys per window
-  - max `8` filled buys per side
+  - max `5` filled buys per side
   - live max price = displayed ask, bounded by `KNGTOP_MARKET_BUY_MAX_PRICE`
 
 ## Sizing
 
 - minimum live order is `$1`
-- the strategy may use `$2` on deep/imbalanced repair buys
-- `KNGTOP_NOTIONAL_USD` currently acts as the upper bound for `$2` initial/deep/imbalanced buys
+- `KNGTOP_NOTIONAL_USD` currently acts as the upper bound for the first buy and projected repair buys
 - order retry on error defaults to `0`; failed/no-fill FAK attempts do not update position state
+- balance/allowance errors stop the current window instead of retrying the same order
 
 ## Run
 
