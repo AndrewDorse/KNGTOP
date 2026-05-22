@@ -883,13 +883,14 @@ def _choose_guarded_pnl_buy(
         )
         return None
 
-    side = _missing_position_side(state) or _weak_outcome_side(state)
+    missing_side = _missing_position_side(state)
+    side = missing_side or _weak_outcome_side(state)
     if side is None:
         side = "UP" if up_ask <= down_ask else "DOWN"
     ask_px = up_ask if side == "UP" else down_ask
     other = _other_side(side)
     weak_side = _weak_outcome_side(state)
-    if _missing_position_side(state) is not None and has_real_position(state, other):
+    if missing_side is not None and has_real_position(state, other):
         pass
     elif weak_side is not None and side != weak_side:
         _log_tag("SKIP", slug=runner.contract.slug, side=side, reason="would_increase_stronger_outcome", weak_side=weak_side)
@@ -906,6 +907,23 @@ def _choose_guarded_pnl_buy(
             side=side,
             reason="locked_profit_guard",
             ask=f"{ask_px:.4f}",
+            pnl_if_up=f"{state.pnl_if_up():.4f}",
+            pnl_if_down=f"{state.pnl_if_down():.4f}",
+            imbalance=f"{state.share_imbalance():.4f}",
+        )
+        return None
+
+    if missing_side is not None:
+        missing_cap = FINAL_60_DANGER_CAP if remaining <= 60.0 else HIGH_REPAIR_PRE240_CAP
+        if ask_px <= missing_cap + 1e-12:
+            return BuyAction(side=side, ask_px=ask_px, amount_usd=amount_usd, reason="missing_side_open", enforce_avg_cap=False)
+        _log_tag(
+            "SKIP",
+            slug=runner.contract.slug,
+            side=side,
+            reason="missing_side_cap",
+            ask=f"{ask_px:.4f}",
+            cap=f"{missing_cap:.4f}",
             pnl_if_up=f"{state.pnl_if_up():.4f}",
             pnl_if_down=f"{state.pnl_if_down():.4f}",
             imbalance=f"{state.share_imbalance():.4f}",

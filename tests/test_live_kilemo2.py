@@ -465,6 +465,27 @@ def test_after_one_side_fill_next_buy_is_missing_side_not_more_same_side() -> No
     assert runner.positions.orders_up == 1
 
 
+def test_missing_side_opens_at_061_before_high_repair_projection_guard() -> None:
+    state = PositionState(spent_down=3.0, shares_down=13.5555, orders_down=1, total_deals=1)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=50,
+        up=0.61,
+        down=0.40,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=13.5555, avg_price=3.0 / 13.5555)],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=13.5555, avg_price=3.0 / 13.5555),
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=3.278688525, avg_price=0.61),
+            ],
+        ],
+    )
+
+    assert clob.calls == [("up-token", 2.0, 0.61)]
+    assert runner.positions.orders_up == 1
+
+
 def test_later_sizing_can_use_fractional_amount_to_optimize_projected_pnl() -> None:
     state = PositionState(spent_up=2.0, shares_up=5.0, spent_down=2.0, shares_down=8.43, orders_up=1, orders_down=1, total_deals=2)
     runner = _runner(1_700_000_000, positions=state)
