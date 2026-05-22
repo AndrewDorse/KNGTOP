@@ -71,6 +71,7 @@ class KngtopConfig:
     ws_rest_poll_enabled: bool
     ws_rest_poll_interval_sec: float
     hedge_max_orders_per_side: int
+    max_shares_per_side: float
 
     @staticmethod
     def from_env() -> "KngtopConfig":
@@ -107,4 +108,8 @@ class KngtopConfig:
                 ),
             ),
             hedge_max_orders_per_side=max(1, int(os.environ.get("KNGTOP_HEDGE_MAX_ORDERS_PER_SIDE") or "5")),
+            max_shares_per_side=max(
+                1.0,
+                float(os.environ.get("KNGTOP_MAX_SHARES_PER_SIDE") or os.environ.get("MAX_SHARES_PER_SIDE") or "15.0"),
+            ),
         )

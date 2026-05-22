@@ -33,8 +33,7 @@ NEXT_WINDOW_LOOKAHEAD_SEC = 20
 
 MIN_ORDER_USD = 1.0
 LARGE_ORDER_USD = 2.0
-MAX_TOTAL_DEALS = 15
-MAX_ORDERS_PER_SIDE = 5
+MAX_SHARES_PER_SIDE = 15.0
 
 BOOTSTRAP_CHEAP_CAP = 0.55
 ACTIVE_REPAIR_INTERVAL_SEC = 5
@@ -46,6 +45,9 @@ HIGH_REPAIR_PRE240_CAP = 0.65
 FINAL_60_DANGER_CAP = 0.80
 LOCKED_PROFIT_PNL = 0.50
 LOCKED_PROFIT_IMBALANCE_TRIGGER = 0.25
+LOCKED_PROFIT_STOP_PNL = 0.25
+LOCKED_PROFIT_STOP_AVG_SUM = 0.95
+LOCKED_PROFIT_STOP_IMBALANCE = 0.10
 HIGH_REPAIR_WORST_TARGET = -0.25
 HIGH_REPAIR_SHARE_GAP_TARGET = 0.10
 DANGEROUS_WEAK_PNL = -2.0
@@ -54,7 +56,7 @@ INITIAL_RETRY_PRICE_IMPROVEMENT = 0.02
 MAX_INITIAL_RETRIES_PER_SIDE = 2
 REPAIR_AMOUNT_STEPS = (1.0, 1.2, 1.4, 1.6, 1.8, 2.0)
 MAX_ORDER_PRICE = 0.99
-POST_ORDER_RECONCILE_TIMEOUT_SEC = 2.0
+POST_ORDER_RECONCILE_TIMEOUT_SEC = 8.0
 POST_ORDER_RECONCILE_POLL_SEC = 0.25
 READY = "READY"
 ORDER_IN_FLIGHT = "ORDER_IN_FLIGHT"
@@ -245,8 +247,8 @@ def _other_side(side: str) -> str:
     return "DOWN" if side == "UP" else "UP"
 
 
-def _orders_for_side(state: PositionState, side: str) -> int:
-    return state.orders_up if side == "UP" else state.orders_down
+def _shares_for_side(state: PositionState, side: str) -> float:
+    return state.shares_up if side == "UP" else state.shares_down
 
 
 def _initial_failures_for_side(runner: WindowRunner, side: str) -> int:
@@ -301,13 +303,30 @@ def _current_gap(state: PositionState) -> float:
     return abs(state.pnl_if_up() - state.pnl_if_down())
 
 
+def _configured_max_shares_per_side(cfg: KngtopConfig) -> float:
+    return max(1.0, float(getattr(cfg, "max_shares_per_side", MAX_SHARES_PER_SIDE)))
+
+
+def _share_room(state: PositionState, side: str, cfg: KngtopConfig) -> float:
+    return max(0.0, _configured_max_shares_per_side(cfg) - _shares_for_side(state, side))
+
+
+def _cap_amount_to_share_room(state: PositionState, side: str, ask_px: float, amount_usd: float, cfg: KngtopConfig) -> float | None:
+    if ask_px <= 0.0:
+        return None
+    capped = min(float(amount_usd), _share_room(state, side, cfg) * float(ask_px))
+    if capped + 1e-12 < MIN_ORDER_USD:
+        return None
+    return max(MIN_ORDER_USD, min(capped, float(amount_usd)))
+
+
 def _choose_order_amount_usd(*, side: str, ask_px: float, state: PositionState, cfg: KngtopConfig) -> float | None:
     current_worst = min(state.pnl_if_up(), state.pnl_if_down())
     current_gap = _current_gap(state)
     best_amount: float | None = None
     best_score: tuple[float, float, float, float] | None = None
     for amount in _candidate_amounts(cfg):
-        if not _can_buy(state, side, amount):
+        if not _can_buy(state, side, amount, ask_px=ask_px, cfg=cfg):
             continue
         _pnl_up, _pnl_down, projected_worst, projected_gap, projected_share_gap, _projected_avg_sum = _projected_after_buy(
             state, side, ask_px, amount
@@ -327,16 +346,16 @@ def _bootstrap_amount_usd(cfg: KngtopConfig) -> float:
     return max(MIN_ORDER_USD, min(float(cfg.notional_usd), LARGE_ORDER_USD))
 
 
-def _can_buy(state: PositionState, side: str, amount_usd: float) -> bool:
+def _can_buy(state: PositionState, side: str, amount_usd: float, *, ask_px: float, cfg: KngtopConfig) -> bool:
     if amount_usd + 1e-12 < MIN_ORDER_USD:
+        return False
+    if ask_px <= 0.0:
         return False
     if state.spent_total() + amount_usd > 20.0 + 1e-12:
         return False
-    if state.total_deals >= MAX_TOTAL_DEALS:
+    if _shares_for_side(state, side) + (amount_usd / ask_px) > _configured_max_shares_per_side(cfg) + 1e-12:
         return False
-    if side == "UP":
-        return state.orders_up < MAX_ORDERS_PER_SIDE
-    return state.orders_down < MAX_ORDERS_PER_SIDE
+    return True
 
 
 def _avg_sum(state: PositionState) -> float:
@@ -401,15 +420,12 @@ def _refresh_positions_from_pm(
         if avg_price is not None and 0.0 < float(avg_price) < 1.0:
             cost_by_side[side] += float(size) * float(avg_price)
 
+    del prev_shares_up, prev_shares_down
     orders_up = prev_orders_up
     orders_down = prev_orders_down
-    if shares_by_side["UP"] > prev_shares_up + 1e-6:
-        orders_up += 1
-    elif shares_by_side["UP"] > 1e-6 and orders_up == 0:
+    if shares_by_side["UP"] > 1e-6 and orders_up == 0:
         orders_up = 1
-    if shares_by_side["DOWN"] > prev_shares_down + 1e-6:
-        orders_down += 1
-    elif shares_by_side["DOWN"] > 1e-6 and orders_down == 0:
+    if shares_by_side["DOWN"] > 1e-6 and orders_down == 0:
         orders_down = 1
 
     refreshed = PositionState(
@@ -444,6 +460,10 @@ def _confirm_fill_from_pm(
         prev_shares = pre_state.shares_up if side == "UP" else pre_state.shares_down
         new_shares = refreshed.shares_up if side == "UP" else refreshed.shares_down
         if new_shares > prev_shares + 1e-6:
+            if (refreshed.orders_up if side == "UP" else refreshed.orders_down) <= (
+                pre_state.orders_up if side == "UP" else pre_state.orders_down
+            ):
+                _record_confirmed_order(runner, side=side)
             return True
         time.sleep(POST_ORDER_RECONCILE_POLL_SEC)
     return False
@@ -496,6 +516,24 @@ def _record_order_intent(runner: WindowRunner, *, side: str) -> None:
         runner.intent_count_up += 1
     else:
         runner.intent_count_down += 1
+
+
+def _record_confirmed_order(runner: WindowRunner, *, side: str) -> None:
+    if side == "UP":
+        runner.positions.orders_up += 1
+    else:
+        runner.positions.orders_down += 1
+    runner.positions.total_deals = runner.positions.orders_up + runner.positions.orders_down
+
+
+def _locked_profit_stop_reached(state: PositionState) -> bool:
+    return (
+        state.both_sides_traded()
+        and state.pnl_if_up() >= LOCKED_PROFIT_STOP_PNL - 1e-12
+        and state.pnl_if_down() >= LOCKED_PROFIT_STOP_PNL - 1e-12
+        and _avg_sum(state) <= LOCKED_PROFIT_STOP_AVG_SUM + 1e-12
+        and state.share_imbalance() <= LOCKED_PROFIT_STOP_IMBALANCE + 1e-12
+    )
 
 
 def _log_current_pnl_state(runner: WindowRunner) -> None:
@@ -557,7 +595,7 @@ def _send_fak_buy(
     )
     if ask_px <= 0.0 or ask_px > min(MAX_ORDER_PRICE, float(cfg.market_buy_max_price)) + 1e-12:
         return False
-    if not _can_buy(runner.positions, side, amount_usd):
+    if not _can_buy(runner.positions, side, amount_usd, ask_px=ask_px, cfg=cfg):
         _log_tag(
             "BUDGET BLOCK",
             slug=runner.contract.slug,
@@ -565,6 +603,8 @@ def _send_fak_buy(
             reason=reason,
             amount=f"{amount_usd:.2f}",
             spent_total=f"{runner.positions.spent_total():.2f}",
+            side_shares=f"{_shares_for_side(runner.positions, side):.6f}",
+            max_side_shares=f"{_configured_max_shares_per_side(cfg):.6f}",
             deals=str(runner.positions.total_deals),
         )
         return False
@@ -777,19 +817,25 @@ def _choose_initial_buy(
             continue
         available_sides += 1
         if not runner.initial_intent_attempted:
+            amount = _cap_amount_to_share_room(runner.positions, side, ask_px, _bootstrap_amount_usd(cfg), cfg)
+            if amount is None:
+                continue
             return BuyAction(
                 side=side,
                 ask_px=ask_px,
-                amount_usd=_bootstrap_amount_usd(cfg),
+                amount_usd=amount,
                 reason="initial_lower_ask",
                 enforce_avg_cap=False,
             )
         if not _initial_retry_allowed(runner, side=side, ask_px=ask_px, elapsed=elapsed):
             continue
+        amount = _cap_amount_to_share_room(runner.positions, side, ask_px, MIN_ORDER_USD, cfg)
+        if amount is None:
+            continue
         return BuyAction(
             side=side,
             ask_px=ask_px,
-            amount_usd=MIN_ORDER_USD,
+            amount_usd=amount,
             reason="initial_retry",
             enforce_avg_cap=False,
         )
@@ -824,6 +870,18 @@ def _choose_guarded_pnl_buy(
     state = runner.positions
     if state.total_deals == 0:
         return _choose_initial_buy(runner, up_ask=up_ask, down_ask=down_ask, elapsed=elapsed, cfg=cfg)
+    if _locked_profit_stop_reached(state):
+        runner.stop_reason = "locked_profit"
+        _log_tag(
+            "STOP",
+            slug=runner.contract.slug,
+            reason="locked_profit",
+            pnl_if_up=f"{state.pnl_if_up():.4f}",
+            pnl_if_down=f"{state.pnl_if_down():.4f}",
+            avg_sum=f"{_avg_sum(state):.4f}",
+            imbalance=f"{state.share_imbalance():.4f}",
+        )
+        return None
 
     side = _missing_position_side(state) or _weak_outcome_side(state)
     if side is None:
@@ -835,16 +893,6 @@ def _choose_guarded_pnl_buy(
         pass
     elif weak_side is not None and side != weak_side:
         _log_tag("SKIP", slug=runner.contract.slug, side=side, reason="would_increase_stronger_outcome", weak_side=weak_side)
-        return None
-    if _orders_for_side(state, side) >= _orders_for_side(state, other) + 2:
-        _log_tag(
-            "SKIP",
-            slug=runner.contract.slug,
-            side=side,
-            reason="side_order_gap_guard",
-            side_orders=str(_orders_for_side(state, side)),
-            other_orders=str(_orders_for_side(state, other)),
-        )
         return None
     amount_usd = _choose_order_amount_usd(side=side, ask_px=ask_px, state=state, cfg=cfg)
     if amount_usd is None:
@@ -1142,7 +1190,7 @@ def main() -> None:
         min_order_usd=f"{MIN_ORDER_USD:.2f}",
         first_order_usd=f"{min(float(cfg.notional_usd), LARGE_ORDER_USD):.2f}",
         later_order_usd="1.00-2.00_projected",
-        max_orders_per_side=str(MAX_ORDERS_PER_SIDE),
+        max_shares_per_side=f"{_configured_max_shares_per_side(cfg):.2f}",
     )
 
     while True:

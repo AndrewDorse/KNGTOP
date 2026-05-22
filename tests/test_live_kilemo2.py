@@ -31,6 +31,7 @@ def _cfg() -> KngtopConfig:
         ws_rest_poll_enabled=False,
         ws_rest_poll_interval_sec=1.0,
         hedge_max_orders_per_side=2,
+        max_shares_per_side=15.0,
     )
 
 
@@ -288,19 +289,102 @@ def test_locked_profit_continues_cheap_weak_buys_when_avg_sum_stays_under_cap() 
 def test_budget_cap_blocks_new_buy() -> None:
     state = PositionState(spent_up=10.0, shares_up=20.0, spent_down=10.0, shares_down=21.0, orders_up=5, orders_down=5, total_deals=10)
     runner = _runner(1_700_000_000, positions=state)
-    clob = _tick(runner, elapsed=100, up=0.44, down=0.52)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.44,
+        down=0.52,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=20.0, avg_price=0.50),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=21.0, avg_price=10.0 / 21.0),
+            ]
+        ],
+    )
 
     assert clob.calls == []
     assert runner.positions.spent_total() <= 20.0
 
 
-def test_order_cap_blocks_new_buy() -> None:
+def test_order_count_does_not_block_when_share_room_remains() -> None:
     state = PositionState(spent_up=8.0, shares_up=12.0, spent_down=8.0, shares_down=20.0, orders_up=5, orders_down=4, total_deals=9)
     runner = _runner(1_700_000_000, positions=state)
-    clob = _tick(runner, elapsed=100, up=0.44, down=0.52)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.44,
+        down=0.52,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=12.0, avg_price=8.0 / 12.0),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=20.0, avg_price=0.40),
+            ],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=14.727272727, avg_price=9.2 / 14.727272727),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=20.0, avg_price=0.40),
+            ],
+        ],
+    )
+
+    assert clob.calls == [("up-token", 1.2, 0.44)]
+    assert runner.positions.shares_up <= 15.0
+
+
+def test_share_cap_blocks_new_buy_even_if_order_count_lags() -> None:
+    state = PositionState(spent_up=8.0, shares_up=14.5, spent_down=8.0, shares_down=20.0, orders_up=4, orders_down=4, total_deals=8)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.40,
+        down=0.60,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=14.5, avg_price=8.0 / 14.5),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=20.0, avg_price=0.40),
+            ]
+        ],
+    )
 
     assert clob.calls == []
-    assert runner.positions.orders_up == 5
+    assert runner.positions.shares_up == 14.5
+
+
+def test_bootstrap_amount_is_capped_by_max_shares_per_side() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _tick(
+        runner,
+        elapsed=0,
+        up=0.10,
+        down=0.90,
+        positions_seq=[
+            [],
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=15.0, avg_price=0.10)],
+        ],
+    )
+
+    assert clob.calls == [("up-token", 1.5, 0.10)]
+    assert runner.positions.shares_up == 15.0
+
+
+def test_locked_profit_balanced_state_stops_buying() -> None:
+    state = PositionState(spent_up=6.5, shares_up=14.0, spent_down=6.5, shares_down=14.1, orders_up=4, orders_down=4, total_deals=8)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.44,
+        down=0.44,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=14.0, avg_price=6.5 / 14.0),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=14.1, avg_price=6.5 / 14.1),
+            ]
+        ],
+    )
+
+    assert clob.calls == []
+    assert runner.stop_reason == "locked_profit"
 
 
 def test_pending_order_blocks_new_buy() -> None:

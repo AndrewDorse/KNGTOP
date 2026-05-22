@@ -28,14 +28,14 @@ Current live entrypoint is `BTC` `5m` only and runs guarded PnL-balance candidat
   - `$2` first intent only
   - later order size is projected from `$1.00` to `$2.00` in `$0.20` steps to improve worst-case outcome PnL and reduce outcome gap
   - max `$20` spent per window
-  - max `15` confirmed fills per window
-  - max `5` confirmed fills per side
+  - max `15` PM-confirmed shares per side, configurable with `KNGTOP_MAX_SHARES_PER_SIDE`
   - live max price = displayed ask, bounded by `KNGTOP_MARKET_BUY_MAX_PRICE`
 
 ## Sizing
 
 - minimum live order is `$1`
 - `KNGTOP_NOTIONAL_USD` currently acts as the upper bound for the first buy and projected repair buys
+- `KNGTOP_MAX_SHARES_PER_SIDE` defaults to `15.0`; buys are blocked if the remaining share room cannot fit at least the `$1` minimum order
 - order retry on error defaults to `0`; failed/no-fill FAK attempts do not update position state
 - balance/allowance errors stop the current window instead of retrying the same order
 

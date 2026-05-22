@@ -31,8 +31,7 @@ This file keeps a short memory of recent live strategy configurations.
   - balance/allowance errors stop the current window
   - order retry on error defaults to `0`
   - max `$20` spent per window
-  - max `15` confirmed fills per window
-  - max `5` confirmed fills per side
+  - max `15` PM-confirmed shares per side via `KNGTOP_MAX_SHARES_PER_SIDE`
 
 ### 2026-05-21
 - Scope: `BTC` only

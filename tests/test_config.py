@@ -53,6 +53,18 @@ def test_market_buy_max_price_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.market_buy_max_price == 0.85
 
 
+def test_max_shares_per_side_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
+    monkeypatch.delenv("KNGTOP_MAX_SHARES_PER_SIDE", raising=False)
+    cfg = KngtopConfig.from_env()
+    assert cfg.max_shares_per_side == 15.0
+
+    monkeypatch.setenv("KNGTOP_MAX_SHARES_PER_SIDE", "12.5")
+    cfg = KngtopConfig.from_env()
+    assert cfg.max_shares_per_side == 12.5
+
+
 def test_ws_rest_poll_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
     monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
