@@ -51,6 +51,9 @@ MAX_ORDER_PRICE = 0.99
 READY = "READY"
 ORDER_IN_FLIGHT = "ORDER_IN_FLIGHT"
 WAIT_NEXT_DECISION = "WAIT_NEXT_DECISION"
+BOOTSTRAP_RETRY_MIN_IMPROVEMENT = 0.02
+BOOTSTRAP_RETRY_MIN_WAIT_SEC = 5.0
+BOOTSTRAP_MAX_RETRIES_PER_SIDE = 2
 
 
 @dataclass(slots=True)
@@ -115,6 +118,12 @@ class WindowRunner:
     last_position_refresh_ts: float = 0.0
     execution_state: str = READY
     next_decision_ts: float = 0.0
+    bootstrap_first_side_attempted: str | None = None
+    bootstrap_first_side_filled: bool = False
+    bootstrap_last_attempt_price: float = 0.0
+    bootstrap_last_attempt_ts: float = -10_000.0
+    bootstrap_fail_count_up: int = 0
+    bootstrap_fail_count_down: int = 0
     stop_reason: str | None = None
 
     def start_sec(self) -> int | None:
@@ -225,6 +234,23 @@ def _bootstrap_amount_usd(cfg: KngtopConfig) -> float:
     return max(MIN_ORDER_USD, min(float(cfg.notional_usd), LARGE_ORDER_USD))
 
 
+def _bootstrap_fail_count(runner: WindowRunner, side: str) -> int:
+    return runner.bootstrap_fail_count_up if side == "UP" else runner.bootstrap_fail_count_down
+
+
+def _record_bootstrap_result(runner: WindowRunner, *, side: str, ask_px: float, elapsed: float, filled: bool) -> None:
+    runner.bootstrap_first_side_attempted = side
+    runner.bootstrap_last_attempt_price = ask_px
+    runner.bootstrap_last_attempt_ts = elapsed
+    if filled:
+        runner.bootstrap_first_side_filled = True
+        return
+    if side == "UP":
+        runner.bootstrap_fail_count_up += 1
+    else:
+        runner.bootstrap_fail_count_down += 1
+
+
 def _can_buy(state: PositionState, side: str, amount_usd: float) -> bool:
     if amount_usd + 1e-12 < MIN_ORDER_USD:
         return False
@@ -325,6 +351,10 @@ def _send_fak_buy(
         return False
 
     _log_tag("INTENT CREATED", slug=runner.contract.slug, side=side, reason=reason, ask=f"{ask_px:.4f}", amount=f"{amount_usd:.2f}")
+    if reason == "bootstrap_cheaper":
+        runner.bootstrap_first_side_attempted = side
+        runner.bootstrap_last_attempt_price = ask_px
+        runner.bootstrap_last_attempt_ts = elapsed
     runner.pending_order = True
     runner.execution_state = ORDER_IN_FLIGHT
     runner.pending_side = side
@@ -342,6 +372,8 @@ def _send_fak_buy(
                     payload = clob.market_buy_usdc(token, amount_usd, max_price=min(MAX_ORDER_PRICE, float(cfg.market_buy_max_price), ask_px))
                     filled_shares = _extract_filled_shares(payload)
                     if filled_shares <= 0.000001:
+                        if reason == "bootstrap_cheaper":
+                            _record_bootstrap_result(runner, side=side, ask_px=ask_px, elapsed=elapsed, filled=False)
                         _log_tag(
                             "ORDER NOFILL",
                             slug=runner.contract.slug,
@@ -356,6 +388,8 @@ def _send_fak_buy(
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
                     if "no orders found to match with FAK order" in str(exc):
+                        if reason == "bootstrap_cheaper":
+                            _record_bootstrap_result(runner, side=side, ask_px=ask_px, elapsed=elapsed, filled=False)
                         _log_tag(
                             "ORDER FAILED",
                             slug=runner.contract.slug,
@@ -370,6 +404,8 @@ def _send_fak_buy(
                     time.sleep(0.5)
             else:
                 if last_error is not None:
+                    if reason == "bootstrap_cheaper":
+                        _record_bootstrap_result(runner, side=side, ask_px=ask_px, elapsed=elapsed, filled=False)
                     _log_tag(
                         "ORDER FAILED",
                         slug=runner.contract.slug,
@@ -383,6 +419,8 @@ def _send_fak_buy(
                 return False
 
         _apply_position_buy(runner.positions, side, ask_px, amount_usd)
+        if reason == "bootstrap_cheaper":
+            _record_bootstrap_result(runner, side=side, ask_px=ask_px, elapsed=elapsed, filled=True)
         runner.last_successful_buy_ts = elapsed
         runner.last_position_refresh_ts = elapsed
         _log_tag(
@@ -422,8 +460,6 @@ def _choose_active_repair_side(runner: WindowRunner, *, up_ask: float, down_ask:
 
     if remaining <= 60.0:
         return smaller
-    if state.share_imbalance() > IMBALANCE_TRIGGER + 1e-12:
-        return smaller
 
     smaller_avg = state.avg_up() if smaller == "UP" else state.avg_down()
     bigger_avg = state.avg_down() if smaller == "UP" else state.avg_up()
@@ -431,6 +467,9 @@ def _choose_active_repair_side(runner: WindowRunner, *, up_ask: float, down_ask:
         return smaller
     if bigger_avg > 1e-12 and bigger_ask <= bigger_avg - DROP_TRIGGER + 1e-12:
         return bigger
+
+    if state.share_imbalance() > IMBALANCE_TRIGGER + 1e-12:
+        return smaller
 
     if _avg_sum(state) <= AVG_SUM_CAP + 1e-12:
         if smaller_ask <= REPAIR_CHEAP_CAP + 1e-12:
@@ -457,10 +496,42 @@ def _maybe_bootstrap_first_leg(
 ) -> bool:
     if runner.positions.total_deals > 0 or elapsed >= 15.0:
         return False
-    side = "UP" if up_ask <= down_ask else "DOWN"
+    cheaper_side = "UP" if up_ask <= down_ask else "DOWN"
+    other_side = "DOWN" if cheaper_side == "UP" else "UP"
+    side = cheaper_side
     ask_px = up_ask if side == "UP" else down_ask
     if ask_px > BOOTSTRAP_CHEAP_CAP + 1e-12:
         return False
+    if runner.bootstrap_first_side_filled:
+        return False
+
+    attempted_side = runner.bootstrap_first_side_attempted
+    if attempted_side is not None:
+        attempted_fail_count = _bootstrap_fail_count(runner, attempted_side)
+        ask_for_attempted = up_ask if attempted_side == "UP" else down_ask
+        can_retry_attempted = (
+            ask_for_attempted <= BOOTSTRAP_CHEAP_CAP + 1e-12
+            and (
+                ask_for_attempted <= runner.bootstrap_last_attempt_price - BOOTSTRAP_RETRY_MIN_IMPROVEMENT + 1e-12
+                or elapsed >= runner.bootstrap_last_attempt_ts + BOOTSTRAP_RETRY_MIN_WAIT_SEC - 1e-12
+            )
+        )
+        if attempted_fail_count < BOOTSTRAP_MAX_RETRIES_PER_SIDE:
+            if not can_retry_attempted:
+                return False
+            side = attempted_side
+            ask_px = ask_for_attempted
+        else:
+            switched_ask = up_ask if other_side == "UP" else down_ask
+            if side != attempted_side and switched_ask <= BOOTSTRAP_CHEAP_CAP + 1e-12:
+                side = other_side
+                ask_px = switched_ask
+            elif can_retry_attempted:
+                side = attempted_side
+                ask_px = ask_for_attempted
+            else:
+                return False
+
     return _send_fak_buy(
         runner=runner,
         side=side,
@@ -505,7 +576,7 @@ def _maybe_bootstrap_second_leg(
                 remaining=f"{remaining:.1f}",
             )
         return False
-    amount_usd = LARGE_ORDER_USD if ask_px <= 0.35 + 1e-12 else _bootstrap_amount_usd(cfg)
+    amount_usd = LARGE_ORDER_USD if ask_px <= 0.30 + 1e-12 else MIN_ORDER_USD
     return _send_fak_buy(
         runner=runner,
         side=missing,

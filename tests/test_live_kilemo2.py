@@ -133,7 +133,7 @@ def test_tick_runner_forces_opposite_bootstrap_side_at_15s() -> None:
         fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_020, timezone.utc)
         _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
 
-    assert fake_clob.calls == [("down-token", 2.0, 0.66)]
+    assert fake_clob.calls == [("down-token", 1.0, 0.66)]
     assert runner.positions.orders_down == 1
     assert runner.positions.both_sides_traded()
 
@@ -196,7 +196,7 @@ def test_tick_runner_rescue_60_cap080_buys_missing_side() -> None:
         fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_240, timezone.utc)
         _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
 
-    assert fake_clob.calls == [("down-token", 2.0, 0.79)]
+    assert fake_clob.calls == [("down-token", 1.0, 0.79)]
     assert runner.positions.orders_down == 1
     assert runner.positions.both_sides_traded()
 
@@ -237,10 +237,36 @@ def test_bootstrap_opposite_fak_failure_does_not_mark_side_open() -> None:
         fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_030, timezone.utc)
         _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
 
-    assert fake_clob.calls == [("up-token", 2.0, 0.7)]
+    assert fake_clob.calls == [("up-token", 1.0, 0.7)]
     assert runner.positions.orders_up == 0
     assert runner.positions.shares_up == 0.0
     assert not runner.positions.both_sides_traded()
+
+
+def test_repeated_nofill_cannot_send_same_bootstrap_2usd_every_second() -> None:
+    runner = _runner(1_700_000_000)
+    fake_clob = _FakeClob(
+        responses=[
+            Exception("PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]"),
+            Exception("PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]"),
+        ]
+    )
+    cfg = _cfg()
+
+    class _Poly:
+        def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            del max_age_sec
+            return (0.49, 0.50) if asset_id == "up-token" else (0.49, 0.50)
+
+    with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_001, timezone.utc)
+        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_002, timezone.utc)
+        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_003, timezone.utc)
+        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+
+    assert fake_clob.calls == [("up-token", 2.0, 0.5)]
 
 
 def test_missing_side_retries_after_fak_failure() -> None:
@@ -272,7 +298,7 @@ def test_missing_side_retries_after_fak_failure() -> None:
         fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_041, timezone.utc)
         _tick_runner(runner, poly=poly, binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
 
-    assert fake_clob.calls == [("up-token", 2.0, 0.7), ("up-token", 2.0, 0.48)]
+    assert fake_clob.calls == [("up-token", 1.0, 0.7), ("up-token", 1.0, 0.48)]
     assert runner.positions.orders_up == 1
     assert runner.positions.shares_up > 0.0
     assert runner.positions.both_sides_traded()
@@ -301,7 +327,7 @@ def test_missing_side_bought_when_price_becomes_cheap_after_failed_bootstrap() -
     fake_clob = _FakeClob(
         responses=[
             Exception("PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]"),
-            {"orderID": "buy-2", "size_matched": 4.16},
+            {"orderID": "buy-2", "size_matched": 2.08},
         ]
     )
     cfg = _cfg()
@@ -444,7 +470,7 @@ def test_failed_order_sets_ready_and_retries_after_1s() -> None:
     fake_clob = _FakeClob(
         responses=[
             Exception("PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]"),
-            {"orderID": "buy-2", "size_matched": 4.16},
+            {"orderID": "buy-2", "size_matched": 2.08},
         ]
     )
     cfg = _cfg()
@@ -463,7 +489,7 @@ def test_failed_order_sets_ready_and_retries_after_1s() -> None:
         fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_031, timezone.utc)
         _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
 
-    assert fake_clob.calls == [("up-token", 2.0, 0.48), ("up-token", 2.0, 0.48)]
+    assert fake_clob.calls == [("up-token", 1.0, 0.48), ("up-token", 1.0, 0.48)]
     assert runner.positions.orders_up == 1
 
 
@@ -482,7 +508,7 @@ def test_100_ticks_in_1_second_produce_max_1_buy_attempt() -> None:
             fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_030, timezone.utc)
             _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
 
-    assert fake_clob.calls == [("up-token", 2.0, 0.48)]
+    assert fake_clob.calls == [("up-token", 1.0, 0.48)]
 
 
 def test_position_state_updates_only_from_real_fill() -> None:
@@ -644,7 +670,7 @@ def test_missing_side_priority_before_active_repair() -> None:
         fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_090, timezone.utc)
         _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
 
-    assert fake_clob.calls == [("down-token", 2.0, 0.66)]
+    assert fake_clob.calls == [("down-token", 1.0, 0.66)]
 
 
 def test_strategy_matches_backtest_decision_sequence_on_sample_window() -> None:
@@ -677,6 +703,49 @@ def test_strategy_matches_backtest_decision_sequence_on_sample_window() -> None:
 
     assert fake_clob.calls[:2] == [
         ("up-token", 2.0, 0.52),
-        ("down-token", 2.0, 0.66),
+        ("down-token", 1.0, 0.66),
     ]
     assert side == "UP"
+
+
+def test_after_both_sides_open_active_repair_continues_on_price_swings() -> None:
+    runner = _runner(
+        1_700_000_000,
+        positions=PositionState(spent_up=2.0, shares_up=4.0, spent_down=1.0, shares_down=1.5151515, orders_up=1, orders_down=1, total_deals=2),
+    )
+    fake_clob = _FakeClob()
+    cfg = _cfg()
+
+    class _Poly:
+        def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            del max_age_sec
+            return (0.00, 0.01) if asset_id == "up-token" else (0.79, 0.80)
+
+    with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_090, timezone.utc)
+        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+
+    assert fake_clob.calls == [("up-token", 2.0, 0.01)]
+
+
+def test_bot_does_not_stop_at_avg_sum_0985_if_side_gets_cheap() -> None:
+    up_shares = 2.0 / 0.50
+    down_shares = 2.0 / 0.485
+    runner = _runner(
+        1_700_000_000,
+        positions=PositionState(spent_up=2.0, shares_up=up_shares, spent_down=2.0, shares_down=down_shares, orders_up=1, orders_down=1, total_deals=2),
+    )
+    fake_clob = _FakeClob()
+    cfg = _cfg()
+    assert _avg_sum(runner.positions) > 0.98
+
+    class _Poly:
+        def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            del max_age_sec
+            return (0.33, 0.35) if asset_id == "up-token" else (0.79, 0.80)
+
+    with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_090, timezone.utc)
+        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+
+    assert fake_clob.calls == [("up-token", 1.0, 0.35)]
