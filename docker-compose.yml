@@ -1,4 +1,4 @@
-# KNGTOP — copy .env.example to .env, set POLY_DRY_RUN=false for live $1 FAK buys
+# KNGTOP - copy .env.example to .env, set POLY_DRY_RUN=false for live FAK buys
 services:
   kngtop:
     build: .

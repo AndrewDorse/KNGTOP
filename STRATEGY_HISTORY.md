@@ -8,22 +8,28 @@ This file keeps a short memory of recent live strategy configurations.
 - Scope: `BTC` only
 - Windows: `5m` only
 - Family: `KILEMO_2`
-- Variant: `bootstrap_active_repair_C + rescue_60_cap080`
+- Variant: `guarded_pnl_balance_C`
 - Flow:
-  - bootstrap cheaper side before `15s` at ask `<= 0.55` for `$1`
-  - at `15s`, if still one-sided, open the missing side at ask `<= 0.70` for `$1`
-  - once both sides are open, reevaluate every `15s`
-  - if share imbalance `> 20%`, buy the smaller-share side
-  - if either ask is at least `0.02` below that side's average entry, buy that side
-  - if `avg_up + avg_down <= 0.95`, allow extra averaging buys on asks `<= 0.45`
-  - if shares are near-balanced and one ask `<= 0.35`, buy that side
-  - last `60s`: only smaller-share-side repairs
-  - rescue at `60s` remaining if still one-sided, buying the missing side at ask `<= 0.80`
+  - first buy is the lower-ask side for `$2` if ask `<= 0.55`
+  - reevaluate every `5s`
+  - after each fill, compute `pnl_if_up`, `pnl_if_down`, and the weaker outcome side
+  - buy only the weaker outcome side
+  - cheap weak repair: ask `<= 0.45`
+  - guarded high repair C: high guard `<= 0.60`
+  - if ask `> 0.60`, allow only when projected worst PnL reaches `>= -0.25` or projected share gap reaches `<= 10%`
+  - pre-240s hard high cap `0.65`
+  - final `60s`: up to `0.80` only if the weak outcome is dangerously weak
+  - if both outcome PnLs are already `>= +0.50`, buy only cheap asks `<= 0.45` or share imbalance `> 25%`
 - Order:
   - FAK buys only
-  - no artificial delay in live
-  - default buy size `$1`
-  - `$2` only when ask `<= 0.30` or imbalance `> 40%`
+  - default repair buy size `$1`
+  - initial buy size `$2`
+  - later `$2` only when ask `<= 0.30` or share imbalance `> 40%`
+  - one order intent at a time
+  - position updates only from confirmed fills
+  - no-fill/error attempts do not update orders, spent, or shares
+  - order retry on error defaults to `0`
+  - max `$20` spent per window
   - max `15` total buys per window
   - max `8` buys per side
 
