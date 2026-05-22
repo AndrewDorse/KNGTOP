@@ -281,6 +281,11 @@ def _next_retry_delay(reason: str) -> float:
     return float(ACTIVE_REPAIR_INTERVAL_SEC)
 
 
+def _schedule_next_decision(runner: WindowRunner, *, now_ts: float, reason: str) -> None:
+    runner.execution_state = WAIT_NEXT_DECISION
+    runner.next_decision_ts = now_ts + _next_retry_delay(reason)
+
+
 def _send_fak_buy(
     *,
     runner: WindowRunner,
@@ -293,23 +298,39 @@ def _send_fak_buy(
     cfg: KngtopConfig,
     enforce_avg_cap: bool = True,
 ) -> bool:
-    if runner.pending_order:
-        _log_tag("BUY SKIP PENDING", slug=runner.contract.slug, side=side, reason=reason, pending_side=runner.pending_side)
-        return False
     if ask_px <= 0.0 or ask_px > min(MAX_ORDER_PRICE, float(cfg.market_buy_max_price)) + 1e-12:
         return False
     if not _can_buy(runner.positions, side, amount_usd):
+        _log_tag(
+            "BUDGET BLOCK",
+            slug=runner.contract.slug,
+            side=side,
+            reason=reason,
+            amount=f"{amount_usd:.2f}",
+            spent_total=f"{runner.positions.spent_total():.2f}",
+            deals=str(runner.positions.total_deals),
+        )
         return False
     after_avg_sum = _avg_after_buy(runner.positions, side, ask_px, amount_usd)
     if enforce_avg_cap and after_avg_sum > AVG_SUM_CAP + 1e-12:
+        _log_tag(
+            "AVG_SUM BLOCK",
+            slug=runner.contract.slug,
+            side=side,
+            reason=reason,
+            ask=f"{ask_px:.4f}",
+            amount=f"{amount_usd:.2f}",
+            post_avg_sum=f"{after_avg_sum:.4f}",
+        )
         return False
 
+    _log_tag("INTENT CREATED", slug=runner.contract.slug, side=side, reason=reason, ask=f"{ask_px:.4f}", amount=f"{amount_usd:.2f}")
     runner.pending_order = True
     runner.execution_state = ORDER_IN_FLIGHT
     runner.pending_side = side
     runner.pending_reason = reason
     runner.pending_created_ts = elapsed
-    _log_tag("BUY ATTEMPT", slug=runner.contract.slug, side=side, reason=reason, ask=f"{ask_px:.4f}", amount=f"{amount_usd:.2f}")
+    _log_tag("ORDER SENT", slug=runner.contract.slug, side=side, reason=reason, ask=f"{ask_px:.4f}", amount=f"{amount_usd:.2f}")
 
     try:
         token = _token_for_side(runner, side)
@@ -322,22 +343,21 @@ def _send_fak_buy(
                     filled_shares = _extract_filled_shares(payload)
                     if filled_shares <= 0.000001:
                         _log_tag(
-                            "BUY NOFILL",
+                            "ORDER NOFILL",
                             slug=runner.contract.slug,
                             side=side,
                             reason=reason,
                             ask=f"{ask_px:.4f}",
                             amount=f"{amount_usd:.2f}",
                         )
-                        runner.execution_state = READY
-                        runner.next_decision_ts = datetime.now(timezone.utc).timestamp() + _next_retry_delay(reason)
+                        _schedule_next_decision(runner, now_ts=datetime.now(timezone.utc).timestamp(), reason=reason)
                         return False
                     break
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
                     if "no orders found to match with FAK order" in str(exc):
                         _log_tag(
-                            "BUY FAILED",
+                            "ORDER FAILED",
                             slug=runner.contract.slug,
                             side=side,
                             reason=reason,
@@ -345,14 +365,13 @@ def _send_fak_buy(
                             amount=f"{amount_usd:.2f}",
                             error=str(exc),
                         )
-                        runner.execution_state = READY
-                        runner.next_decision_ts = datetime.now(timezone.utc).timestamp() + _next_retry_delay(reason)
+                        _schedule_next_decision(runner, now_ts=datetime.now(timezone.utc).timestamp(), reason=reason)
                         return False
                     time.sleep(0.5)
             else:
                 if last_error is not None:
                     _log_tag(
-                        "BUY FAILED",
+                        "ORDER FAILED",
                         slug=runner.contract.slug,
                         side=side,
                         reason=reason,
@@ -360,17 +379,14 @@ def _send_fak_buy(
                         amount=f"{amount_usd:.2f}",
                         error=str(last_error),
                     )
-                    runner.execution_state = READY
-                    runner.next_decision_ts = datetime.now(timezone.utc).timestamp() + _next_retry_delay(reason)
+                    _schedule_next_decision(runner, now_ts=datetime.now(timezone.utc).timestamp(), reason=reason)
                 return False
 
         _apply_position_buy(runner.positions, side, ask_px, amount_usd)
         runner.last_successful_buy_ts = elapsed
         runner.last_position_refresh_ts = elapsed
-        runner.execution_state = READY
-        runner.next_decision_ts = datetime.now(timezone.utc).timestamp() + _next_retry_delay(reason)
         _log_tag(
-            "BUY FILLED",
+            "ORDER FILLED",
             slug=runner.contract.slug,
             side=side,
             reason=reason,
@@ -380,6 +396,15 @@ def _send_fak_buy(
             avg_sum=f"{_avg_sum(runner.positions):.4f}",
             imbalance=f"{runner.positions.share_imbalance():.4f}",
         )
+        _log_tag(
+            "POSITION UPDATED",
+            slug=runner.contract.slug,
+            spent_total=f"{runner.positions.spent_total():.2f}",
+            up_shares=f"{runner.positions.shares_up:.6f}",
+            down_shares=f"{runner.positions.shares_down:.6f}",
+            avg_sum=f"{_avg_sum(runner.positions):.4f}",
+        )
+        _schedule_next_decision(runner, now_ts=datetime.now(timezone.utc).timestamp(), reason=reason)
         return True
     finally:
         runner.pending_order = False
