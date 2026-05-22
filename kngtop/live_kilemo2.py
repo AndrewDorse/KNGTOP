@@ -55,7 +55,6 @@ DANGEROUS_WEAK_PNL = -2.0
 INITIAL_RETRY_WAIT_SEC = 10.0
 INITIAL_RETRY_PRICE_IMPROVEMENT = 0.02
 MAX_INITIAL_RETRIES_PER_SIDE = 2
-REPAIR_AMOUNT_STEPS = (1.0, 1.2, 1.4, 1.6, 1.8, 2.0)
 MAX_ORDER_PRICE = 0.99
 POST_ORDER_RECONCILE_TIMEOUT_SEC = 8.0
 POST_ORDER_RECONCILE_POLL_SEC = 0.25
@@ -296,7 +295,9 @@ def _projected_after_buy(state: PositionState, side: str, ask_px: float, amount_
 
 def _candidate_amounts(cfg: KngtopConfig) -> tuple[float, ...]:
     cap = max(MIN_ORDER_USD, min(float(cfg.notional_usd), LARGE_ORDER_USD))
-    amounts = tuple(amount for amount in REPAIR_AMOUNT_STEPS if MIN_ORDER_USD - 1e-12 <= amount <= cap + 1e-12)
+    start_cents = int(round(MIN_ORDER_USD * 100))
+    cap_cents = int(round(cap * 100))
+    amounts = tuple(cents / 100.0 for cents in range(start_cents, cap_cents + 1))
     return amounts or (MIN_ORDER_USD,)
 
 
@@ -344,19 +345,32 @@ def _share_gap_after_buy(state: PositionState, side: str, ask_px: float, amount_
     return abs(up_shares - down_shares)
 
 
-def _repair_buy_keeps_balance(state: PositionState, side: str, ask_px: float, amount_usd: float, cfg: KngtopConfig) -> bool:
+def _repair_buy_keeps_balance(
+    state: PositionState,
+    side: str,
+    ask_px: float,
+    amount_usd: float,
+    cfg: KngtopConfig,
+    preferred_larger_side: str | None,
+) -> bool:
     if not state.both_sides_traded():
         return True
     current_side_shares = _shares_for_side(state, side)
     other_shares = _shares_for_side(state, _other_side(side))
-    if current_side_shares > other_shares + 1e-12:
-        return False
     projected_side_shares = current_side_shares + amount_usd / max(ask_px, 1e-9)
     current_abs_share_gap = abs(current_side_shares - other_shares)
     projected_abs_share_gap = abs(projected_side_shares - other_shares)
+    if (
+        projected_abs_share_gap > _configured_max_share_gap(cfg) + 1e-12
+        and projected_abs_share_gap >= current_abs_share_gap - 1e-12
+    ):
+        return False
+    if side != preferred_larger_side and projected_side_shares > other_shares + 1e-12:
+        return False
     return (
-        projected_abs_share_gap <= _configured_max_share_gap(cfg) + 1e-12
+        side == preferred_larger_side
         or projected_abs_share_gap < current_abs_share_gap - 1e-12
+        or current_side_shares <= other_shares + 1e-12
     )
 
 
@@ -375,7 +389,30 @@ def _choose_order_amount_usd(
     state: PositionState,
     cfg: KngtopConfig,
     enforce_repair_guards: bool = False,
+    preferred_larger_side: str | None = None,
 ) -> float | None:
+    current_worst_side = _weak_outcome_side(state)
+    current_worst_side_pnl = state.pnl_if_up() if current_worst_side == "UP" else state.pnl_if_down()
+    if current_worst_side is not None and current_worst_side_pnl < -1e-12 and side == current_worst_side:
+        best_amount: float | None = None
+        best_score: tuple[float, int, float] | None = None
+        for amount in _candidate_amounts(cfg):
+            if not _can_buy(state, side, amount, ask_px=ask_px, cfg=cfg):
+                continue
+            pnl_up, pnl_down, _projected_worst, _projected_gap, _projected_share_gap, projected_avg_sum = _projected_after_buy(
+                state, side, ask_px, amount
+            )
+            projected_side_pnl = pnl_up if side == "UP" else pnl_down
+            improvement = projected_side_pnl - current_worst_side_pnl
+            if improvement <= 1e-12:
+                continue
+            both_profitable = int(pnl_up >= -1e-12 and pnl_down >= -1e-12)
+            score = (improvement, both_profitable, -projected_avg_sum)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_amount = amount
+        return best_amount
+
     best_amount: float | None = None
     best_score: tuple[int, int, float, float, float] | None = None
     for amount in _candidate_amounts(cfg):
@@ -388,7 +425,7 @@ def _choose_order_amount_usd(
         if enforce_repair_guards:
             if not _repair_avg_sum_allowed(state, projected_avg_sum, cfg):
                 continue
-            if not _repair_buy_keeps_balance(state, side, ask_px, amount, cfg):
+            if not _repair_buy_keeps_balance(state, side, ask_px, amount, cfg, preferred_larger_side):
                 continue
             current_abs_share_gap = abs(state.shares_up - state.shares_down)
             if (
@@ -405,7 +442,14 @@ def _choose_order_amount_usd(
     return best_amount
 
 
-def _repair_candidate_skip_reason(*, side: str, ask_px: float, state: PositionState, cfg: KngtopConfig) -> str:
+def _repair_candidate_skip_reason(
+    *,
+    side: str,
+    ask_px: float,
+    state: PositionState,
+    cfg: KngtopConfig,
+    preferred_larger_side: str | None = None,
+) -> str:
     saw_buyable = False
     saw_avg_sum_pass = False
     saw_share_gap_pass = False
@@ -419,7 +463,7 @@ def _repair_candidate_skip_reason(*, side: str, ask_px: float, state: PositionSt
         del _pnl_up, _pnl_down, _projected_worst, _projected_gap, _projected_share_gap
         if _repair_avg_sum_allowed(state, projected_avg_sum, cfg):
             saw_avg_sum_pass = True
-        if not _repair_buy_keeps_balance(state, side, ask_px, amount, cfg):
+        if not _repair_buy_keeps_balance(state, side, ask_px, amount, cfg, preferred_larger_side):
             continue
         current_abs_share_gap = abs(state.shares_up - state.shares_down)
         projected_abs_share_gap = _share_gap_after_buy(state, side, ask_px, amount)
@@ -969,6 +1013,7 @@ def _choose_guarded_pnl_buy(
     elapsed: float,
     remaining: float,
     cfg: KngtopConfig,
+    current_winning_side: str | None = None,
 ) -> BuyAction | None:
     state = runner.positions
     if state.total_deals == 0:
@@ -990,6 +1035,16 @@ def _choose_guarded_pnl_buy(
     missing_side = _missing_position_side(state)
     if missing_side is not None:
         side = missing_side
+    elif state.both_sides_traded() and _weak_outcome_side(state) is not None and (
+        (state.pnl_if_up() if _weak_outcome_side(state) == "UP" else state.pnl_if_down()) < -1e-12
+    ):
+        side = _weak_outcome_side(state)
+    elif (
+        current_winning_side is not None
+        and state.both_sides_traded()
+        and _shares_for_side(state, current_winning_side) <= _shares_for_side(state, _other_side(current_winning_side)) + 1e-12
+    ):
+        side = current_winning_side
     elif state.both_sides_traded() and abs(state.shares_up - state.shares_down) > 1e-12:
         side = "UP" if state.shares_up < state.shares_down else "DOWN"
     else:
@@ -1016,6 +1071,7 @@ def _choose_guarded_pnl_buy(
         state=state,
         cfg=cfg,
         enforce_repair_guards=enforce_repair_guards,
+        preferred_larger_side=current_winning_side,
     )
     if amount_usd is None:
         _log_tag(
@@ -1023,7 +1079,13 @@ def _choose_guarded_pnl_buy(
             slug=runner.contract.slug,
             side=side,
             reason=(
-                _repair_candidate_skip_reason(side=side, ask_px=ask_px, state=state, cfg=cfg)
+                _repair_candidate_skip_reason(
+                    side=side,
+                    ask_px=ask_px,
+                    state=state,
+                    cfg=cfg,
+                    preferred_larger_side=current_winning_side,
+                )
                 if enforce_repair_guards
                 else "no_valid_amount"
             ),
@@ -1105,6 +1167,7 @@ def _maybe_guarded_pnl_buy(
     remaining: float,
     clob: KngtopClob | None,
     cfg: KngtopConfig,
+    current_winning_side: str | None = None,
 ) -> bool:
     slot = int(elapsed) // ACTIVE_REPAIR_INTERVAL_SEC
     if slot <= runner.last_repair_slot:
@@ -1118,6 +1181,7 @@ def _maybe_guarded_pnl_buy(
         elapsed=elapsed,
         remaining=remaining,
         cfg=cfg,
+        current_winning_side=current_winning_side,
     )
     if action is None:
         return False
@@ -1247,8 +1311,15 @@ def _tick_runner(
         )
         if runner.window_open_px is None:
             return
-    if binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec) is None:
+    current_px = binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec)
+    if current_px is None:
         return
+    current_winning_side: str | None = None
+    if runner.window_open_px is not None:
+        if float(current_px) > float(runner.window_open_px) + 1e-12:
+            current_winning_side = "UP"
+        elif float(current_px) < float(runner.window_open_px) - 1e-12:
+            current_winning_side = "DOWN"
     up_quote = poly.best_bid_ask_for(runner.contract.up.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     down_quote = poly.best_bid_ask_for(runner.contract.down.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     if up_quote is None or down_quote is None:
@@ -1264,6 +1335,7 @@ def _tick_runner(
         remaining=remaining,
         clob=clob,
         cfg=cfg,
+        current_winning_side=current_winning_side,
     ):
         return
     runner.execution_state = WAIT_NEXT_DECISION

@@ -148,7 +148,7 @@ def test_initial_buy_skips_when_lower_ask_above_bootstrap_cap() -> None:
     assert runner.positions.total_deals == 0
 
 
-def test_weak_outcome_cheap_repair_blocks_when_projected_avg_sum_is_bad() -> None:
+def test_weak_outcome_cheap_repair_buys_when_worst_side_improves() -> None:
     state = PositionState(spent_up=2.0, shares_up=3.8461538, spent_down=2.0, shares_down=4.0816326, orders_up=1, orders_down=1, total_deals=2)
     runner = _runner(1_700_000_000, positions=state)
     clob = _tick(
@@ -168,8 +168,8 @@ def test_weak_outcome_cheap_repair_blocks_when_projected_avg_sum_is_bad() -> Non
         ],
     )
 
-    assert clob.calls == []
-    assert runner.positions.orders_up == 1
+    assert clob.calls == [("up-token", 2.0, 0.43)]
+    assert runner.positions.orders_up == 2
 
 
 def test_weak_outcome_cheap_repair_blocks_when_min_order_would_overshoot_balance() -> None:
@@ -191,7 +191,7 @@ def test_weak_outcome_cheap_repair_blocks_when_min_order_would_overshoot_balance
     assert clob.calls == []
 
 
-def test_high_guard_060_allows_guarded_high_repair_below_or_equal_060() -> None:
+def test_high_guard_060_buys_when_worst_side_improves() -> None:
     state = PositionState(spent_up=2.0, shares_up=3.8461538, spent_down=2.0, shares_down=4.0816326, orders_up=1, orders_down=1, total_deals=2)
     runner = _runner(1_700_000_000, positions=state)
     clob = _tick(
@@ -211,7 +211,7 @@ def test_high_guard_060_allows_guarded_high_repair_below_or_equal_060() -> None:
         ],
     )
 
-    assert clob.calls == []
+    assert clob.calls == [("up-token", 2.0, 0.60)]
 
 
 def test_high_price_above_065_is_blocked_before_240s() -> None:
@@ -336,7 +336,7 @@ def test_order_count_does_not_block_when_share_room_remains() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.2, 0.44)]
+    assert clob.calls == [("up-token", 1.32, 0.44)]
     assert runner.positions.shares_up <= 15.0
 
 
