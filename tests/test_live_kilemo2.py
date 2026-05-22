@@ -34,6 +34,7 @@ def _cfg() -> KngtopConfig:
         max_shares_per_side=15.0,
         max_share_gap=2.0,
         repair_avg_sum_cap=0.95,
+        locked_profit_roi=0.10,
     )
 
 
@@ -171,8 +172,8 @@ def test_weak_outcome_cheap_repair_blocks_when_projected_avg_sum_is_bad() -> Non
     assert runner.positions.orders_up == 1
 
 
-def test_weak_outcome_cheap_repair_uses_projected_size_when_ask_at_or_below_030() -> None:
-    state = PositionState(spent_up=2.0, shares_up=3.0, spent_down=2.0, shares_down=8.0, orders_up=1, orders_down=1, total_deals=2)
+def test_weak_outcome_cheap_repair_blocks_when_min_order_would_overshoot_balance() -> None:
+    state = PositionState(spent_up=2.0, shares_up=7.8, spent_down=2.0, shares_down=8.0, orders_up=1, orders_down=1, total_deals=2)
     runner = _runner(1_700_000_000, positions=state)
     clob = _tick(
         runner,
@@ -181,17 +182,13 @@ def test_weak_outcome_cheap_repair_uses_projected_size_when_ask_at_or_below_030(
         down=0.70,
         positions_seq=[
             [
-                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=3.0, avg_price=2.0 / 3.0),
-                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=8.0, avg_price=0.25),
-            ],
-            [
-                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=8.333333333, avg_price=0.432),
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=7.8, avg_price=2.0 / 7.8),
                 _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=8.0, avg_price=0.25),
             ],
         ],
     )
 
-    assert clob.calls == [("up-token", 2.0, 0.30)]
+    assert clob.calls == []
 
 
 def test_high_guard_060_allows_guarded_high_repair_below_or_equal_060() -> None:
@@ -280,12 +277,23 @@ def test_locked_profit_only_allows_cheap_or_imbalanced_buys() -> None:
     assert clob.calls == []
 
 
-def test_locked_profit_continues_cheap_weak_buys_when_avg_sum_stays_under_cap() -> None:
+def test_cheap_weak_buy_blocks_when_min_order_would_flip_balance() -> None:
     state = PositionState(spent_up=3.0, shares_up=8.0, spent_down=3.0, shares_down=8.2, orders_up=3, orders_down=3, total_deals=6)
     runner = _runner(1_700_000_000, positions=state)
-    clob = _tick(runner, elapsed=100, up=0.44, down=0.52)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.44,
+        down=0.52,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=8.0, avg_price=0.375),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=8.2, avg_price=3.0 / 8.2),
+            ]
+        ],
+    )
 
-    assert clob.calls == [("up-token", 1.0, 0.44)]
+    assert clob.calls == []
 
 
 def test_budget_cap_blocks_new_buy() -> None:
@@ -392,7 +400,7 @@ def test_14_5_vs_12_can_only_repair_smaller_down_side() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 1.2, 0.40)]
+    assert clob.calls == [("down-token", 1.0, 0.40)]
     assert runner.positions.shares_down == 14.5
 
 
@@ -432,7 +440,7 @@ def test_bootstrap_amount_is_capped_by_max_shares_per_side() -> None:
     assert runner.positions.shares_up == 15.0
 
 
-def test_locked_profit_balanced_state_stops_buying() -> None:
+def test_balanced_profit_under_roi_target_does_not_stop_window() -> None:
     state = PositionState(spent_up=6.5, shares_up=14.0, spent_down=6.5, shares_down=14.1, orders_up=4, orders_down=4, total_deals=8)
     runner = _runner(1_700_000_000, positions=state)
     clob = _tick(
@@ -449,7 +457,47 @@ def test_locked_profit_balanced_state_stops_buying() -> None:
     )
 
     assert clob.calls == []
+    assert runner.stop_reason is None
+
+
+def test_locked_profit_balanced_state_stops_only_after_roi_target() -> None:
+    state = PositionState(spent_up=5.5, shares_up=14.0, spent_down=5.5, shares_down=14.1, orders_up=4, orders_down=4, total_deals=8)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.44,
+        down=0.44,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=14.0, avg_price=5.5 / 14.0),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=14.1, avg_price=5.5 / 14.1),
+            ]
+        ],
+    )
+
+    assert clob.calls == []
     assert runner.stop_reason == "locked_profit"
+
+
+def test_twelve_vs_eight_position_does_not_stop_before_roi_and_balance() -> None:
+    state = PositionState(spent_up=4.0, shares_up=12.0, spent_down=4.0, shares_down=8.0, orders_up=4, orders_down=3, total_deals=7)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.44,
+        down=0.50,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=12.0, avg_price=4.0 / 12.0),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=8.0, avg_price=0.50),
+            ]
+        ],
+    )
+
+    assert runner.stop_reason is None
+    assert all(call[0] != "up-token" for call in clob.calls)
 
 
 def test_pending_order_blocks_new_buy() -> None:
@@ -571,7 +619,7 @@ def test_later_sizing_can_use_fractional_amount_to_optimize_projected_pnl() -> N
         ],
     )
 
-    assert clob.calls == [("up-token", 2.0, 0.35)]
+    assert clob.calls == [("up-token", 1.2, 0.35)]
 
 
 def test_balance_or_allowance_error_stops_window() -> None:

@@ -74,6 +74,7 @@ class KngtopConfig:
     max_shares_per_side: float
     max_share_gap: float
     repair_avg_sum_cap: float
+    locked_profit_roi: float
 
     @staticmethod
     def from_env() -> "KngtopConfig":
@@ -116,4 +117,5 @@ class KngtopConfig:
             ),
             max_share_gap=max(0.0, float(os.environ.get("KNGTOP_MAX_SHARE_GAP") or "2.0")),
             repair_avg_sum_cap=max(0.0, float(os.environ.get("KNGTOP_REPAIR_AVG_SUM_CAP") or "0.95")),
+            locked_profit_roi=max(0.0, float(os.environ.get("KNGTOP_LOCKED_PROFIT_ROI") or "0.10")),
         )

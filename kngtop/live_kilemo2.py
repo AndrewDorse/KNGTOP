@@ -45,11 +45,10 @@ WEAK_REPAIR_CHEAP_CAP = 0.45
 HIGH_REPAIR_GUARD = 0.60
 HIGH_REPAIR_PRE240_CAP = 0.65
 FINAL_60_DANGER_CAP = 0.80
-LOCKED_PROFIT_PNL = 0.50
 LOCKED_PROFIT_IMBALANCE_TRIGGER = 0.25
-LOCKED_PROFIT_STOP_PNL = 0.25
 LOCKED_PROFIT_STOP_AVG_SUM = 0.95
 LOCKED_PROFIT_STOP_IMBALANCE = 0.10
+LOCKED_PROFIT_STOP_ROI = 0.10
 HIGH_REPAIR_WORST_TARGET = -0.25
 HIGH_REPAIR_SHARE_GAP_TARGET = 0.10
 DANGEROUS_WEAK_PNL = -2.0
@@ -317,6 +316,14 @@ def _configured_repair_avg_sum_cap(cfg: KngtopConfig) -> float:
     return max(0.0, float(getattr(cfg, "repair_avg_sum_cap", REPAIR_AVG_SUM_CAP)))
 
 
+def _configured_locked_profit_roi(cfg: KngtopConfig) -> float:
+    return max(0.0, float(getattr(cfg, "locked_profit_roi", LOCKED_PROFIT_STOP_ROI)))
+
+
+def _locked_profit_target_usd(cfg: KngtopConfig) -> float:
+    return _configured_max_shares_per_side(cfg) * _configured_locked_profit_roi(cfg)
+
+
 def _share_room(state: PositionState, side: str, cfg: KngtopConfig) -> float:
     return max(0.0, _configured_max_shares_per_side(cfg) - _shares_for_side(state, side))
 
@@ -335,6 +342,17 @@ def _share_gap_after_buy(state: PositionState, side: str, ask_px: float, amount_
     up_shares = state.shares_up + (shares if side == "UP" else 0.0)
     down_shares = state.shares_down + (shares if side == "DOWN" else 0.0)
     return abs(up_shares - down_shares)
+
+
+def _repair_buy_keeps_side_smaller(state: PositionState, side: str, ask_px: float, amount_usd: float) -> bool:
+    if not state.both_sides_traded():
+        return True
+    current_side_shares = _shares_for_side(state, side)
+    other_shares = _shares_for_side(state, _other_side(side))
+    if current_side_shares >= other_shares - 1e-12:
+        return False
+    projected_side_shares = current_side_shares + amount_usd / max(ask_px, 1e-9)
+    return projected_side_shares <= other_shares + 1e-12
 
 
 def _choose_order_amount_usd(
@@ -356,6 +374,8 @@ def _choose_order_amount_usd(
         projected_abs_share_gap = _share_gap_after_buy(state, side, ask_px, amount)
         if enforce_repair_guards:
             if projected_avg_sum > _configured_repair_avg_sum_cap(cfg) + 1e-12:
+                continue
+            if not _repair_buy_keeps_side_smaller(state, side, ask_px, amount):
                 continue
             current_abs_share_gap = abs(state.shares_up - state.shares_down)
             if (
@@ -385,6 +405,8 @@ def _repair_candidate_skip_reason(*, side: str, ask_px: float, state: PositionSt
         del _pnl_up, _pnl_down, _projected_worst, _projected_gap, _projected_share_gap
         if projected_avg_sum <= _configured_repair_avg_sum_cap(cfg) + 1e-12:
             saw_avg_sum_pass = True
+        if not _repair_buy_keeps_side_smaller(state, side, ask_px, amount):
+            continue
         current_abs_share_gap = abs(state.shares_up - state.shares_down)
         projected_abs_share_gap = _share_gap_after_buy(state, side, ask_px, amount)
         if (
@@ -397,7 +419,7 @@ def _repair_candidate_skip_reason(*, side: str, ask_px: float, state: PositionSt
     if not saw_avg_sum_pass:
         return "avg_sum_guard"
     if not saw_share_gap_pass:
-        return "share_gap_guard"
+        return "repair_overshoot_guard"
     return "repair_candidate_guard"
 
 
@@ -586,10 +608,11 @@ def _record_confirmed_order(runner: WindowRunner, *, side: str) -> None:
 
 
 def _locked_profit_stop_reached(state: PositionState, cfg: KngtopConfig) -> bool:
+    profit_target = _locked_profit_target_usd(cfg)
     return (
         state.both_sides_traded()
-        and state.pnl_if_up() >= LOCKED_PROFIT_STOP_PNL - 1e-12
-        and state.pnl_if_down() >= LOCKED_PROFIT_STOP_PNL - 1e-12
+        and state.pnl_if_up() >= profit_target - 1e-12
+        and state.pnl_if_down() >= profit_target - 1e-12
         and _avg_sum(state) <= LOCKED_PROFIT_STOP_AVG_SUM + 1e-12
         and state.share_imbalance() <= LOCKED_PROFIT_STOP_IMBALANCE + 1e-12
         and abs(state.shares_up - state.shares_down) <= _configured_max_share_gap(cfg) + 1e-12
@@ -944,6 +967,7 @@ def _choose_guarded_pnl_buy(
             reason="locked_profit",
             pnl_if_up=f"{state.pnl_if_up():.4f}",
             pnl_if_down=f"{state.pnl_if_down():.4f}",
+            profit_target=f"{_locked_profit_target_usd(cfg):.4f}",
             avg_sum=f"{_avg_sum(state):.4f}",
             imbalance=f"{state.share_imbalance():.4f}",
         )
@@ -999,7 +1023,10 @@ def _choose_guarded_pnl_buy(
         )
         return None
 
-    locked_profit = state.pnl_if_up() >= LOCKED_PROFIT_PNL - 1e-12 and state.pnl_if_down() >= LOCKED_PROFIT_PNL - 1e-12
+    locked_profit = (
+        state.pnl_if_up() >= _locked_profit_target_usd(cfg) - 1e-12
+        and state.pnl_if_down() >= _locked_profit_target_usd(cfg) - 1e-12
+    )
     if locked_profit and not (ask_px <= WEAK_REPAIR_CHEAP_CAP + 1e-12 or state.share_imbalance() > LOCKED_PROFIT_IMBALANCE_TRIGGER + 1e-12):
         _log_tag(
             "SKIP",
@@ -1309,6 +1336,8 @@ def main() -> None:
         first_order_usd=f"{min(float(cfg.notional_usd), LARGE_ORDER_USD):.2f}",
         later_order_usd="1.00-2.00_projected",
         max_shares_per_side=f"{_configured_max_shares_per_side(cfg):.2f}",
+        max_share_gap=f"{_configured_max_share_gap(cfg):.2f}",
+        locked_profit_target=f"{_locked_profit_target_usd(cfg):.2f}",
     )
 
     while True:

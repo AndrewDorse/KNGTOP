@@ -139,6 +139,7 @@ def _cfg() -> KngtopConfig:
         max_shares_per_side=15.0,
         max_share_gap=2.0,
         repair_avg_sum_cap=0.95,
+        locked_profit_roi=0.10,
     )
 
 

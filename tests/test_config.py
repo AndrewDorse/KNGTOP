@@ -70,15 +70,19 @@ def test_balance_guard_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
     monkeypatch.delenv("KNGTOP_MAX_SHARE_GAP", raising=False)
     monkeypatch.delenv("KNGTOP_REPAIR_AVG_SUM_CAP", raising=False)
+    monkeypatch.delenv("KNGTOP_LOCKED_PROFIT_ROI", raising=False)
     cfg = KngtopConfig.from_env()
     assert cfg.max_share_gap == 2.0
     assert cfg.repair_avg_sum_cap == 0.95
+    assert cfg.locked_profit_roi == 0.10
 
     monkeypatch.setenv("KNGTOP_MAX_SHARE_GAP", "1.5")
     monkeypatch.setenv("KNGTOP_REPAIR_AVG_SUM_CAP", "0.93")
+    monkeypatch.setenv("KNGTOP_LOCKED_PROFIT_ROI", "0.12")
     cfg = KngtopConfig.from_env()
     assert cfg.max_share_gap == 1.5
     assert cfg.repair_avg_sum_cap == 0.93
+    assert cfg.locked_profit_roi == 0.12
 
 
 def test_ws_rest_poll_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -21,8 +21,8 @@ This file keeps a short memory of recent live strategy configurations.
   - if ask `> 0.60`, allow only when projected worst PnL reaches `>= -0.25` or projected share gap reaches `<= 10%`
   - pre-240s hard high cap `0.65`
   - final `60s`: up to `0.80` only if the weak outcome is dangerously weak
-  - post-open repair candidates must keep projected avg sum `<= 0.95` and projected share gap `<= 2.0` by default
-  - if both outcome PnLs are already `>= +0.50`, buy only cheap asks `<= 0.45` or share imbalance `> 25%`
+  - post-open repair candidates must keep projected avg sum `<= 0.95`, avoid flipping the bought side past the other side, and keep/improve the share gap
+  - stop only when both outcomes have reached the locked-profit ROI target; with `15` max shares and `10%`, that is `$1.50` per outcome
 - Order:
   - FAK buys only
   - `$2` first intent only
@@ -36,6 +36,7 @@ This file keeps a short memory of recent live strategy configurations.
   - max `15` PM-confirmed shares per side via `KNGTOP_MAX_SHARES_PER_SIDE`
   - max post-open share gap `2.0` via `KNGTOP_MAX_SHARE_GAP`
   - max post-open repair avg sum `0.95` via `KNGTOP_REPAIR_AVG_SUM_CAP`
+  - locked-profit stop ROI `10%` via `KNGTOP_LOCKED_PROFIT_ROI`
 
 ### 2026-05-21
 - Scope: `BTC` only
