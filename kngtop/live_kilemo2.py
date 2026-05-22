@@ -48,6 +48,7 @@ RESCUE_60_CAP = 0.80
 LARGE_ORDER_PRICE_THRESHOLD = 0.30
 LARGE_ORDER_IMBALANCE_THRESHOLD = 0.40
 MAX_ORDER_PRICE = 0.99
+BUY_RETRY_COOLDOWN_SEC = 5.0
 
 
 @dataclass(slots=True)
@@ -82,7 +83,7 @@ class PositionState:
         return abs(self.shares_up - self.shares_down) / total
 
     def both_sides_traded(self) -> bool:
-        return self.orders_up > 0 and self.orders_down > 0
+        return has_real_position(self, "UP") and has_real_position(self, "DOWN")
 
 
 @dataclass(slots=True)
@@ -93,9 +94,9 @@ class WindowRunner:
     window_minutes: int
     window_open_px: float | None = None
     positions: PositionState = field(default_factory=PositionState)
-    bootstrap_second_attempted: bool = False
-    rescue_60_attempted: bool = False
     last_repair_slot: int = -1
+    next_missing_side_retry_elapsed: float = 0.0
+    last_missing_wait_log_slot: int = -1
     stop_reason: str | None = None
 
     def start_sec(self) -> int | None:
@@ -138,6 +139,32 @@ def _extract_order_id(payload: object) -> str | None:
     return None
 
 
+def _extract_numeric(payload: dict[str, object], *keys: str) -> float | None:
+    for key in keys:
+        value = payload.get(key)
+        try:
+            if value is None:
+                continue
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _extract_filled_shares(payload: object) -> float:
+    if not isinstance(payload, dict):
+        return 0.0
+    value = _extract_numeric(payload, "size_matched", "matched_amount", "filled_amount", "filled", "makerAmountFilled")
+    if value is not None:
+        return max(0.0, float(value))
+    nested = payload.get("order")
+    if isinstance(nested, dict):
+        nested_value = _extract_numeric(nested, "size_matched", "matched_amount", "filled_amount", "filled", "makerAmountFilled")
+        if nested_value is not None:
+            return max(0.0, float(nested_value))
+    return 0.0
+
+
 def _current_window_start_sec(now_ts: int, window_minutes: int) -> int:
     window_sec = max(60, int(window_minutes) * 60)
     return (int(now_ts) // window_sec) * window_sec
@@ -162,6 +189,11 @@ def _window_elapsed_remaining(runner: WindowRunner, now_ts: float) -> tuple[floa
 
 def _token_for_side(runner: WindowRunner, side: str) -> TokenMarket:
     return runner.contract.up if str(side).upper() == "UP" else runner.contract.down
+
+
+def has_real_position(state: PositionState, side: str) -> bool:
+    shares = state.shares_up if side == "UP" else state.shares_down
+    return float(shares) > 0.000001
 
 
 def _order_amount_usd(*, ask_px: float, state: PositionState, cfg: KngtopConfig) -> float:
@@ -198,6 +230,14 @@ def _avg_after_buy(state: PositionState, side: str, ask_px: float, amount_usd: f
 
 def _smaller_share_side(state: PositionState) -> str:
     return "UP" if state.shares_up < state.shares_down else "DOWN"
+
+
+def _missing_side(state: PositionState) -> str | None:
+    up_open = has_real_position(state, "UP")
+    down_open = has_real_position(state, "DOWN")
+    if up_open == down_open:
+        return None
+    return "UP" if not up_open else "DOWN"
 
 
 def _apply_position_buy(state: PositionState, side: str, ask_px: float, amount_usd: float) -> None:
@@ -239,14 +279,47 @@ def _send_fak_buy(
         for _attempt in range(1, attempts + 1):
             try:
                 payload = clob.market_buy_usdc(token, amount_usd, max_price=min(MAX_ORDER_PRICE, float(cfg.market_buy_max_price), ask_px))
-                _ = _extract_order_id(payload)
+                filled_shares = _extract_filled_shares(payload)
+                if filled_shares <= 0.000001:
+                    _log_tag(
+                        "BUY FAILED",
+                        slug=runner.contract.slug,
+                        side=side,
+                        reason=reason,
+                        ask=f"{ask_px:.4f}",
+                        amount=f"{amount_usd:.2f}",
+                        error="zero_fill",
+                        retry_in=f"{BUY_RETRY_COOLDOWN_SEC:.0f}s",
+                    )
+                    return False
                 break
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
+                if "no orders found to match with FAK order" in str(exc):
+                    _log_tag(
+                        "BUY FAILED",
+                        slug=runner.contract.slug,
+                        side=side,
+                        reason=reason,
+                        ask=f"{ask_px:.4f}",
+                        amount=f"{amount_usd:.2f}",
+                        error=str(exc),
+                        retry_in=f"{BUY_RETRY_COOLDOWN_SEC:.0f}s",
+                    )
+                    return False
                 time.sleep(0.5)
         else:
             if last_error is not None:
-                _log_tag("ERROR", slug=runner.contract.slug, stage="buy", side=side, reason=reason, error=str(last_error))
+                _log_tag(
+                    "BUY FAILED",
+                    slug=runner.contract.slug,
+                    side=side,
+                    reason=reason,
+                    ask=f"{ask_px:.4f}",
+                    amount=f"{amount_usd:.2f}",
+                    error=str(last_error),
+                    retry_in=f"{BUY_RETRY_COOLDOWN_SEC:.0f}s",
+                )
             return False
 
     _apply_position_buy(runner.positions, side, ask_px, amount_usd)
@@ -330,28 +403,48 @@ def _maybe_bootstrap_second_leg(
     up_ask: float,
     down_ask: float,
     elapsed: float,
+    remaining: float,
     clob: KngtopClob | None,
     cfg: KngtopConfig,
 ) -> None:
-    if runner.bootstrap_second_attempted or elapsed < 15.0:
+    if elapsed < 15.0:
         return
-    runner.bootstrap_second_attempted = True
-    if runner.positions.both_sides_traded() or runner.positions.total_deals == 0:
+    missing = _missing_side(runner.positions)
+    if missing is None or runner.positions.total_deals == 0:
         return
-    missing = "UP" if runner.positions.orders_up == 0 else "DOWN"
+    if elapsed + 1e-12 < runner.next_missing_side_retry_elapsed:
+        return
     ask_px = up_ask if missing == "UP" else down_ask
-    if ask_px > BOOTSTRAP_OPPOSITE_CAP + 1e-12:
+    cap = 0.90 if remaining <= 30.0 else 0.80 if remaining <= 60.0 else 0.70
+    if ask_px > cap + 1e-12:
+        wait_slot = int(elapsed) // 5
+        if wait_slot > runner.last_missing_wait_log_slot:
+            runner.last_missing_wait_log_slot = wait_slot
+            _log_tag(
+                "WAIT MISSING SIDE",
+                slug=runner.contract.slug,
+                side=missing,
+                ask=f"{ask_px:.4f}",
+                cap=f"{cap:.4f}",
+                elapsed=f"{elapsed:.1f}",
+                remaining=f"{remaining:.1f}",
+            )
         return
-    _send_fak_buy(
+    amount_usd = max(MIN_ORDER_USD, min(float(cfg.notional_usd), LARGE_ORDER_USD)) if ask_px <= 0.35 + 1e-12 else MIN_ORDER_USD
+    ok = _send_fak_buy(
         runner=runner,
         side=missing,
         ask_px=ask_px,
-        amount_usd=MIN_ORDER_USD,
-        reason="bootstrap_opposite",
+        amount_usd=amount_usd,
+        reason="missing_side_retry",
         clob=clob,
         cfg=cfg,
         enforce_avg_cap=False,
     )
+    if not ok:
+        runner.next_missing_side_retry_elapsed = elapsed + BUY_RETRY_COOLDOWN_SEC
+    else:
+        runner.next_missing_side_retry_elapsed = elapsed
 
 
 def _maybe_active_repair(
@@ -399,12 +492,13 @@ def _maybe_rescue_missing_side(
     clob: KngtopClob | None,
     cfg: KngtopConfig,
 ) -> None:
-    if runner.rescue_60_attempted or remaining > 60.0:
+    if remaining > 60.0:
         return
-    runner.rescue_60_attempted = True
     if runner.positions.total_deals <= 0 or runner.positions.both_sides_traded():
         return
-    missing = "UP" if runner.positions.orders_up == 0 else "DOWN"
+    missing = _missing_side(runner.positions)
+    if missing is None:
+        return
     ask_px = up_ask if missing == "UP" else down_ask
     if ask_px > RESCUE_60_CAP + 1e-12:
         return
@@ -521,20 +615,30 @@ def _tick_runner(
     _down_bid, down_ask = down_quote
 
     _maybe_bootstrap_first_leg(runner, up_ask=float(up_ask), down_ask=float(down_ask), elapsed=elapsed, clob=clob, cfg=cfg)
-    _maybe_bootstrap_second_leg(runner, up_ask=float(up_ask), down_ask=float(down_ask), elapsed=elapsed, clob=clob, cfg=cfg)
+    if _missing_side(runner.positions) is not None:
+        _maybe_bootstrap_second_leg(
+            runner,
+            up_ask=float(up_ask),
+            down_ask=float(down_ask),
+            elapsed=elapsed,
+            remaining=remaining,
+            clob=clob,
+            cfg=cfg,
+        )
+        _maybe_rescue_missing_side(
+            runner,
+            up_ask=float(up_ask),
+            down_ask=float(down_ask),
+            remaining=remaining,
+            clob=clob,
+            cfg=cfg,
+        )
+        return
     _maybe_active_repair(
         runner,
         up_ask=float(up_ask),
         down_ask=float(down_ask),
         elapsed=elapsed,
-        remaining=remaining,
-        clob=clob,
-        cfg=cfg,
-    )
-    _maybe_rescue_missing_side(
-        runner,
-        up_ask=float(up_ask),
-        down_ask=float(down_ask),
         remaining=remaining,
         clob=clob,
         cfg=cfg,

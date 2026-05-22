@@ -52,12 +52,19 @@ def _runner(start: int, *, positions: PositionState | None = None) -> WindowRunn
 
 
 class _FakeClob:
-    def __init__(self) -> None:
+    def __init__(self, responses: list[object] | None = None) -> None:
         self.calls: list[tuple[str, float, float]] = []
+        self.responses = list(responses or [])
 
     def market_buy_usdc(self, token: TokenMarket, usdc: float, *, max_price: float | None = None):  # noqa: ANN201
         self.calls.append((token.token_id, usdc, 0.0 if max_price is None else max_price))
-        return {"orderID": f"buy-{len(self.calls)}"}
+        if self.responses:
+            response = self.responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+        shares = usdc / max(0.01, float(max_price or 0.5))
+        return {"orderID": f"buy-{len(self.calls)}", "size_matched": shares}
 
 
 class _FakeBinance:
@@ -135,7 +142,6 @@ def test_tick_runner_active_repair_buys_smaller_side_on_imbalance() -> None:
 
 def test_tick_runner_rescue_60_cap080_buys_missing_side() -> None:
     runner = _runner(1_700_000_000, positions=PositionState(spent_up=0.10, shares_up=2.0, orders_up=1, total_deals=1))
-    runner.bootstrap_second_attempted = True
     fake_clob = _FakeClob()
     cfg = _cfg()
 
@@ -155,7 +161,6 @@ def test_tick_runner_rescue_60_cap080_buys_missing_side() -> None:
 
 def test_tick_runner_rescue_skips_missing_side_above_cap() -> None:
     runner = _runner(1_700_000_000, positions=PositionState(spent_up=0.10, shares_up=2.0, orders_up=1, total_deals=1))
-    runner.bootstrap_second_attempted = True
     fake_clob = _FakeClob()
     cfg = _cfg()
 
@@ -170,3 +175,137 @@ def test_tick_runner_rescue_skips_missing_side_above_cap() -> None:
 
     assert fake_clob.calls == []
     assert runner.positions.orders_down == 0
+
+
+def test_bootstrap_opposite_fak_failure_does_not_mark_side_open() -> None:
+    runner = _runner(1_700_000_000, positions=PositionState(spent_down=1.0, shares_down=2.0, orders_down=1, total_deals=1))
+    fake_clob = _FakeClob(
+        responses=[
+            Exception("PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]")
+        ]
+    )
+    cfg = _cfg()
+
+    class _Poly:
+        def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            del max_age_sec
+            return (0.68, 0.70) if asset_id == "up-token" else (0.49, 0.50)
+
+    with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_030, timezone.utc)
+        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+
+    assert fake_clob.calls == [("up-token", 1.0, 0.7)]
+    assert runner.positions.orders_up == 0
+    assert runner.positions.shares_up == 0.0
+    assert not runner.positions.both_sides_traded()
+
+
+def test_missing_side_retries_after_fak_failure() -> None:
+    runner = _runner(1_700_000_000, positions=PositionState(spent_down=1.0, shares_down=2.0, orders_down=1, total_deals=1))
+    fake_clob = _FakeClob(
+        responses=[
+            Exception("PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]"),
+            {"orderID": "buy-2", "size_matched": 2.08},
+        ]
+    )
+    cfg = _cfg()
+
+    class _Poly:
+        asks = [0.70, 0.48]
+        call = 0
+
+        def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            del max_age_sec
+            if asset_id == "up-token":
+                value = self.asks[min(self.call, len(self.asks) - 1)]
+                self.call += 1
+                return (max(0.01, value - 0.01), value)
+            return (0.49, 0.50)
+
+    poly = _Poly()
+    with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_030, timezone.utc)
+        _tick_runner(runner, poly=poly, binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_036, timezone.utc)
+        _tick_runner(runner, poly=poly, binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+
+    assert fake_clob.calls == [("up-token", 1.0, 0.7), ("up-token", 1.0, 0.48)]
+    assert runner.positions.orders_up == 1
+    assert runner.positions.shares_up > 0.0
+    assert runner.positions.both_sides_traded()
+
+
+def test_active_repair_blocked_until_both_sides_have_real_shares() -> None:
+    runner = _runner(1_700_000_000, positions=PositionState(spent_down=3.0, shares_down=8.0, orders_down=3, total_deals=3))
+    fake_clob = _FakeClob()
+    cfg = _cfg()
+
+    class _Poly:
+        def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            del max_age_sec
+            return (0.24, 0.26) if asset_id == "up-token" else (0.69, 0.71)
+
+    with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_090, timezone.utc)
+        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+
+    assert fake_clob.calls == [("up-token", 2.0, 0.26)]
+    assert runner.positions.orders_up == 1
+
+
+def test_missing_side_bought_when_price_becomes_cheap_after_failed_bootstrap() -> None:
+    runner = _runner(1_700_000_000, positions=PositionState(spent_down=1.0, shares_down=2.0, orders_down=1, total_deals=1))
+    fake_clob = _FakeClob(
+        responses=[
+            Exception("PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]"),
+            {"orderID": "buy-2", "size_matched": 4.16},
+        ]
+    )
+    cfg = _cfg()
+
+    class _Poly:
+        asks = [0.70, 0.48]
+        call = 0
+
+        def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            del max_age_sec
+            if asset_id == "up-token":
+                value = self.asks[min(self.call, len(self.asks) - 1)]
+                self.call += 1
+                return (max(0.01, value - 0.01), value)
+            return (0.49, 0.50)
+
+    poly = _Poly()
+    with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_030, timezone.utc)
+        _tick_runner(runner, poly=poly, binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_036, timezone.utc)
+        _tick_runner(runner, poly=poly, binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+
+    assert runner.positions.orders_up == 1
+    assert runner.positions.shares_up > 0.0
+    assert runner.positions.both_sides_traded()
+
+
+def test_failed_buy_does_not_increment_order_count_or_spent() -> None:
+    runner = _runner(1_700_000_000, positions=PositionState(spent_down=1.0, shares_down=2.0, orders_down=1, total_deals=1))
+    fake_clob = _FakeClob(
+        responses=[
+            Exception("PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]")
+        ]
+    )
+    cfg = _cfg()
+
+    class _Poly:
+        def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            del max_age_sec
+            return (0.68, 0.70) if asset_id == "up-token" else (0.49, 0.50)
+
+    with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_030, timezone.utc)
+        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+
+    assert runner.positions.total_deals == 1
+    assert runner.positions.orders_up == 0
+    assert runner.positions.spent_up == 0.0
