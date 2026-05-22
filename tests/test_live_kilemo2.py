@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import inspect
 from unittest.mock import patch
 
 from kngtop.config import KngtopConfig
 from kngtop.gamma import ActiveContract, TokenMarket
-from kngtop.live_kilemo2 import PositionState, WindowRunner, _tick_runner
+import kngtop.live_kilemo2 as live_kilemo2
+from kngtop.live_kilemo2 import ORDER_IN_FLIGHT, PositionState, WindowRunner, _tick_runner
 
 
 def _cfg() -> KngtopConfig:
@@ -347,7 +349,7 @@ def test_pending_order_blocks_new_buy() -> None:
     assert fake_clob.calls == []
 
 
-def test_failed_fak_retries_after_cooldown_only() -> None:
+def test_failed_order_sets_ready_and_retries_after_1s() -> None:
     runner = _runner(1_700_000_000, positions=PositionState(spent_down=1.0, shares_down=2.0, orders_down=1, total_deals=1))
     fake_clob = _FakeClob(
         responses=[
@@ -365,23 +367,19 @@ def test_failed_fak_retries_after_cooldown_only() -> None:
     with patch("kngtop.live_kilemo2.datetime") as fake_dt:
         fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_030, timezone.utc)
         _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+        assert runner.execution_state != ORDER_IN_FLIGHT
         fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_034, timezone.utc)
         _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
-        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_041, timezone.utc)
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_031, timezone.utc)
         _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
 
     assert fake_clob.calls == [("up-token", 1.0, 0.48), ("up-token", 1.0, 0.48)]
     assert runner.positions.orders_up == 1
 
 
-def test_same_side_cooldown_blocks_spam() -> None:
+def test_100_ticks_in_1_second_produce_max_1_buy_attempt() -> None:
     runner = _runner(1_700_000_000, positions=PositionState(spent_down=1.0, shares_down=2.0, orders_down=1, total_deals=1))
-    fake_clob = _FakeClob(
-        responses=[
-            Exception("PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]"),
-            {"orderID": "buy-2", "size_matched": 2.08},
-        ]
-    )
+    fake_clob = _FakeClob(responses=[Exception("PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]")])
     cfg = _cfg()
 
     class _Poly:
@@ -390,13 +388,11 @@ def test_same_side_cooldown_blocks_spam() -> None:
             return (0.47, 0.48) if asset_id == "up-token" else (0.49, 0.50)
 
     with patch("kngtop.live_kilemo2.datetime") as fake_dt:
-        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_030, timezone.utc)
-        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
-        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_036, timezone.utc)
-        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+        for _ in range(100):
+            fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_030, timezone.utc)
+            _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
 
     assert fake_clob.calls == [("up-token", 1.0, 0.48)]
-    assert runner.positions.orders_up == 0
 
 
 def test_position_state_updates_only_from_real_fill() -> None:
@@ -416,3 +412,48 @@ def test_position_state_updates_only_from_real_fill() -> None:
     assert runner.positions.orders_up == 0
     assert runner.positions.shares_up == 0.0
     assert runner.positions.spent_up == 0.0
+
+
+def test_after_send_order_next_tick_waits_for_result() -> None:
+    runner = _runner(1_700_000_000, positions=PositionState(spent_down=1.0, shares_down=2.0, orders_down=1, total_deals=1))
+    runner.pending_order = True
+    runner.execution_state = ORDER_IN_FLIGHT
+    fake_clob = _FakeClob()
+    cfg = _cfg()
+
+    class _Poly:
+        def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            del max_age_sec
+            return (0.47, 0.48) if asset_id == "up-token" else (0.49, 0.50)
+
+    with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_030, timezone.utc)
+        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+
+    assert fake_clob.calls == []
+
+
+def test_order_count_changes_only_after_real_fill() -> None:
+    runner = _runner(1_700_000_000, positions=PositionState(spent_down=1.0, shares_down=2.0, orders_down=1, total_deals=1))
+    fake_clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 0.0}, {"orderID": "buy-2", "size_matched": 2.0}])
+    cfg = _cfg()
+
+    class _Poly:
+        def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
+            del max_age_sec
+            return (0.47, 0.48) if asset_id == "up-token" else (0.49, 0.50)
+
+    with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_030, timezone.utc)
+        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_031, timezone.utc)
+        _tick_runner(runner, poly=_Poly(), binance=_FakeBinance(), clob=fake_clob, cfg=cfg)
+
+    assert runner.positions.orders_up == 1
+    assert runner.positions.total_deals == 2
+
+
+def test_no_cooldown_logs_exist() -> None:
+    source = inspect.getsource(live_kilemo2)
+    assert "BUY SKIP COOLDOWN" not in source
+    assert "buy_cooldown_until_ts" not in source
