@@ -6,6 +6,7 @@
 - Always confirm live fills from Polymarket positions before counting shares/spend.
 - Missing side gets priority until both sides are open.
 - After both sides are open, keep buying the worse PnL side if that side improves, until both sides are profitable.
+- Repair buys after both sides are open should be below that side's current avg, so avg sum improves.
 - Prefer the current winning side to be equal or slightly bigger, while keeping sizes close.
 - Later buys can be any cent amount from `$1.00` to `$2.00`.
 - Max `15` shares per side by default.

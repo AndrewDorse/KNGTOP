@@ -1,4 +1,4 @@
-"""BTC 5m live bot for guarded PnL-balance strategy C."""
+﻿"""BTC 5m live bot for guarded PnL-balance strategy C."""
 
 from __future__ import annotations
 
@@ -52,7 +52,6 @@ LOCKED_PROFIT_STOP_ROI = 0.10
 HIGH_REPAIR_WORST_TARGET = -0.25
 HIGH_REPAIR_SHARE_GAP_TARGET = 0.10
 DANGEROUS_WEAK_PNL = -2.0
-REPAIR_PRICE_IMPROVEMENT_BUFFER = 0.02
 INITIAL_RETRY_WAIT_SEC = 10.0
 INITIAL_RETRY_PRICE_IMPROVEMENT = 0.02
 MAX_INITIAL_RETRIES_PER_SIDE = 2
@@ -121,8 +120,6 @@ class WindowRunner:
     pending_order: bool = False
     pending_side: str | None = None
     pending_reason: str | None = None
-    pending_ask_px: float = 0.0
-    pending_amount_usd: float = 0.0
     pending_created_ts: float = 0.0
     last_successful_buy_ts: float = -10_000.0
     last_position_refresh_ts: float = 0.0
@@ -254,10 +251,6 @@ def _shares_for_side(state: PositionState, side: str) -> float:
     return state.shares_up if side == "UP" else state.shares_down
 
 
-def _avg_for_side(state: PositionState, side: str) -> float:
-    return state.avg_up() if side == "UP" else state.avg_down()
-
-
 def _initial_failures_for_side(runner: WindowRunner, side: str) -> int:
     return runner.initial_failed_up if side == "UP" else runner.initial_failed_down
 
@@ -373,10 +366,7 @@ def _repair_buy_keeps_balance(
     ):
         return False
     if side != preferred_larger_side and projected_side_shares > other_shares + 1e-12:
-        return (
-            current_side_shares < other_shares - 1e-12
-            and projected_abs_share_gap <= _configured_max_share_gap(cfg) + 1e-12
-        )
+        return False
     return (
         side == preferred_larger_side
         or projected_abs_share_gap < current_abs_share_gap - 1e-12
@@ -390,15 +380,6 @@ def _repair_avg_sum_allowed(state: PositionState, projected_avg_sum: float, cfg:
     if current_avg_sum > cap + 1e-12:
         return projected_avg_sum < current_avg_sum - 1e-12
     return projected_avg_sum <= cap + 1e-12
-
-
-def _repair_price_improves_avg_sum(state: PositionState, side: str, ask_px: float) -> bool:
-    if not state.both_sides_traded():
-        return True
-    current_side_avg = state.avg_up() if side == "UP" else state.avg_down()
-    if current_side_avg <= 1e-12:
-        return True
-    return ask_px < current_side_avg - REPAIR_PRICE_IMPROVEMENT_BUFFER + 1e-12
 
 
 def _choose_order_amount_usd(
@@ -421,13 +402,6 @@ def _choose_order_amount_usd(
             pnl_up, pnl_down, _projected_worst, _projected_gap, _projected_share_gap, projected_avg_sum = _projected_after_buy(
                 state, side, ask_px, amount
             )
-            if enforce_repair_guards:
-                if not _repair_price_improves_avg_sum(state, side, ask_px):
-                    continue
-                if not _repair_avg_sum_allowed(state, projected_avg_sum, cfg):
-                    continue
-                if not _repair_buy_keeps_balance(state, side, ask_px, amount, cfg, preferred_larger_side):
-                    continue
             projected_side_pnl = pnl_up if side == "UP" else pnl_down
             improvement = projected_side_pnl - current_worst_side_pnl
             if improvement <= 1e-12:
@@ -449,8 +423,6 @@ def _choose_order_amount_usd(
         )
         projected_abs_share_gap = _share_gap_after_buy(state, side, ask_px, amount)
         if enforce_repair_guards:
-            if not _repair_price_improves_avg_sum(state, side, ask_px):
-                continue
             if not _repair_avg_sum_allowed(state, projected_avg_sum, cfg):
                 continue
             if not _repair_buy_keeps_balance(state, side, ask_px, amount, cfg, preferred_larger_side):
@@ -479,16 +451,12 @@ def _repair_candidate_skip_reason(
     preferred_larger_side: str | None = None,
 ) -> str:
     saw_buyable = False
-    saw_price_pass = False
     saw_avg_sum_pass = False
     saw_share_gap_pass = False
     for amount in _candidate_amounts(cfg):
         if not _can_buy(state, side, amount, ask_px=ask_px, cfg=cfg):
             continue
         saw_buyable = True
-        if not _repair_price_improves_avg_sum(state, side, ask_px):
-            continue
-        saw_price_pass = True
         _pnl_up, _pnl_down, _projected_worst, _projected_gap, _projected_share_gap, projected_avg_sum = _projected_after_buy(
             state, side, ask_px, amount
         )
@@ -506,8 +474,6 @@ def _repair_candidate_skip_reason(
             saw_share_gap_pass = True
     if not saw_buyable:
         return "no_valid_amount"
-    if not saw_price_pass:
-        return "price_not_tighter"
     if not saw_avg_sum_pass:
         return "avg_sum_guard"
     if not saw_share_gap_pass:
@@ -565,17 +531,12 @@ def _refresh_positions_from_pm(
 ) -> PositionState:
     prev_shares_up = runner.positions.shares_up
     prev_shares_down = runner.positions.shares_down
-    prev_spent_up = runner.positions.spent_up
-    prev_spent_down = runner.positions.spent_down
     prev_orders_up = runner.positions.orders_up
     prev_orders_down = runner.positions.orders_down
     rows = fetch_user_positions(user=cfg.funder, timeout=cfg.request_timeout_sec)
     token_by_side = {"UP": runner.contract.up.token_id, "DOWN": runner.contract.down.token_id}
     shares_by_side = {"UP": 0.0, "DOWN": 0.0}
     cost_by_side = {"UP": 0.0, "DOWN": 0.0}
-    fallback_cost_by_side = {"UP": False, "DOWN": False}
-    prev_shares_by_side = {"UP": prev_shares_up, "DOWN": prev_shares_down}
-    prev_cost_by_side = {"UP": prev_spent_up, "DOWN": prev_spent_down}
     for row in rows:
         slug = str(row.get("slug") or row.get("marketSlug") or row.get("market_slug") or "")
         asset_id = str(row.get("asset") or row.get("asset_id") or row.get("token_id") or "")
@@ -594,37 +555,11 @@ def _refresh_positions_from_pm(
         avg_price = _extract_numeric(row, "avgPrice", "averagePrice", "avg_price", "price")
         if size is None or size <= 0:
             continue
-        size_f = float(size)
-        shares_by_side[side] += size_f
+        shares_by_side[side] += float(size)
         if avg_price is not None and 0.0 < float(avg_price) < 1.0:
-            cost_by_side[side] += size_f * float(avg_price)
-            continue
-        prev_shares = prev_shares_by_side[side]
-        prev_cost = prev_cost_by_side[side]
-        prev_avg = prev_cost / prev_shares if prev_shares > 1e-12 and prev_cost > 1e-12 else 0.0
-        carried_shares = min(size_f, prev_shares)
-        added_shares = max(0.0, size_f - carried_shares)
-        if prev_avg > 1e-12:
-            cost_by_side[side] += carried_shares * prev_avg
-        if runner.pending_side == side and runner.pending_ask_px > 1e-12:
-            cost_by_side[side] += added_shares * runner.pending_ask_px
-            fallback_cost_by_side[side] = True
-        elif prev_avg > 1e-12:
-            cost_by_side[side] += added_shares * prev_avg
-            fallback_cost_by_side[side] = True
+            cost_by_side[side] += float(size) * float(avg_price)
 
-    for side, used_fallback in fallback_cost_by_side.items():
-        if used_fallback:
-            _log_tag(
-                "AVG_PRICE FALLBACK",
-                slug=runner.contract.slug,
-                side=side,
-                shares=f"{shares_by_side[side]:.6f}",
-                pending_ask=f"{runner.pending_ask_px:.4f}" if runner.pending_side == side else None,
-                cost=f"{cost_by_side[side]:.4f}",
-            )
-
-    del prev_shares_up, prev_shares_down, prev_spent_up, prev_spent_down
+    del prev_shares_up, prev_shares_down
     orders_up = prev_orders_up
     orders_down = prev_orders_down
     if shares_by_side["UP"] > 1e-6 and orders_up == 0:
@@ -843,8 +778,6 @@ def _send_fak_buy(
     runner.execution_state = ORDER_IN_FLIGHT
     runner.pending_side = side
     runner.pending_reason = reason
-    runner.pending_ask_px = ask_px
-    runner.pending_amount_usd = amount_usd
     runner.pending_created_ts = elapsed
     _log_tag("ORDER SENT", slug=runner.contract.slug, side=side, reason=reason, ask=f"{ask_px:.4f}", amount=f"{amount_usd:.2f}")
 
@@ -986,8 +919,6 @@ def _send_fak_buy(
         runner.pending_order = False
         runner.pending_side = None
         runner.pending_reason = None
-        runner.pending_ask_px = 0.0
-        runner.pending_amount_usd = 0.0
         runner.pending_created_ts = 0.0
 
 
