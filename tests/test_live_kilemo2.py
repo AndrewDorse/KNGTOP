@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from kngtop.config import KngtopConfig
 from kngtop.gamma import ActiveContract, TokenMarket
-from kngtop.live_kilemo2 import ORDER_IN_FLIGHT, PositionState, WindowRunner, _effective_state_with_pending, _tick_runner
+from kngtop.live_kilemo2 import ORDER_IN_FLIGHT, PositionState, WindowRunner, _choose_guarded_pnl_buy, _effective_state_with_pending, _tick_runner
 
 
 def _cfg() -> KngtopConfig:
@@ -906,6 +906,51 @@ def test_partial_fill_updates_from_confirmed_filled_shares_conservatively() -> N
     assert runner.positions.shares_down == 2.0
     assert runner.positions.spent_down == 0.98
     assert runner.positions.total_deals == 1
+
+
+def test_successful_fak_without_fill_field_records_local_risk_immediately() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob(responses=[{"success": True, "orderID": "buy-1"}])
+
+    _tick(
+        runner,
+        elapsed=0,
+        up=0.60,
+        down=0.33,
+        clob=clob,
+        positions_seq=[[], []],
+    )
+
+    assert clob.calls == [("down-token", 2.0, 0.33)]
+    assert abs(runner.positions.shares_down - (2.0 / 0.33)) < 1e-6
+    assert abs(runner.positions.spent_down - 2.0) < 1e-6
+
+
+def test_after_both_sides_open_repair_targets_smaller_side_not_larger_winning_side() -> None:
+    state = PositionState(
+        spent_up=3.91,
+        shares_up=8.59,
+        spent_down=4.00,
+        shares_down=9.76,
+        orders_up=3,
+        orders_down=2,
+        total_deals=5,
+    )
+    runner = _runner(1_700_000_000, positions=state)
+
+    action = _choose_guarded_pnl_buy(
+        runner,
+        up_ask=0.44,
+        down_ask=0.33,
+        elapsed=240,
+        remaining=60,
+        cfg=_cfg(),
+        current_winning_side="DOWN",
+    )
+
+    assert action is not None
+    assert action.side == "UP"
+    assert action.amount_usd == 1.0
 
 
 def test_api_underreport_does_not_reduce_confirmed_local_position() -> None:
