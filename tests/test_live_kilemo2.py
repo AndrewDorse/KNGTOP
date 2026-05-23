@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from kngtop.config import KngtopConfig
 from kngtop.gamma import ActiveContract, TokenMarket
-from kngtop.live_kilemo2 import ORDER_IN_FLIGHT, PositionState, WindowRunner, _tick_runner
+from kngtop.live_kilemo2 import ORDER_IN_FLIGHT, PositionState, WindowRunner, _effective_state_with_pending, _tick_runner
 
 
 def _cfg() -> KngtopConfig:
@@ -225,7 +225,7 @@ def test_high_price_above_065_is_blocked_before_240s() -> None:
     assert clob.calls == []
 
 
-def test_final_60_allows_dangerously_weak_side_up_to_080() -> None:
+def test_final_60_blocks_when_existing_position_is_over_cap() -> None:
     state = PositionState(spent_up=2.0, shares_up=1.0, spent_down=8.0, shares_down=25.0, orders_up=1, orders_down=4, total_deals=5)
     runner = _runner(1_700_000_000, positions=state)
     clob = _tick(
@@ -245,7 +245,8 @@ def test_final_60_allows_dangerously_weak_side_up_to_080() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 2.0, 0.80)]
+    assert clob.calls == []
+    assert runner.stop_reason == "over_cap_position"
 
 
 def test_locked_profit_only_allows_cheap_or_imbalanced_buys() -> None:
@@ -308,7 +309,7 @@ def test_budget_cap_blocks_new_buy() -> None:
     assert runner.positions.spent_total() <= 20.0
 
 
-def test_order_count_does_not_block_when_share_room_remains() -> None:
+def test_over_cap_other_side_stops_instead_of_chasing_balance() -> None:
     state = PositionState(spent_up=8.0, shares_up=12.0, spent_down=8.0, shares_down=20.0, orders_up=5, orders_down=4, total_deals=9)
     runner = _runner(1_700_000_000, positions=state)
     clob = _tick(
@@ -328,8 +329,8 @@ def test_order_count_does_not_block_when_share_room_remains() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.32, 0.44)]
-    assert runner.positions.shares_up <= 15.0
+    assert clob.calls == []
+    assert runner.stop_reason == "over_cap_position"
 
 
 def test_share_cap_blocks_repair_past_max_even_when_other_side_over_cap() -> None:
@@ -905,6 +906,87 @@ def test_partial_fill_updates_from_confirmed_filled_shares_conservatively() -> N
     assert runner.positions.shares_down == 2.0
     assert runner.positions.spent_down == 0.98
     assert runner.positions.total_deals == 1
+
+
+def test_api_underreport_does_not_reduce_confirmed_local_position() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 4.0}])
+
+    _tick(
+        runner,
+        elapsed=0,
+        up=0.50,
+        down=0.49,
+        clob=clob,
+        positions_seq=[
+            [],
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.49)],
+        ],
+    )
+    _tick(
+        runner,
+        elapsed=5,
+        up=0.90,
+        down=0.90,
+        clob=clob,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=1.0, avg_price=0.49)],
+        ],
+    )
+
+    assert runner.positions.shares_down == 4.0
+    assert abs(runner.positions.spent_down - 1.96) < 1e-6
+
+
+def test_pending_reserved_shares_count_toward_effective_share_cap() -> None:
+    state = PositionState(spent_up=7.0, shares_up=14.0, spent_down=3.0, shares_down=8.0, orders_up=4, orders_down=2, total_deals=6)
+    runner = _runner(1_700_000_000, positions=state)
+    runner.pending_order = True
+    runner.pending_side = "UP"
+    runner.pending_amount_usd = 0.40
+    runner.pending_reserved_shares = 1.0
+
+    effective = _effective_state_with_pending(runner)
+
+    assert effective.shares_up == 15.0
+    assert effective.spent_up == 7.4
+
+
+def test_hard_cap_uses_api_plus_local_effective_state() -> None:
+    state = PositionState(spent_up=6.0, shares_up=14.0, spent_down=4.0, shares_down=10.0, orders_up=4, orders_down=3, total_deals=7)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.25,
+        down=0.70,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=14.8, avg_price=6.0 / 14.8),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=10.0, avg_price=0.40),
+            ],
+        ],
+    )
+
+    assert clob.calls == []
+    assert runner.positions.shares_up == 14.8
+
+
+def test_late_one_sided_window_stops_when_missing_side_cannot_open() -> None:
+    state = PositionState(spent_up=2.0, shares_up=5.0, spent_down=0.0, shares_down=0.0, orders_up=1, orders_down=0, total_deals=1)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=285,
+        up=0.10,
+        down=0.90,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.40)],
+        ],
+    )
+
+    assert clob.calls == []
+    assert runner.stop_reason == "one_sided_unhedged"
 
 
 def test_one_order_per_tick_even_when_many_conditions_true() -> None:

@@ -19,6 +19,7 @@
 ## Comparing Strategies
 
 - Compare the current engine against the previous pushed engine on the same window pool.
+- Command: "run current live 98 strategy upgrade search" means find at least 5 small strategy improvement ideas aligned with `CORE_RULES.md`, test each idea against baseline `98`, and report simulation sheets on 100, 200, and 500 window pools with `$20` and `$50` per-window budgets.
 - Use the same config for both engines:
   - `MAX_SHARES_PER_SIDE=15`
   - `MAX_SHARE_GAP=2`
@@ -36,6 +37,20 @@
   - max share gap
   - one-sided windows
 - Do not show "guaranteed worst PnL total" unless explicitly requested.
+
+## Position State Memory
+
+- Keep two position views in mind when changing live logic:
+  - Sent/filled view: what the bot sent and what the FAK/order response says filled, including fill amount, shares, and average/fill price.
+  - API view: what Polymarket position API reports for shares and average price.
+- Do not blindly trust API `avgPrice=0`; treat it as lag/bad data and fall back to the sent/filled view until API data becomes valid.
+- Strategy decisions should act from confirmed fills first, then reconcile against API position data.
+
+## Wallet History Command
+
+- Command: "get wallet history from `<window_start>` 5m btc window and report" means fetch Polymarket activity for wallet `0x9016105aaD4bc837E275110DA4CdCf4249b9edE1` around the BTC 5m UP/DOWN window starting at `<window_start>`.
+- Analyze activity per window: buys/spend, sells/proceeds, redeems/claimed amount, net cash, shares by side, and final per-window summary.
+- If the user gives a broader time range, group activity by each BTC 5m window slug or start timestamp.
 
 ## Current Engine
 
