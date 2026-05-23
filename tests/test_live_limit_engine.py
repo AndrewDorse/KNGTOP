@@ -223,3 +223,20 @@ def test_missing_smaller_side_order_is_posted_when_cheap() -> None:
 
     assert ("up-token", 0.39, 5.0) in clob.calls
     assert all(call[0] != "down-token" for call in clob.calls)
+
+
+def test_local_sent_ledger_blocks_spam_when_pm_positions_lag() -> None:
+    runner = _runner(1_700_000_000)
+    positions = [
+        _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=10.0, avg_price=0.47),
+        _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=10.0, avg_price=0.47),
+    ]
+    clob = _FakeClob()
+
+    for i in range(6):
+        clob.open_orders = [row for row in clob.open_orders if row["asset_id"] != "down-token"]
+        _tick(runner, elapsed=240 + i, up=0.60, down=0.30, clob=clob, positions=positions)
+
+    down_calls = [call for call in clob.calls if call[0] == "down-token"]
+    assert len(down_calls) == 1
+    assert runner.sent_shares["DOWN"] == 5.0

@@ -82,6 +82,8 @@ class WindowRunner:
     positions: PositionState = field(default_factory=PositionState)
     open_orders: dict[str, list[OpenOrder]] = field(default_factory=lambda: {"UP": [], "DOWN": []})
     last_replace_ts: dict[str, float] = field(default_factory=lambda: {"UP": 0.0, "DOWN": 0.0})
+    sent_shares: dict[str, float] = field(default_factory=lambda: {"UP": 0.0, "DOWN": 0.0})
+    sent_cost: dict[str, float] = field(default_factory=lambda: {"UP": 0.0, "DOWN": 0.0})
     stop_reason: str | None = None
 
     def start_sec(self) -> int | None:
@@ -230,6 +232,22 @@ def _projected_avg_sum(pos: PositionState, side: str, price: float) -> float:
     return up_avg + down_avg
 
 
+def _open_order_shares(runner: WindowRunner, side: str) -> float:
+    return sum(max(0.0, order.remaining_shares) for order in runner.open_orders.get(side, []))
+
+
+def _local_sent_shares(runner: WindowRunner, side: str) -> float:
+    return max(0.0, float(runner.sent_shares.get(side, 0.0)))
+
+
+def _effective_side_exposure(runner: WindowRunner, side: str) -> float:
+    return runner.positions.shares(side) + max(_open_order_shares(runner, side), _local_sent_shares(runner, side))
+
+
+def _local_sent_total_cost(runner: WindowRunner) -> float:
+    return max(0.0, float(runner.sent_cost.get("UP", 0.0))) + max(0.0, float(runner.sent_cost.get("DOWN", 0.0)))
+
+
 def _avg_sum_max_price(pos: PositionState, side: str) -> float:
     other = "DOWN" if side == "UP" else "UP"
     other_avg = pos.avg(other)
@@ -241,10 +259,11 @@ def _avg_sum_max_price(pos: PositionState, side: str) -> float:
     return (allowed_side_avg * (shares + ORDER_SHARES) - spent) / ORDER_SHARES
 
 
-def _desired_price_for_side(pos: PositionState, side: str, ask_px: float | None, cfg: KngtopConfig) -> float | None:
-    if pos.shares(side) >= float(cfg.max_shares_per_side) - 1e-12:
+def _desired_price_for_side(runner: WindowRunner, side: str, ask_px: float | None, cfg: KngtopConfig) -> float | None:
+    pos = runner.positions
+    if _effective_side_exposure(runner, side) + ORDER_SHARES > float(cfg.max_shares_per_side) + 1e-12:
         return None
-    if pos.spent_total() + OPENING_PRICE * ORDER_SHARES > MAX_SPENT_PER_WINDOW + 1e-12:
+    if max(pos.spent_total(), _local_sent_total_cost(runner)) + OPENING_PRICE * ORDER_SHARES > MAX_SPENT_PER_WINDOW + 1e-12:
         return None
     if pos.shares(side) <= 1e-12:
         return OPENING_PRICE
@@ -274,6 +293,8 @@ def _post_order(runner: WindowRunner, *, clob: KngtopClob | None, side: str, pri
     del cfg
     if clob is None:
         _log_tag("DRY ORDER", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{ORDER_SHARES:.2f}")
+        runner.sent_shares[side] = _local_sent_shares(runner, side) + ORDER_SHARES
+        runner.sent_cost[side] = max(0.0, float(runner.sent_cost.get(side, 0.0))) + ORDER_SHARES * price
         return True
     try:
         payload = clob.limit_buy_shares(_token_for_side(runner, side), price=price, shares=ORDER_SHARES, post_only=True)
@@ -283,6 +304,8 @@ def _post_order(runner: WindowRunner, *, clob: KngtopClob | None, side: str, pri
         _log_tag("ORDER FAILED", slug=runner.contract.slug, side=side, price=f"{price:.2f}", error=str(exc))
         return False
     order_id = _extract_order_id(payload)
+    runner.sent_shares[side] = _local_sent_shares(runner, side) + ORDER_SHARES
+    runner.sent_cost[side] = max(0.0, float(runner.sent_cost.get(side, 0.0))) + ORDER_SHARES * price
     _log_tag("ORDER SENT", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{ORDER_SHARES:.2f}", order_id=order_id)
     return True
 
@@ -345,8 +368,8 @@ def _tick_runner(
     up_quote = poly.best_bid_ask_for(runner.contract.up.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     down_quote = poly.best_bid_ask_for(runner.contract.down.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     desired = {
-        "UP": _desired_price_for_side(runner.positions, "UP", up_quote[1] if up_quote else None, cfg),
-        "DOWN": _desired_price_for_side(runner.positions, "DOWN", down_quote[1] if down_quote else None, cfg),
+        "UP": _desired_price_for_side(runner, "UP", up_quote[1] if up_quote else None, cfg),
+        "DOWN": _desired_price_for_side(runner, "DOWN", down_quote[1] if down_quote else None, cfg),
     }
     now_monotonic = time.monotonic()
     _maintain_side_order(runner, side="UP", desired_price=desired["UP"], clob=clob, cfg=cfg, now_monotonic=now_monotonic)
