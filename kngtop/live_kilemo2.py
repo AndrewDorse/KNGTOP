@@ -31,12 +31,14 @@ TRADE_PAIR_KEY = "BTC"
 TRADE_WINDOW_MINUTES = 5
 WINDOW_SECONDS = TRADE_WINDOW_MINUTES * 60
 NEXT_WINDOW_LOOKAHEAD_SEC = 20
+PRESTART_ENTRY_SEC = 20.0
 
 MIN_ORDER_USD = 1.0
 LARGE_ORDER_USD = 2.0
 LIMIT_MIN_SHARES = 5.0
 LIMIT_MIN_USD = 1.05
 LIMIT_PASSIVE_OFFSET = 0.01
+OPENING_PAIR_PRICE = 0.47
 MAX_SHARES_PER_SIDE = 15.0
 MAX_SHARE_GAP = 2.0
 
@@ -134,6 +136,7 @@ class WindowRunner:
     last_initial_attempt_elapsed: float = -10_000.0
     initial_failed_up: int = 0
     initial_failed_down: int = 0
+    opening_pair_sent: bool = False
     intent_count_up: int = 0
     intent_count_down: int = 0
     sends_up: int = 0
@@ -439,6 +442,10 @@ def _can_send_on_side(runner: WindowRunner, side: str, cfg: KngtopConfig) -> boo
     return _share_headroom_on_side(runner, side, cfg) + 1e-12 >= LIMIT_MIN_SHARES
 
 
+def _configured_repair_avg_sum_cap(cfg: KngtopConfig) -> float:
+    return max(0.0, float(getattr(cfg, "repair_avg_sum_cap", REPAIR_AVG_SUM_CAP)))
+
+
 def _locked_profit_target_usd(cfg: KngtopConfig) -> float:
     return _configured_max_shares_per_side(cfg) * _configured_locked_profit_roi(cfg)
 
@@ -468,6 +475,10 @@ def _has_open_clob_orders(runner: WindowRunner) -> bool:
     return bool(lo.runner_open_order_views(runner))
 
 
+def _opening_pair_has_open_orders(runner: WindowRunner) -> bool:
+    return bool(runner.opening_pair_sent and _has_open_clob_orders(runner))
+
+
 def _can_place_limit_buy(runner: WindowRunner, side: str, price: float, cfg: KngtopConfig) -> bool:
     if not lo.cycle_is_idle(runner):
         return False
@@ -487,10 +498,16 @@ def _can_place_limit_buy(runner: WindowRunner, side: str, price: float, cfg: Kng
     if flat:
         state = lo.projected_positions(runner, confirmed)
         return _can_buy(state, side, cost, ask_px=price, cfg=cfg)
-    if required_side is None or side != required_side:
-        return False
     state = lo.projected_positions(runner, confirmed)
     if not _can_buy(state, side, cost, ask_px=price, cfg=cfg):
+        return False
+    if not _limit_respects_avg_sum(state, side, price, cost, cfg):
+        return False
+    if required_side is None:
+        if not confirmed.both_sides_traded():
+            return False
+        return _limit_improves_side_average(state, side, price)
+    if side != required_side:
         return False
     if _missing_position_side(confirmed) is not None:
         return True
@@ -509,7 +526,8 @@ def _cap_amount_to_share_room(state: PositionState, side: str, ask_px: float, am
 def _limit_order_shares(price: float) -> float:
     if price <= 0.0:
         return 0.0
-    return max(LIMIT_MIN_SHARES, LIMIT_MIN_USD / max(price, 1e-9))
+    del price
+    return LIMIT_MIN_SHARES
 
 
 def _passive_limit_buy_price(ask_px: float) -> float:
@@ -571,9 +589,21 @@ def _projected_abs_share_gap_after_limit(state: PositionState, side: str, price:
 def _balance_limit_improves_gap(state: PositionState, side: str, price: float, cfg: KngtopConfig) -> bool:
     current_gap = _abs_share_gap(state)
     projected_gap = _projected_abs_share_gap_after_limit(state, side, price)
+    shares = _limit_order_shares(price)
+    if side == "UP" and state.shares_up < state.shares_down - 1e-12:
+        if state.shares_up + shares > state.shares_down + 1e-12:
+            return False
+    if side == "DOWN" and state.shares_down < state.shares_up - 1e-12:
+        if state.shares_down + shares > state.shares_up + 1e-12:
+            return False
     if projected_gap <= _configured_max_share_gap(cfg) + 1e-12:
         return True
     return projected_gap < current_gap - 1e-12
+
+
+def _limit_improves_side_average(state: PositionState, side: str, price: float) -> bool:
+    side_avg = _avg_for_side(state, side)
+    return side_avg > 1e-12 and price <= side_avg - REPAIR_PRICE_IMPROVEMENT_BUFFER + 1e-12
 
 
 def _hedge_limit_repair_action(
@@ -595,6 +625,8 @@ def _hedge_limit_repair_action(
     amount_usd = _limit_order_cost(target_price)
     if not _can_buy(state, side, amount_usd, ask_px=target_price, cfg=cfg):
         return None
+    if _avg_after_buy(state, side, target_price, amount_usd) > _configured_repair_avg_sum_cap(cfg) + 1e-12:
+        return None
     if _missing_position_side(confirmed) is None and not _balance_limit_improves_gap(state, side, target_price, cfg):
         return None
     reason = "missing_side_limit" if _missing_position_side(confirmed) is not None else "balance_limit_repair"
@@ -607,6 +639,34 @@ def _hedge_limit_repair_action(
     )
 
 
+def _balanced_growth_action(
+    runner: WindowRunner,
+    *,
+    up_ask: float,
+    down_ask: float,
+    cfg: KngtopConfig,
+) -> BuyAction | None:
+    state = _effective_state_with_pending(runner)
+    if not state.both_sides_traded():
+        return None
+    candidates: list[tuple[float, str, float, float]] = []
+    for side, quoted_ask in (("UP", up_ask), ("DOWN", down_ask)):
+        target_price = _passive_limit_buy_price(quoted_ask)
+        amount_usd = _limit_order_cost(target_price)
+        if not _can_buy(state, side, amount_usd, ask_px=target_price, cfg=cfg):
+            continue
+        if not _limit_improves_side_average(state, side, target_price):
+            continue
+        if not _limit_respects_avg_sum(state, side, target_price, amount_usd, cfg):
+            continue
+        improvement = _avg_for_side(state, side) - target_price
+        candidates.append((improvement, side, target_price, amount_usd))
+    if not candidates:
+        return None
+    _improvement, side, target_price, amount_usd = max(candidates, key=lambda item: item[0])
+    return BuyAction(side=side, ask_px=target_price, amount_usd=amount_usd, reason="balanced_avg_improve", enforce_avg_cap=True)
+
+
 def _can_buy(state: PositionState, side: str, amount_usd: float, *, ask_px: float, cfg: KngtopConfig) -> bool:
     if amount_usd + 1e-12 < MIN_ORDER_USD:
         return False
@@ -617,6 +677,10 @@ def _can_buy(state: PositionState, side: str, amount_usd: float, *, ask_px: floa
     if _shares_for_side(state, side) + (amount_usd / ask_px) > _configured_max_shares_per_side(cfg) + 1e-12:
         return False
     return True
+
+
+def _limit_respects_avg_sum(state: PositionState, side: str, price: float, amount_usd: float, cfg: KngtopConfig) -> bool:
+    return _avg_after_buy(state, side, price, amount_usd) <= _configured_repair_avg_sum_cap(cfg) + 1e-12
 
 
 def _avg_sum(state: PositionState) -> float:
@@ -1007,6 +1071,28 @@ def _send_cycle_hedge(
             down_shares=f"{confirmed.shares_down:.6f}",
         )
         return True
+    if _avg_after_buy(confirmed, hedge_side, hedge_price, hedge_cost) > _configured_repair_avg_sum_cap(cfg) + 1e-12:
+        _log_tag(
+            "CYCLE HEDGE BLOCK",
+            slug=runner.contract.slug,
+            side=hedge_side,
+            reason="avg_sum_cap",
+            hedge_price=f"{hedge_price:.4f}",
+            projected_avg_sum=f"{_avg_after_buy(confirmed, hedge_side, hedge_price, hedge_cost):.4f}",
+            avg_sum_cap=f"{_configured_repair_avg_sum_cap(cfg):.4f}",
+        )
+        return True
+    if _missing_position_side(confirmed) is None and not _balance_limit_improves_gap(confirmed, hedge_side, hedge_price, cfg):
+        _log_tag(
+            "CYCLE HEDGE BLOCK",
+            slug=runner.contract.slug,
+            side=hedge_side,
+            reason="share_gap_or_flip",
+            hedge_price=f"{hedge_price:.4f}",
+            up_shares=f"{confirmed.shares_up:.6f}",
+            down_shares=f"{confirmed.shares_down:.6f}",
+        )
+        return True
     if not lo.cycle_begin_hedge(runner, side=hedge_side, price=hedge_price, shares=hedge_shares):
         return True
     try:
@@ -1271,6 +1357,51 @@ def _choose_initial_buy(
     return None
 
 
+def _post_opening_pair(
+    runner: WindowRunner,
+    *,
+    clob: KngtopClob | None,
+    cfg: KngtopConfig,
+) -> bool:
+    confirmed = _confirmed_position_state(runner)
+    if runner.opening_pair_sent:
+        return False
+    if lo.cycle_is_busy(runner) or _has_open_clob_orders(runner):
+        return False
+    if has_real_position(confirmed, "UP") or has_real_position(confirmed, "DOWN"):
+        return False
+    shares = _limit_order_shares(OPENING_PAIR_PRICE)
+    total_cost = 2.0 * shares * OPENING_PAIR_PRICE
+    if shares <= 0.0 or shares * OPENING_PAIR_PRICE + 1e-12 < LIMIT_MIN_USD:
+        return False
+    if confirmed.spent_total() + total_cost > 20.0 + 1e-12:
+        return False
+    if not _can_send_on_side(runner, "UP", cfg) or not _can_send_on_side(runner, "DOWN", cfg):
+        return False
+    try:
+        up_id = _post_cycle_limit(runner, side="UP", price=OPENING_PAIR_PRICE, shares=shares, clob=clob, cfg=cfg)
+        down_id = _post_cycle_limit(runner, side="DOWN", price=OPENING_PAIR_PRICE, shares=shares, clob=clob, cfg=cfg)
+    except Exception as exc:  # noqa: BLE001
+        if _is_balance_or_allowance_error(exc):
+            runner.stop_reason = "balance_or_allowance"
+            _log_tag("STOP", slug=runner.contract.slug, reason="balance_or_allowance", error=str(exc))
+            return False
+        _log_tag("OPENING PAIR FAILED", slug=runner.contract.slug, error=str(exc))
+        return False
+    runner.opening_pair_sent = True
+    runner.sends_up += 1
+    runner.sends_down += 1
+    _log_tag(
+        "OPENING PAIR SENT",
+        slug=runner.contract.slug,
+        price=f"{OPENING_PAIR_PRICE:.4f}",
+        shares=f"{shares:.6f}",
+        up_id=up_id,
+        down_id=down_id,
+    )
+    return True
+
+
 def _choose_guarded_pnl_buy(
     runner: WindowRunner,
     *,
@@ -1290,9 +1421,7 @@ def _choose_guarded_pnl_buy(
         and not has_real_position(confirmed, "UP")
         and not has_real_position(confirmed, "DOWN")
     ):
-        if _has_open_clob_orders(runner):
-            return None
-        return _choose_initial_buy(runner, up_ask=up_ask, down_ask=down_ask, elapsed=elapsed, cfg=cfg)
+        return None
     over_cap_side = _over_cap_side(confirmed, cfg)
     required_side = _required_hedge_side(confirmed, cfg)
     if over_cap_side is not None:
@@ -1346,6 +1475,9 @@ def _choose_guarded_pnl_buy(
         )
         return None
 
+    if (growth_action := _balanced_growth_action(runner, up_ask=up_ask, down_ask=down_ask, cfg=cfg)) is not None:
+        return growth_action
+
     _log_tag(
         "SKIP",
         slug=runner.contract.slug,
@@ -1386,7 +1518,7 @@ def _maybe_guarded_pnl_buy(
     )
     if action is None:
         return False
-    limit_price = action.ask_px if action.reason in {"balance_limit_repair", "missing_side_limit"} else _passive_limit_buy_price(action.ask_px)
+    limit_price = action.ask_px if action.reason in {"balance_limit_repair", "missing_side_limit", "balanced_avg_improve"} else _passive_limit_buy_price(action.ask_px)
     return _send_limit_buy(
         runner=runner,
         side=action.side,
@@ -1492,7 +1624,7 @@ def _tick_runner(
             required_side = _required_hedge_side(confirmed, cfg)
             if clob is not None:
                 lo.sync_clob_open_orders(runner, clob=clob)
-                if lo.cycle_is_idle(runner):
+                if lo.cycle_is_idle(runner) and not _opening_pair_has_open_orders(runner):
                     lo.enforce_single_order(runner, clob=clob, required_side=required_side)
         except Exception as exc:  # noqa: BLE001
             _log_tag("RECONCILE", slug=runner.contract.slug, status="error", error=str(exc))
@@ -1511,6 +1643,8 @@ def _tick_runner(
     if elapsed is None or remaining is None:
         return
     if elapsed < 0:
+        if elapsed >= -PRESTART_ENTRY_SEC - 1e-12 and up_quote is not None and down_quote is not None:
+            _post_opening_pair(runner, clob=clob, cfg=cfg)
         return
     if runner.window_open_px is None:
         start_sec = runner.start_sec()
@@ -1643,7 +1777,7 @@ def main() -> None:
         window_minutes=str(TRADE_WINDOW_MINUTES),
         strategy="guarded_pnl_balance_C",
         reconcile_interval_sec=f"{lo.RECONCILE_INTERVAL_SEC:.1f}",
-        bootstrap="initial_lower_ask<=0.55_amount2",
+        bootstrap="prestart_pair_47c_5shares_each",
         active_repair="5s_weak_outcome_cheap<=0.45_high_guard<=0.60",
         high_repair="pre240<=0.65_final60_danger<=0.80",
         min_order_usd=f"{MIN_ORDER_USD:.2f}",

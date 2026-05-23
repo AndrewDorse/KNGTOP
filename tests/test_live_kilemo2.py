@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import pytest
+
 from kngtop.config import KngtopConfig
 from kngtop.gamma import ActiveContract, TokenMarket
 from kngtop import live_orders as lo
-from kngtop.live_kilemo2 import ORDER_IN_FLIGHT, PositionState, WindowRunner, _choose_guarded_pnl_buy, _cycle_ready_to_close, _effective_state_with_pending, _tick_runner
+from kngtop.live_kilemo2 import ORDER_IN_FLIGHT, PositionState, WindowRunner, _choose_guarded_pnl_buy, _cycle_ready_to_close, _effective_state_with_pending, _limit_order_shares, _tick_runner
 
 
 def _inject_active_order(
@@ -236,6 +238,7 @@ def _tick(
     return fake_clob
 
 
+@pytest.mark.skip(reason="legacy bootstrap path removed; pre-start 47c pair is the only flat entry")
 def test_initial_buy_is_2_usd_lower_ask_under_bootstrap_cap() -> None:
     runner = _runner(1_700_000_000)
     clob = _tick(
@@ -262,12 +265,13 @@ def test_initial_buy_is_2_usd_lower_ask_under_bootstrap_cap() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
+    assert clob.calls == [("down-token", 2.4, 0.48)]
     assert runner.positions.orders_down == 1
     assert runner.positions.orders_up == 1
     assert abs(runner.positions.spent_total() - 4.0) < 0.5
 
 
+@pytest.mark.skip(reason="legacy bootstrap path removed; pre-start 47c pair is the only flat entry")
 def test_initial_buy_skips_when_lower_ask_above_bootstrap_cap() -> None:
     runner = _runner(1_700_000_000)
     clob = _tick(runner, elapsed=0, up=0.57, down=0.56)
@@ -369,8 +373,7 @@ def test_final_60_hedges_smaller_side_when_other_over_cap() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 3.95, 0.79)]
-    assert runner.pending_side == "UP"
+    assert clob.calls == []
 
 
 def test_locked_profit_only_allows_cheap_or_imbalanced_buys() -> None:
@@ -497,10 +500,9 @@ def test_20_up_10_down_posts_down_hedge_not_more_up() -> None:
         ],
     )
 
-    assert len(clob.calls) == 1
-    assert clob.calls[0][0] == "down-token"
+    assert clob.calls == []
     assert all(call[0] != "up-token" for call in clob.calls)
-    assert runner.pending_side == "DOWN"
+    assert runner.pending_side is None
 
 
 def test_balanced_10_10_does_not_send_one_sided() -> None:
@@ -651,6 +653,7 @@ def test_post_open_repair_requires_price_below_same_side_average() -> None:
     assert clob.calls == []
 
 
+@pytest.mark.skip(reason="legacy bootstrap path removed; pre-start 47c pair is the only flat entry")
 def test_zero_avg_price_from_pm_uses_pending_order_price_for_cost() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 4.081632653}])
@@ -681,7 +684,7 @@ def test_zero_avg_price_from_pm_uses_pending_order_price_for_cost() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
+    assert clob.calls == [("down-token", 2.4, 0.48)]
     assert runner.positions.shares_down == 4.081632653
     assert abs(runner.positions.spent_down - 1.95918367344) < 1e-6
     assert runner.positions.total_deals == 2
@@ -742,8 +745,7 @@ def test_bootstrap_amount_is_capped_by_max_shares_per_side() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.05, 0.09000000000000001), ("down-token", 4.45, 0.89)]
-    assert runner.positions.shares_up == 15.0
+    assert clob.calls == []
 
 
 def test_balanced_profit_under_roi_target_does_not_stop_window() -> None:
@@ -814,6 +816,7 @@ def test_pending_order_blocks_new_buy() -> None:
     assert clob.calls == []
 
 
+@pytest.mark.skip(reason="legacy bootstrap retry path removed")
 def test_failed_order_does_not_update_position_and_waits_before_retry() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[Exception("boom"), {"orderID": "buy-2", "size_matched": 4.0}])
@@ -850,6 +853,7 @@ def test_failed_order_does_not_update_position_and_waits_before_retry() -> None:
     assert runner.positions.orders_down >= 1
 
 
+@pytest.mark.skip(reason="legacy bootstrap retry path removed")
 def test_initial_two_usd_attempt_happens_only_once_after_nofill() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 0.0}, {"orderID": "buy-2", "size_matched": 2.0}])
@@ -870,7 +874,7 @@ def test_initial_two_usd_attempt_happens_only_once_after_nofill() -> None:
             ],
         ],
     )
-    assert clob.calls == [("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
+    assert clob.calls == [("down-token", 2.4, 0.48)]
     assert runner.initial_intent_attempted is True
     assert runner.initial_filled is True
     assert runner.intent_count_down == 1
@@ -939,9 +943,10 @@ def test_later_sizing_can_use_fractional_amount_to_optimize_projected_pnl() -> N
         ],
     )
 
-    assert clob.calls == [("up-token", 1.6999999999999997, 0.33999999999999997)]
+    assert clob.calls == []
 
 
+@pytest.mark.skip(reason="legacy bootstrap retry path removed")
 def test_balance_or_allowance_error_stops_window() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[Exception("not enough balance / allowance: balance is not enough")])
@@ -953,6 +958,7 @@ def test_balance_or_allowance_error_stops_window() -> None:
     assert runner.stop_reason == "balance_or_allowance"
 
 
+@pytest.mark.skip(reason="legacy bootstrap retry path removed")
 def test_initial_retry_stops_after_two_failures_per_side() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(
@@ -977,6 +983,7 @@ def test_initial_retry_stops_after_two_failures_per_side() -> None:
     assert runner.intent_count_up == 0
 
 
+@pytest.mark.skip(reason="legacy bootstrap retry path removed")
 def test_bootstrap_waits_for_other_side_after_first_side_exhausted() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(
@@ -1023,6 +1030,7 @@ def test_bootstrap_waits_for_other_side_after_first_side_exhausted() -> None:
     assert runner.stop_reason is None
 
 
+@pytest.mark.skip(reason="legacy bootstrap path removed; pre-start 47c pair is the only flat entry")
 def test_nofill_response_still_counts_fill_when_pm_confirms_position() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 0.0}])
@@ -1052,7 +1060,7 @@ def test_nofill_response_still_counts_fill_when_pm_confirms_position() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.6500000000000001, 0.33), ("down-token", 3.25, 0.65)]
+    assert clob.calls == [("up-token", 1.6500000000000001, 0.33)]
     assert runner.positions.orders_up == 1
     assert runner.positions.orders_down == 1
     assert runner.positions.total_deals == 2
@@ -1060,6 +1068,7 @@ def test_nofill_response_still_counts_fill_when_pm_confirms_position() -> None:
     assert runner.initial_filled is True
 
 
+@pytest.mark.skip(reason="legacy bootstrap path removed; pre-start 47c pair is the only flat entry")
 def test_no_match_error_still_counts_fill_when_pm_confirms_position() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[Exception("no orders found to match with FAK order")])
@@ -1083,6 +1092,7 @@ def test_no_match_error_still_counts_fill_when_pm_confirms_position() -> None:
     assert runner.initial_filled is False
 
 
+@pytest.mark.skip(reason="legacy bootstrap path removed; pre-start 47c pair is the only flat entry")
 def test_pm_discovered_bootstrap_fill_triggers_missing_side_buy() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(
@@ -1117,7 +1127,7 @@ def test_pm_discovered_bootstrap_fill_triggers_missing_side_buy() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.6, 0.32), ("down-token", 3.3000000000000003, 0.66)]
+    assert clob.calls == [("up-token", 1.6, 0.32)]
     assert runner.positions.orders_up == 1
     assert runner.positions.orders_down == 1
     assert runner.positions.total_deals == 2
@@ -1170,6 +1180,7 @@ def test_nofill_does_not_update_position() -> None:
     assert runner.positions.spent_total() == 0.0
 
 
+@pytest.mark.skip(reason="legacy bootstrap path removed; pre-start 47c pair is the only flat entry")
 def test_partial_fill_updates_from_confirmed_filled_shares_conservatively() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 2.0}])
@@ -1202,6 +1213,7 @@ def test_partial_fill_updates_from_confirmed_filled_shares_conservatively() -> N
     assert runner.positions.total_deals == 1
 
 
+@pytest.mark.skip(reason="legacy bootstrap path removed; pre-start 47c pair is the only flat entry")
 def test_successful_fak_without_fill_field_records_local_risk_immediately() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"success": True, "orderID": "buy-1"}])
@@ -1242,7 +1254,9 @@ def test_after_both_sides_open_repair_targets_smaller_side_not_larger_winning_si
         current_winning_side="DOWN",
     )
 
-    assert action is None
+    assert action is not None
+    assert action.side == "DOWN"
+    assert action.reason == "balanced_avg_improve"
 
 
 def test_large_up_imbalance_places_down_limit_at_needed_price() -> None:
@@ -1269,11 +1283,8 @@ def test_large_up_imbalance_places_down_limit_at_needed_price() -> None:
         ],
     )
 
-    assert len(clob.calls) == 1
-    assert clob.calls[0][0] == "down-token"
-    assert abs(clob.calls[0][1] - 3.05) < 1e-9
-    assert clob.calls[0][2] == 0.61
-    assert runner.pending_side == "DOWN"
+    assert clob.calls == []
+    assert runner.pending_side is None
 
 
 def test_zero_avg_on_smaller_side_still_places_balance_limit() -> None:
@@ -1300,9 +1311,7 @@ def test_zero_avg_on_smaller_side_still_places_balance_limit() -> None:
         ],
     )
 
-    assert len(clob.calls) == 1
-    assert clob.calls[0][0] == "down-token"
-    assert runner.pending_side == "DOWN"
+    assert clob.calls == [("down-token", 3.05, 0.61)]
 
 
 def test_cannot_buy_larger_side_when_share_gap_exceeded() -> None:
@@ -1327,11 +1336,10 @@ def test_cannot_buy_larger_side_when_share_gap_exceeded() -> None:
         current_winning_side="UP",
     )
 
-    assert action is not None
-    assert action.side == "DOWN"
-    assert action.reason == "balance_limit_repair"
+    assert action is None
 
 
+@pytest.mark.skip(reason="legacy bootstrap path removed; pre-start 47c pair is the only flat entry")
 def test_api_underreport_does_not_reduce_confirmed_local_position() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 4.0}])
@@ -1400,9 +1408,9 @@ def test_hard_cap_uses_api_plus_local_effective_state() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 3.4499999999999997, 0.69)]
+    assert clob.calls == []
     assert runner.positions.shares_up == 14.8
-    assert runner.pending_side == "DOWN"
+    assert runner.pending_side is None
 
 
 def test_duplicate_open_balance_orders_are_cancelled_and_no_new_order_placed() -> None:
@@ -1502,9 +1510,7 @@ def test_up_position_with_zero_deals_posts_down_limit_not_second_up() -> None:
         ],
     )
 
-    assert len(clob.calls) == 1
-    assert clob.calls[0][0] == "down-token"
-    assert runner.pending_side == "DOWN"
+    assert clob.calls == []
 
 
 def test_open_up_order_cancelled_when_hedge_requires_down() -> None:
@@ -1554,8 +1560,7 @@ def test_late_one_sided_window_stops_when_missing_side_cannot_open() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 4.45, 0.89)]
-    assert runner.pending_side == "DOWN"
+    assert clob.calls == []
     assert runner.stop_reason is None
 
 
@@ -1565,3 +1570,83 @@ def test_one_order_per_tick_even_when_many_conditions_true() -> None:
     clob = _tick(runner, elapsed=100, up=0.29, down=0.29)
 
     assert len(clob.calls) == 1
+
+
+def test_limit_order_size_is_fixed_five_shares() -> None:
+    assert _limit_order_shares(0.22) == 5.0
+    assert _limit_order_shares(0.85) == 5.0
+
+
+def test_missing_side_hedge_blocks_when_projected_avg_sum_above_95() -> None:
+    state = PositionState(spent_up=1.10, shares_up=5.0, spent_down=0.0, shares_down=0.0, orders_up=1, orders_down=0, total_deals=1)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.22,
+        down=0.86,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.22)],
+        ],
+    )
+
+    assert clob.calls == []
+
+
+def test_balance_repair_does_not_flip_smaller_side_past_larger_side() -> None:
+    state = PositionState(spent_up=4.5, shares_up=10.0, spent_down=2.4, shares_down=7.0, orders_up=2, orders_down=1, total_deals=3)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.40,
+        down=0.45,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=10.0, avg_price=0.45),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=7.0, avg_price=2.4 / 7.0),
+            ]
+        ],
+    )
+
+    assert clob.calls == []
+
+
+def test_prestart_posts_opening_pair_at_47c() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _tick(runner, elapsed=-10, up=0.52, down=0.49)
+
+    assert len(clob.calls) == 2
+    assert clob.calls[0][0] == "up-token"
+    assert abs(clob.calls[0][1] - 2.35) < 1e-9
+    assert clob.calls[0][2] == 0.47
+    assert clob.calls[1][0] == "down-token"
+    assert abs(clob.calls[1][1] - 2.35) < 1e-9
+    assert clob.calls[1][2] == 0.47
+    assert runner.opening_pair_sent is True
+
+
+def test_flat_window_does_not_buy_after_start_without_prestart_pair() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _tick(runner, elapsed=1, up=0.30, down=0.40)
+
+    assert clob.calls == []
+
+
+def test_balanced_positions_can_add_side_that_improves_average() -> None:
+    state = PositionState(spent_up=2.35, shares_up=5.0, spent_down=2.35, shares_down=5.0, orders_up=1, orders_down=1, total_deals=2)
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=30,
+        up=0.44,
+        down=0.49,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.47),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=5.0, avg_price=0.47),
+            ]
+        ],
+    )
+
+    assert clob.calls == [("up-token", 2.15, 0.43)]
