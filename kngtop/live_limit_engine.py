@@ -1,10 +1,15 @@
 """Clean BTC 5m two-sided limit-order engine.
 
 Rule shape:
-- From 20s before a new window starts, keep one buy order per side at 0.47.
-- After fills, keep exactly one buy order per side while that side has room.
+- Trade fixed 5-share limit buys.
+- Use the C_weak_cap045_high_guard060 rules:
+  - start with the cheaper side if ask <= 0.55;
+  - buy the missing hedge side up to 0.70;
+  - after both sides exist, repair only cheap/weak or guarded-improving buys;
+  - avg_sum_after_buy must stay <= 0.95.
+- Keep at most one buy order per side while that side has room.
 - Never keep two buy orders on the same side.
-- Cancel/replace stale side orders when the target limit changes.
+- For buys, a lower resting limit is better; replace only orders that are too expensive.
 """
 
 from __future__ import annotations
@@ -32,13 +37,17 @@ TRADE_PAIR_KEY = "BTC"
 TRADE_WINDOW_MINUTES = 5
 WINDOW_SECONDS = TRADE_WINDOW_MINUTES * 60
 PRESTART_SEC = 20
-OPENING_PRICE = 0.47
 ORDER_SHARES = 5.0
 MAX_SPENT_PER_WINDOW = 20.0
 REPRICE_TOLERANCE = 0.005
 MIN_ORDER_USD = 1.05
 AVG_IMPROVE_BUFFER = 0.02
 AVG_SUM_CAP = 0.95
+C_INITIAL_CAP = 0.55
+C_MISSING_HEDGE_CAP = 0.70
+C_WEAK_CAP = 0.45
+C_HIGH_GUARD = 0.60
+C_BALANCE_EPSILON = 1e-9
 REPLACE_COOLDOWN_SEC = 0.75
 
 
@@ -62,6 +71,18 @@ class PositionState:
 
     def avg_sum(self) -> float:
         return self.avg("UP") + self.avg("DOWN")
+
+    def pnl_if(self, side: str) -> float:
+        return self.shares(side) - self.spent_total()
+
+    def worst_case_pnl(self) -> float:
+        return min(self.pnl_if("UP"), self.pnl_if("DOWN"))
+
+    def has_side(self, side: str) -> bool:
+        return self.shares(side) > C_BALANCE_EPSILON
+
+    def both_sides(self) -> bool:
+        return self.has_side("UP") and self.has_side("DOWN")
 
 
 @dataclass(slots=True)
@@ -165,6 +186,7 @@ def _parse_side_from_position(row: dict[str, object], runner: WindowRunner) -> s
 def _refresh_positions(runner: WindowRunner, *, cfg: KngtopConfig, rows: list[dict[str, object]] | None = None) -> PositionState:
     if rows is None:
         rows = fetch_user_positions(user=cfg.funder, timeout=cfg.request_timeout_sec)
+    previous = runner.positions
     pos = PositionState()
     token_ids = {runner.contract.up.token_id, runner.contract.down.token_id}
     for row in rows:
@@ -188,6 +210,12 @@ def _refresh_positions(runner: WindowRunner, *, cfg: KngtopConfig, rows: list[di
         else:
             pos.shares_down += size
             pos.spent_down += cost
+    for side in ("UP", "DOWN"):
+        reflected_shares = max(0.0, pos.shares(side) - previous.shares(side))
+        if reflected_shares > 1e-12:
+            runner.sent_shares[side] = max(0.0, _local_sent_shares(runner, side) - reflected_shares)
+            reflected_cost = reflected_shares * pos.avg(side)
+            runner.sent_cost[side] = max(0.0, float(runner.sent_cost.get(side, 0.0)) - reflected_cost)
     runner.positions = pos
     return pos
 
@@ -232,6 +260,13 @@ def _projected_avg_sum(pos: PositionState, side: str, price: float) -> float:
     return up_avg + down_avg
 
 
+def _projected_worst_case_pnl(pos: PositionState, side: str, price: float) -> float:
+    spent_total = pos.spent_total() + ORDER_SHARES * price
+    up_shares = pos.shares_up + (ORDER_SHARES if side == "UP" else 0.0)
+    down_shares = pos.shares_down + (ORDER_SHARES if side == "DOWN" else 0.0)
+    return min(up_shares - spent_total, down_shares - spent_total)
+
+
 def _open_order_shares(runner: WindowRunner, side: str) -> float:
     return sum(max(0.0, order.remaining_shares) for order in runner.open_orders.get(side, []))
 
@@ -248,33 +283,72 @@ def _local_sent_total_cost(runner: WindowRunner) -> float:
     return max(0.0, float(runner.sent_cost.get("UP", 0.0))) + max(0.0, float(runner.sent_cost.get("DOWN", 0.0)))
 
 
-def _avg_sum_max_price(pos: PositionState, side: str) -> float:
-    other = "DOWN" if side == "UP" else "UP"
-    other_avg = pos.avg(other)
-    allowed_side_avg = AVG_SUM_CAP - other_avg
-    if allowed_side_avg <= 0.0:
-        return 0.0
-    spent = pos.spent_up if side == "UP" else pos.spent_down
-    shares = pos.shares_up if side == "UP" else pos.shares_down
-    return (allowed_side_avg * (shares + ORDER_SHARES) - spent) / ORDER_SHARES
-
-
-def _desired_price_for_side(runner: WindowRunner, side: str, ask_px: float | None, cfg: KngtopConfig) -> float | None:
+def _can_place_side_order(runner: WindowRunner, side: str, price: float, cfg: KngtopConfig, *, enforce_avg_cap: bool = True) -> bool:
     pos = runner.positions
     if _effective_side_exposure(runner, side) + ORDER_SHARES > float(cfg.max_shares_per_side) + 1e-12:
-        return None
-    if max(pos.spent_total(), _local_sent_total_cost(runner)) + OPENING_PRICE * ORDER_SHARES > MAX_SPENT_PER_WINDOW + 1e-12:
-        return None
-    if pos.shares(side) <= 1e-12:
-        return OPENING_PRICE
-    if ask_px is None or ask_px <= 0.0:
-        return None
-    max_price = min(float(ask_px), pos.avg(side) - AVG_IMPROVE_BUFFER, _avg_sum_max_price(pos, side), 0.99)
-    if max_price * ORDER_SHARES + 1e-12 < MIN_ORDER_USD:
-        return None
-    if _projected_avg_sum(pos, side, max_price) > AVG_SUM_CAP + 1e-12:
-        return None
-    return max(0.01, round(max_price, 2))
+        return False
+    if max(pos.spent_total(), _local_sent_total_cost(runner)) + price * ORDER_SHARES > MAX_SPENT_PER_WINDOW + 1e-12:
+        return False
+    if price * ORDER_SHARES + 1e-12 < MIN_ORDER_USD:
+        return False
+    if enforce_avg_cap and _projected_avg_sum(pos, side, price) > AVG_SUM_CAP + 1e-12:
+        return False
+    return True
+
+
+def _c_target_prices(runner: WindowRunner, *, up_ask: float | None, down_ask: float | None, cfg: KngtopConfig) -> dict[str, float | None]:
+    pos = runner.positions
+    asks = {"UP": up_ask, "DOWN": down_ask}
+    targets: dict[str, float | None] = {"UP": None, "DOWN": None}
+
+    def clean_price(side: str) -> float | None:
+        raw = asks.get(side)
+        if raw is None or raw <= 0.0:
+            return None
+        return round(max(0.01, min(0.99, float(raw))), 2)
+
+    if not pos.has_side("UP") and not pos.has_side("DOWN"):
+        up = clean_price("UP")
+        down = clean_price("DOWN")
+        if up is None and down is None:
+            return targets
+        side = "DOWN" if up is None else "UP" if down is None else "UP" if up <= down else "DOWN"
+        price = clean_price(side)
+        if price is not None and price <= C_INITIAL_CAP + 1e-12 and _can_place_side_order(runner, side, price, cfg):
+            targets[side] = price
+        return targets
+
+    if pos.has_side("UP") != pos.has_side("DOWN"):
+        side = "DOWN" if pos.has_side("UP") else "UP"
+        price = clean_price(side)
+        if price is not None and price <= C_MISSING_HEDGE_CAP + 1e-12 and _can_place_side_order(runner, side, price, cfg, enforce_avg_cap=False):
+            targets[side] = price
+        return targets
+
+    smaller_side: str | None
+    if pos.shares_up < pos.shares_down - C_BALANCE_EPSILON:
+        smaller_side = "UP"
+    elif pos.shares_down < pos.shares_up - C_BALANCE_EPSILON:
+        smaller_side = "DOWN"
+    else:
+        smaller_side = None
+
+    before_worst = pos.worst_case_pnl()
+    for side in ("UP", "DOWN"):
+        price = clean_price(side)
+        if price is None or not _can_place_side_order(runner, side, price, cfg):
+            continue
+        side_avg = pos.avg(side)
+        cheap_weak = side == smaller_side and price <= C_WEAK_CAP + 1e-12
+        avg_drop = side_avg > 1e-12 and price <= side_avg - AVG_IMPROVE_BUFFER + 1e-12
+        guarded_high = (
+            side == smaller_side
+            and price <= C_HIGH_GUARD + 1e-12
+            and _projected_worst_case_pnl(pos, side, price) > before_worst + 1e-12
+        )
+        if cheap_weak or avg_drop or guarded_high:
+            targets[side] = price
+    return targets
 
 
 def _cancel_order(runner: WindowRunner, *, clob: KngtopClob | None, order: OpenOrder, reason: str) -> bool:
@@ -367,10 +441,12 @@ def _tick_runner(
         return
     up_quote = poly.best_bid_ask_for(runner.contract.up.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     down_quote = poly.best_bid_ask_for(runner.contract.down.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
-    desired = {
-        "UP": _desired_price_for_side(runner, "UP", up_quote[1] if up_quote else None, cfg),
-        "DOWN": _desired_price_for_side(runner, "DOWN", down_quote[1] if down_quote else None, cfg),
-    }
+    desired = _c_target_prices(
+        runner,
+        up_ask=up_quote[1] if up_quote else None,
+        down_ask=down_quote[1] if down_quote else None,
+        cfg=cfg,
+    )
     now_monotonic = time.monotonic()
     _maintain_side_order(runner, side="UP", desired_price=desired["UP"], clob=clob, cfg=cfg, now_monotonic=now_monotonic)
     _sync_open_orders(runner, clob=clob)
@@ -486,7 +562,14 @@ def main() -> None:
         threading.Thread(target=_reconcile_loop, args=(threading.Event(),), kwargs={"clob": clob, "cfg": cfg, "runtime_state": runtime_state, "on_update": coord.notify}, name="limit-reconcile", daemon=True).start()
     runners: dict[int, WindowRunner] = {}
     runtime_state["runners"] = runners
-    _log_tag("INIT", pair=TRADE_PAIR_KEY, window_minutes=str(TRADE_WINDOW_MINUTES), strategy="two_sided_limit_engine", opening_price=f"{OPENING_PRICE:.2f}", order_shares=f"{ORDER_SHARES:.2f}")
+    _log_tag(
+        "INIT",
+        pair=TRADE_PAIR_KEY,
+        window_minutes=str(TRADE_WINDOW_MINUTES),
+        strategy="C_weak_cap045_high_guard060_limit5",
+        order_shares=f"{ORDER_SHARES:.2f}",
+        max_shares_per_side=f"{cfg.max_shares_per_side:.2f}",
+    )
     while True:
         coord.wait_for_turn()
         _run_iteration(cfg, runners=runners, poly=poly, clob=clob, runtime_state=runtime_state)
