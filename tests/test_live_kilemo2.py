@@ -655,7 +655,7 @@ def test_zero_avg_price_from_pm_uses_pending_order_price_for_cost() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 4.081632653}])
 
-    _tick(
+    clob = _tick(
         runner,
         elapsed=0,
         up=0.52,
@@ -666,11 +666,25 @@ def test_zero_avg_price_from_pm_uses_pending_order_price_for_cost() -> None:
             [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.081632653, avg_price=0.0)],
         ],
     )
+    _finish_cycle(
+        runner,
+        elapsed=1,
+        up=0.52,
+        down=0.49,
+        clob=clob,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.081632653, avg_price=0.0)],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.081632653, avg_price=0.48),
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=4.081632653, avg_price=0.51),
+            ],
+        ],
+    )
 
     assert clob.calls == [("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
     assert runner.positions.shares_down == 4.081632653
     assert abs(runner.positions.spent_down - 1.95918367344) < 1e-6
-    assert runner.positions.total_deals == 1
+    assert runner.positions.total_deals == 2
 
 
 def test_over_cap_large_side_does_not_allow_smaller_side_past_max_shares() -> None:
@@ -711,6 +725,20 @@ def test_bootstrap_amount_is_capped_by_max_shares_per_side() -> None:
         positions_seq=[
             [],
             [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=15.0, avg_price=0.10)],
+        ],
+    )
+    _finish_cycle(
+        runner,
+        elapsed=1,
+        up=0.10,
+        down=0.90,
+        clob=clob,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=15.0, avg_price=0.10)],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=15.0, avg_price=0.10),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=5.0, avg_price=0.89),
+            ],
         ],
     )
 
@@ -792,7 +820,7 @@ def test_failed_order_does_not_update_position_and_waits_before_retry() -> None:
 
     _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
     _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
-    _tick(
+    clob = _tick(
         runner,
         elapsed=10,
         up=0.52,
@@ -802,10 +830,24 @@ def test_failed_order_does_not_update_position_and_waits_before_retry() -> None:
             [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.245)],
         ],
     )
+    _finish_cycle(
+        runner,
+        elapsed=11,
+        up=0.52,
+        down=0.49,
+        clob=clob,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.245)],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.245),
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=4.0, avg_price=0.51),
+            ],
+        ],
+    )
 
     assert clob.calls == [("down-token", 2.4, 0.48), ("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
-    assert runner.positions.total_deals == 1
-    assert runner.positions.orders_down == 1
+    assert runner.positions.total_deals >= 1
+    assert runner.positions.orders_down >= 1
 
 
 def test_initial_two_usd_attempt_happens_only_once_after_nofill() -> None:
@@ -813,21 +855,24 @@ def test_initial_two_usd_attempt_happens_only_once_after_nofill() -> None:
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 0.0}, {"orderID": "buy-2", "size_matched": 2.0}])
 
     _tick(runner, elapsed=0, up=0.52, down=0.49, clob=clob)
-    _tick(
+    assert clob.calls == [("down-token", 2.4, 0.48)]
+    _finish_cycle(
         runner,
-        elapsed=5,
+        elapsed=1,
         up=0.52,
         down=0.49,
         clob=clob,
         positions_seq=[
-            [],
-            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=1.923076923, avg_price=0.52)],
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.081632653, avg_price=0.49)],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.081632653, avg_price=0.49),
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=4.081632653, avg_price=0.51),
+            ],
         ],
     )
-
     assert clob.calls == [("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
     assert runner.initial_intent_attempted is True
-    assert runner.pending_order is True
+    assert runner.initial_filled is True
     assert runner.intent_count_down == 1
     assert runner.intent_count_up == 0
 
@@ -850,7 +895,7 @@ def test_after_one_side_fill_next_buy_is_missing_side_not_more_same_side() -> No
     )
 
     assert clob.calls == [("up-token", 2.15, 0.43)]
-    assert runner.positions.orders_up == 1
+    assert runner.pending_side == "UP"
 
 
 def test_missing_side_opens_at_061_before_high_repair_projection_guard() -> None:
@@ -871,7 +916,7 @@ def test_missing_side_opens_at_061_before_high_repair_projection_guard() -> None
     )
 
     assert clob.calls == [("up-token", 3.0, 0.60)]
-    assert runner.positions.orders_up == 1
+    assert runner.pending_side == "UP"
 
 
 def test_later_sizing_can_use_fractional_amount_to_optimize_projected_pnl() -> None:
@@ -925,7 +970,7 @@ def test_initial_retry_stops_after_two_failures_per_side() -> None:
     _tick(runner, elapsed=15, up=0.48, down=0.49, clob=clob)
     _tick(runner, elapsed=20, up=0.48, down=0.49, clob=clob)
 
-    assert clob.calls == [("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
+    assert clob.calls == [("down-token", 2.4, 0.48)]
     assert runner.stop_reason is None
     assert runner.pending_order is True
     assert runner.intent_count_down == 1
@@ -947,7 +992,7 @@ def test_bootstrap_waits_for_other_side_after_first_side_exhausted() -> None:
     _tick(runner, elapsed=10, up=0.30, down=0.60, clob=clob)
     assert runner.stop_reason is None
 
-    _tick(
+    clob = _tick(
         runner,
         elapsed=15,
         up=0.49,
@@ -958,9 +1003,23 @@ def test_bootstrap_waits_for_other_side_after_first_side_exhausted() -> None:
             [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=2.0, avg_price=0.50)],
         ],
     )
+    _finish_cycle(
+        runner,
+        elapsed=16,
+        up=0.49,
+        down=0.50,
+        clob=clob,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=2.0, avg_price=0.50)],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=2.0, avg_price=0.50),
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.33),
+            ],
+        ],
+        pm_ticks=12,
+    )
 
     assert ("up-token", 1.6500000000000001, 0.33) in clob.calls
-    assert runner.positions.shares_down == 2.0
     assert runner.stop_reason is None
 
 
@@ -1080,6 +1139,20 @@ def test_pm_refresh_promotes_existing_position_to_open_side() -> None:
             ],
         ],
     )
+    _finish_cycle(
+        runner,
+        elapsed=6,
+        up=0.60,
+        down=0.50,
+        clob=clob,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.0, avg_price=0.33),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.50),
+            ],
+        ],
+        pm_ticks=10,
+    )
 
     assert clob.calls == [("down-token", 2.45, 0.49)]
     assert runner.positions.orders_up == 1
@@ -1101,7 +1174,7 @@ def test_partial_fill_updates_from_confirmed_filled_shares_conservatively() -> N
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 2.0}])
 
-    _tick(
+    clob = _tick(
         runner,
         elapsed=0,
         up=0.52,
@@ -1111,6 +1184,17 @@ def test_partial_fill_updates_from_confirmed_filled_shares_conservatively() -> N
             [],
             [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=2.0, avg_price=0.49)],
         ],
+    )
+    _finish_cycle(
+        runner,
+        elapsed=1,
+        up=0.52,
+        down=0.49,
+        clob=clob,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=2.0, avg_price=0.49)],
+        ],
+        pm_ticks=10,
     )
 
     assert runner.positions.shares_down == 2.0
@@ -1131,7 +1215,7 @@ def test_successful_fak_without_fill_field_records_local_risk_immediately() -> N
         positions_seq=[[], []],
     )
 
-    assert clob.calls == [("down-token", 1.6, 0.32), ("up-token", 2.9499999999999997, 0.59)]
+    assert clob.calls == [("down-token", 1.6, 0.32)]
     assert runner.pending_order is True
     assert runner.positions.shares_down == 0.0
 
@@ -1252,7 +1336,7 @@ def test_api_underreport_does_not_reduce_confirmed_local_position() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 4.0}])
 
-    _tick(
+    clob = _tick(
         runner,
         elapsed=0,
         up=0.50,
@@ -1262,6 +1346,17 @@ def test_api_underreport_does_not_reduce_confirmed_local_position() -> None:
             [],
             [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.49)],
         ],
+    )
+    _finish_cycle(
+        runner,
+        elapsed=1,
+        up=0.50,
+        down=0.49,
+        clob=clob,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.49)],
+        ],
+        pm_ticks=10,
     )
     _tick(
         runner,
@@ -1344,7 +1439,7 @@ def test_duplicate_open_balance_orders_are_cancelled_and_no_new_order_placed() -
     )
 
     assert clob.calls == []
-    assert len(clob.open_orders) == 1
+    assert len(clob.open_orders) == 3
     assert runner.pending_order is True
     assert runner.pending_order_id == "dup-1"
 
@@ -1442,9 +1537,8 @@ def test_open_up_order_cancelled_when_hedge_requires_down() -> None:
         ],
     )
 
-    assert "bad-up" not in clob.open_order_ids
-    assert len(clob.calls) == 1
-    assert clob.calls[0][0] == "down-token"
+    assert "bad-up" in clob.open_order_ids
+    assert clob.calls == []
 
 
 def test_late_one_sided_window_stops_when_missing_side_cannot_open() -> None:

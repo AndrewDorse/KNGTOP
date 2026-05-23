@@ -419,12 +419,24 @@ def _configured_locked_profit_roi(cfg: KngtopConfig) -> float:
     return max(0.0, float(getattr(cfg, "locked_profit_roi", LOCKED_PROFIT_STOP_ROI)))
 
 
-def _max_sends_per_side(cfg: KngtopConfig) -> int:
-    return max(1, int(_configured_max_shares_per_side(cfg) / LIMIT_MIN_SHARES))
+def _shares_reserved_on_side(runner: WindowRunner, side: str) -> float:
+    order = lo.active_order(runner)
+    if order is not None and order.side == str(side).upper():
+        return order.reserved_shares()
+    return 0.0
+
+
+def _effective_shares_on_side(runner: WindowRunner, side: str) -> float:
+    confirmed = _confirmed_position_state(runner)
+    return _shares_for_side(confirmed, side) + _shares_reserved_on_side(runner, side)
+
+
+def _share_headroom_on_side(runner: WindowRunner, side: str, cfg: KngtopConfig) -> float:
+    return max(0.0, _configured_max_shares_per_side(cfg) - _effective_shares_on_side(runner, side))
 
 
 def _can_send_on_side(runner: WindowRunner, side: str, cfg: KngtopConfig) -> bool:
-    return lo.sends_for_side(runner, side) < _max_sends_per_side(cfg)
+    return _share_headroom_on_side(runner, side, cfg) + 1e-12 >= LIMIT_MIN_SHARES
 
 
 def _locked_profit_target_usd(cfg: KngtopConfig) -> float:
@@ -536,19 +548,17 @@ def _required_hedge_side(state: PositionState, cfg: KngtopConfig) -> str | None:
 
 
 def _required_cycle_hedge_side(runner: WindowRunner, confirmed: PositionState, cfg: KngtopConfig) -> str | None:
-    """Opposite leg still needed after primary is on CLOB (never skip bootstrap hedge)."""
-    c = runner.cycle
+    """Opposite leg after primary fill is PM-confirmed — never same side as primary."""
     required = _required_hedge_side(confirmed, cfg)
-    if required is not None and required != c.primary_side:
-        if _can_send_on_side(runner, required, cfg) and not _side_over_cap(confirmed, required, cfg):
-            return required
+    if required is None or required == runner.cycle.primary_side:
         return None
-    other = lo.opposite_side(c.primary_side)
-    if has_real_position(confirmed, other):
+    if _side_over_cap(confirmed, required, cfg) or not _can_send_on_side(runner, required, cfg):
         return None
-    if not _can_send_on_side(runner, other, cfg) or _side_over_cap(confirmed, other, cfg):
-        return None
-    return other
+    return required
+
+
+def _cycle_leg_fill_confirmed(c: lo.OrderCycle, state: PositionState, side: str, expected_shares: float) -> bool:
+    return _cycle_side_progress(c, state, side, expected_shares)
 
 
 def _projected_abs_share_gap_after_limit(state: PositionState, side: str, price: float) -> float:
@@ -973,18 +983,6 @@ def _post_cycle_limit(
     return _extract_order_id(payload) if isinstance(payload, dict) else None
 
 
-def _link_existing_hedge_on_clob(runner: WindowRunner, hedge_side: str) -> bool:
-    """Track opposite-side CLOB order already open — no second post."""
-    views = lo.open_orders_on_side(runner, hedge_side)
-    if not views:
-        return False
-    view = views[0]
-    if not lo.cycle_begin_hedge(runner, side=hedge_side, price=view.price, shares=view.remaining_shares):
-        return False
-    lo.cycle_mark_hedge_sent(runner, view.order_id)
-    return True
-
-
 def _send_cycle_hedge(
     runner: WindowRunner,
     *,
@@ -1010,12 +1008,6 @@ def _send_cycle_hedge(
         )
         return True
     if not lo.cycle_begin_hedge(runner, side=hedge_side, price=hedge_price, shares=hedge_shares):
-        return True
-    if cfg.dry_run or clob is None:
-        oid = _post_cycle_limit(runner, side=hedge_side, price=hedge_price, shares=hedge_shares, clob=clob, cfg=cfg)
-        lo.cycle_mark_hedge_sent(runner, oid)
-        _record_local_fill(runner, hedge_side, hedge_price, hedge_cost, hedge_shares)
-        _begin_pm_wait(runner, cfg=cfg)
         return True
     try:
         oid = _post_cycle_limit(runner, side=hedge_side, price=hedge_price, shares=hedge_shares, clob=clob, cfg=cfg)
@@ -1054,12 +1046,17 @@ def _advance_order_cycle(
         if not primary_on_book:
             return True
         _log_tag("CYCLE PRIMARY ON BOOK", slug=runner.contract.slug, order_id=c.primary_order_id)
+        c.phase = lo.PHASE_WAIT_PRIMARY_FILL
+        return True
+
+    if c.phase == lo.PHASE_WAIT_PRIMARY_FILL:
         _refresh_positions_from_pm(runner, cfg=cfg)
         confirmed = _confirmed_position_state(runner)
+        if not _cycle_leg_fill_confirmed(c, confirmed, c.primary_side, c.primary_shares):
+            return True
+        _log_tag("CYCLE PRIMARY FILL", slug=runner.contract.slug, order_id=c.primary_order_id, side=c.primary_side)
         hedge_side = _required_cycle_hedge_side(runner, confirmed, cfg)
         if hedge_side is not None and not c.hedge_sent:
-            if _link_existing_hedge_on_clob(runner, hedge_side):
-                return True
             return _send_cycle_hedge(runner, hedge_side=hedge_side, up_ask=up_ask, down_ask=down_ask, clob=clob, cfg=cfg)
         _begin_pm_wait(runner, cfg=cfg)
         return True
@@ -1069,9 +1066,23 @@ def _advance_order_cycle(
             hedge_on_book = bool(c.hedge_order_id)
         else:
             hedge_on_book = lo.order_on_clob(runner, clob=clob, order_id=c.hedge_order_id, side=c.hedge_side)
-        if not hedge_on_book:
+        if hedge_on_book:
+            _log_tag("CYCLE HEDGE ON BOOK", slug=runner.contract.slug, order_id=c.hedge_order_id)
+            c.phase = lo.PHASE_WAIT_HEDGE_FILL
             return True
-        _log_tag("CYCLE HEDGE ON BOOK", slug=runner.contract.slug, order_id=c.hedge_order_id)
+        _refresh_positions_from_pm(runner, cfg=cfg)
+        confirmed = _confirmed_position_state(runner)
+        if _cycle_leg_fill_confirmed(c, confirmed, c.hedge_side, c.hedge_shares):
+            _log_tag("CYCLE HEDGE FILL", slug=runner.contract.slug, order_id=c.hedge_order_id, side=c.hedge_side)
+            _begin_pm_wait(runner, cfg=cfg)
+        return True
+
+    if c.phase == lo.PHASE_WAIT_HEDGE_FILL:
+        _refresh_positions_from_pm(runner, cfg=cfg)
+        confirmed = _confirmed_position_state(runner)
+        if not _cycle_leg_fill_confirmed(c, confirmed, c.hedge_side, c.hedge_shares):
+            return True
+        _log_tag("CYCLE HEDGE FILL", slug=runner.contract.slug, order_id=c.hedge_order_id, side=c.hedge_side)
         _begin_pm_wait(runner, cfg=cfg)
         return True
 
@@ -1079,17 +1090,6 @@ def _advance_order_cycle(
         _refresh_positions_from_pm(runner, cfg=cfg)
         pos = _confirmed_position_state(runner)
         if not _cycle_ready_to_close(runner, cfg):
-            missing = _missing_position_side(pos)
-            if missing is not None and not _cycle_side_progress(c, pos, missing, 0.5):
-                _log_tag(
-                    "CYCLE RESET",
-                    slug=runner.contract.slug,
-                    cycle_n=str(c.cycle_n),
-                    reason="one_sided_pm",
-                    missing=missing,
-                )
-                lo.cycle_reset(runner)
-                return False
             c.pm_stable_streak = 0
             _log_tag(
                 "CYCLE PM WAIT",
@@ -1173,7 +1173,6 @@ def _send_limit_buy(
     if cfg.dry_run or clob is None:
         oid = _post_cycle_limit(runner, side=side, price=price, shares=shares, clob=clob, cfg=cfg)
         lo.cycle_mark_primary_sent(runner, oid)
-        _record_local_fill(runner, side, price, amount_usd, shares)
         return True
 
     try:
@@ -1502,18 +1501,6 @@ def _tick_runner(
     down_quote = poly.best_bid_ask_for(runner.contract.down.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     up_ask = float(up_quote[1]) if up_quote is not None else 0.0
     down_ask = float(down_quote[1]) if down_quote is not None else 0.0
-
-    if lo.cycle_is_busy(runner) and not cfg.dry_run:
-        _refresh_positions_from_pm(runner, cfg=cfg)
-        pos = _confirmed_position_state(runner)
-        missing = _missing_position_side(pos)
-        c = runner.cycle
-        if (
-            missing is not None
-            and c.phase == lo.PHASE_WAIT_PM
-            and not _cycle_side_progress(c, pos, missing, 0.5)
-        ):
-            lo.cycle_reset(runner)
 
     if _advance_order_cycle(runner, clob=clob, cfg=cfg, up_ask=up_ask, down_ask=down_ask):
         return

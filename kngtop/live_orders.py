@@ -27,7 +27,9 @@ PM_STABLE_INTERVAL_SEC = 1.0
 
 PHASE_IDLE = "idle"
 PHASE_WAIT_PRIMARY = "wait_primary"
+PHASE_WAIT_PRIMARY_FILL = "wait_primary_fill"
 PHASE_WAIT_HEDGE = "wait_hedge"
+PHASE_WAIT_HEDGE_FILL = "wait_hedge_fill"
 PHASE_WAIT_PM = "wait_pm"
 
 MAX_SENDS_PER_CYCLE = 2
@@ -109,7 +111,7 @@ def active_order(runner: WindowRunner) -> LiveOrder | None:
     c = runner.cycle
     if cycle_is_idle(runner):
         return None
-    if c.phase in {PHASE_WAIT_HEDGE, PHASE_WAIT_PM} and c.hedge_sent:
+    if c.phase in {PHASE_WAIT_HEDGE, PHASE_WAIT_HEDGE_FILL, PHASE_WAIT_PM} and c.hedge_sent:
         side, price, shares = c.hedge_side, c.hedge_price, c.hedge_shares
         oid, reason = c.hedge_order_id, "hedge_limit"
     else:
@@ -398,71 +400,33 @@ def tick_pm_stable(runner: WindowRunner, *, up_shares: float, down_shares: float
     return c.pm_stable_streak >= PM_STABLE_CONFIRMS
 
 
-def cancel_open_order(
-    runner: WindowRunner,
-    *,
-    clob: KngtopClob | None,
-    view: OpenOrderView,
-    reason: str,
-) -> bool:
-    if clob is None:
-        return False
-    keep_ids = {runner.cycle.primary_order_id, runner.cycle.hedge_order_id} - {None}
-    if view.order_id in keep_ids:
-        return False
-    try:
-        clob.cancel_order_by_id(view.order_id)
-    except Exception as exc:  # noqa: BLE001
-        _log_tag("LIMIT CANCEL", slug=runner.contract.slug, order_id=view.order_id, error=str(exc))
-        return False
-    _log_tag("LIMIT CANCEL", slug=runner.contract.slug, order_id=view.order_id, reason=reason)
-    sync_clob_open_orders(runner, clob=clob)
-    return True
-
-
 def enforce_single_order(
     runner: WindowRunner,
     *,
     clob: KngtopClob | None,
     required_side: str | None,
 ) -> bool:
-    """Cancel stray CLOB orders; adopt one orphan on required side when idle."""
+    """Adopt one matching orphan CLOB order when idle. Never cancel or re-post."""
     if clob is None:
         return cycle_is_busy(runner)
     sync_clob_open_orders(runner, clob=clob)
+    if not cycle_is_idle(runner):
+        return cycle_is_busy(runner)
     keep_ids = {runner.cycle.primary_order_id, runner.cycle.hedge_order_id} - {None}
     views = [v for v in runner_open_order_views(runner) if v.order_id not in keep_ids]
     if not views:
         return cycle_is_busy(runner)
-
-    up_views = [v for v in views if v.side == "UP"]
-    down_views = [v for v in views if v.side == "DOWN"]
-
-    if required_side is None and up_views and down_views and cycle_is_idle(runner):
-        from kngtop.live_kilemo2 import _confirmed_position_state
-
-        pos = _confirmed_position_state(runner)
-        adopt_open_order(runner, view=up_views[0], pm_up=pos.shares_up, pm_down=pos.shares_down)
-        for extra in up_views[1:]:
-            cancel_open_order(runner, clob=clob, view=extra, reason="duplicate_open")
-        for extra in down_views[1:]:
-            cancel_open_order(runner, clob=clob, view=extra, reason="duplicate_open")
-        return True
-
-    keep_one: OpenOrderView | None = None
+    pick: OpenOrderView | None = None
     for view in views:
         if required_side is not None and view.side != required_side:
-            cancel_open_order(runner, clob=clob, view=view, reason="wrong_side")
             continue
-        if keep_one is None:
-            keep_one = view
-            continue
-        cancel_open_order(runner, clob=clob, view=view, reason="duplicate_open")
-    if keep_one is not None and cycle_is_idle(runner):
+        pick = view
+        break
+    if pick is not None:
         from kngtop.live_kilemo2 import _confirmed_position_state
 
         pos = _confirmed_position_state(runner)
-        adopt_open_order(runner, view=keep_one, pm_up=pos.shares_up, pm_down=pos.shares_down)
+        adopt_open_order(runner, view=pick, pm_up=pos.shares_up, pm_down=pos.shares_down)
     return bool(runner_open_order_views(runner)) or cycle_is_busy(runner)
 
 

@@ -83,20 +83,25 @@ def test_cycle_mark_primary_sent_counts_side() -> None:
     assert runner.orders_sent == 1
 
 
-def test_mandatory_hedge_side_when_flat() -> None:
-    from kngtop.live_kilemo2 import _required_cycle_hedge_side
+def test_hedge_side_only_after_primary_fill() -> None:
+    from kngtop.live_kilemo2 import PositionState, _required_cycle_hedge_side
 
     runner = _runner(1_700_000_000)
     lo.cycle_begin_primary(runner, side="DOWN", price=0.48, shares=5.0, reason="initial_lower_ask")
-    assert _required_cycle_hedge_side(runner, runner.positions, _cfg()) == "UP"
+    assert _required_cycle_hedge_side(runner, runner.positions, _cfg()) is None
+    filled = PositionState(spent_down=2.0, shares_down=5.0, orders_down=1, total_deals=1)
+    runner.cycle.pm_down_start = 0.0
+    assert _required_cycle_hedge_side(runner, filled, _cfg()) == "UP"
 
 
-def test_send_cap_blocks_fourth_order_on_side() -> None:
-    from kngtop.live_kilemo2 import _can_send_on_side
+def test_share_cap_blocks_when_at_max_shares_per_side() -> None:
+    from kngtop.live_kilemo2 import PositionState, _can_send_on_side
 
+    cfg = _cfg()
     runner = _runner(1_700_000_000)
-    runner.sends_up = 3
-    assert not _can_send_on_side(runner, "UP", _cfg())
+    runner.positions = PositionState(shares_up=15.0, orders_up=3, total_deals=3)
+    runner.api_positions = runner.positions
+    assert not _can_send_on_side(runner, "UP", cfg)
 
 
 def test_order_on_clob_detects_open_order() -> None:
