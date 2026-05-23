@@ -136,6 +136,7 @@ class WindowRunner:
     initial_failed_down: int = 0
     intent_count_up: int = 0
     intent_count_down: int = 0
+    orders_sent: int = 0
     orders: dict[str, lo.LiveOrder] = field(default_factory=dict)
     open_orders: dict[str, list[lo.OpenOrderView]] = field(default_factory=lambda: {"UP": [], "DOWN": []})
     last_reconcile_monotonic: float = 0.0
@@ -433,6 +434,10 @@ def _over_cap_side(state: PositionState, cfg: KngtopConfig) -> str | None:
     return None
 
 
+def _side_over_cap(state: PositionState, side: str, cfg: KngtopConfig) -> bool:
+    return _shares_for_side(state, side) > _configured_max_shares_per_side(cfg) + 1e-12
+
+
 def _share_room(state: PositionState, side: str, cfg: KngtopConfig) -> float:
     return max(0.0, _configured_max_shares_per_side(cfg) - _shares_for_side(state, side))
 
@@ -448,18 +453,20 @@ def _can_place_limit_buy(runner: WindowRunner, side: str, price: float, cfg: Kng
     cost = shares * max(price, 0.0)
     if shares <= 0.0 or cost + 1e-12 < LIMIT_MIN_USD:
         return False
-    state = _effective_state_with_pending(runner)
-    if not _can_buy(state, side, cost, ask_px=price, cfg=cfg):
-        return False
     confirmed = _confirmed_position_state(runner)
+    if _side_over_cap(confirmed, side, cfg):
+        return False
     required_side = _required_hedge_side(confirmed, cfg)
     if required_side is not None and side != required_side:
         return False
-    if not state.both_sides_traded():
+    state = lo.projected_positions(runner, confirmed)
+    if not _can_buy(state, side, cost, ask_px=price, cfg=cfg):
+        return False
+    if not confirmed.both_sides_traded():
         return True
     if _limit_order_respects_share_gap(state, side, price, cfg):
         return True
-    return _balance_required_side(state, cfg) == side and _balance_limit_improves_gap(state, side, price, cfg)
+    return _balance_required_side(confirmed, cfg) == side and _balance_limit_improves_gap(state, side, price, cfg)
 
 
 def _cap_amount_to_share_room(state: PositionState, side: str, ask_px: float, amount_usd: float, cfg: KngtopConfig) -> float | None:
@@ -930,11 +937,13 @@ def _apply_cached_reconcile_snapshot(
         if time.perf_counter() - runner.last_reconcile_monotonic + 1e-12 < lo.RECONCILE_INTERVAL_SEC:
             return
         _refresh_positions_from_pm(runner, cfg=cfg)
+        confirmed = _confirmed_position_state(runner)
         lo.reconcile_runner_orders(
             runner,
             clob=clob,
             open_order_rows=clob.get_open_orders(),
             now_ts=time.time(),
+            pre_shares_by_side={"UP": confirmed.shares_up, "DOWN": confirmed.shares_down},
         )
         runner.last_reconcile_monotonic = time.perf_counter()
         return
@@ -945,7 +954,14 @@ def _apply_cached_reconcile_snapshot(
     )
     open_rows = list(runtime_state.get("reconcile_open_orders", []))
     _refresh_positions_from_pm(runner, cfg=cfg, rows=position_rows)
-    lo.reconcile_runner_orders(runner, clob=clob, open_order_rows=open_rows, now_ts=float(runtime_state.get("reconcile_wall_ts", time.time())))
+    confirmed = _confirmed_position_state(runner)
+    lo.reconcile_runner_orders(
+        runner,
+        clob=clob,
+        open_order_rows=open_rows,
+        now_ts=float(runtime_state.get("reconcile_wall_ts", time.time())),
+        pre_shares_by_side={"UP": confirmed.shares_up, "DOWN": confirmed.shares_down},
+    )
     runner.reconcile_seq = seq
     runner.last_reconcile_monotonic = float(runtime_state.get("reconcile_cache_at", time.perf_counter()))
     active = lo.active_order(runner)
@@ -957,59 +973,6 @@ def _apply_cached_reconcile_snapshot(
         down_open=str(len(runner.open_orders.get("DOWN", []))),
         orders_active=str(1 if active is not None else 0),
     )
-
-
-def _reconcile_fills_from_pm(runner: WindowRunner, *, cfg: KngtopConfig, clob: KngtopClob | None) -> None:
-    order = lo.active_order(runner)
-    if order is None or order.side not in {"UP", "DOWN"}:
-        return
-    if clob is not None:
-        lo.reconcile_runner_orders(
-            runner,
-            clob=clob,
-            open_order_rows=clob.get_open_orders(),
-            now_ts=time.time(),
-        )
-    pre_shares = _shares_for_side(runner.positions, order.side)
-    try:
-        refreshed = _refresh_positions_from_pm(runner, cfg=cfg)
-    except Exception as exc:  # noqa: BLE001
-        _log_tag("FILL_RECONCILE", slug=runner.contract.slug, status="error", error=str(exc))
-        return
-    new_shares = _shares_for_side(refreshed, order.side)
-    if new_shares <= pre_shares + 1e-6:
-        return
-    filled_delta = new_shares - pre_shares
-    if filled_delta > 1e-12 and order.price > 1e-12:
-        _record_local_fill(runner, order.side, order.price, filled_delta * order.price, filled_delta, ensure_floor=False)
-    runner.last_successful_buy_ts = order.sent_ts
-    runner.last_position_refresh_ts = order.sent_ts
-    still_open = [
-        row for row in lo.runner_open_order_views(runner) if row.order_id == order.order_id
-    ]
-    if still_open:
-        fully_filled = filled_delta + 1e-12 >= order.shares or order.matched_shares + 1e-12 >= order.shares
-        if not fully_filled and still_open[0].remaining_shares > 1e-12:
-            order.remaining_shares = still_open[0].remaining_shares
-            order.matched_shares = max(0.0, order.shares - order.remaining_shares)
-            order.status = lo.ORDER_PARTIAL if order.remaining_shares > 1e-12 else lo.ORDER_FILLED
-            _log_tag(
-                "LIMIT PARTIAL",
-                slug=runner.contract.slug,
-                side=order.side,
-                order_id=order.order_id,
-                matched=f"{filled_delta:.6f}",
-                remaining=f"{order.remaining_shares:.6f}",
-            )
-            if order.status == lo.ORDER_FILLED and _is_initial_reason(order.reason):
-                runner.initial_filled = True
-            return
-    lo.mark_filled(order)
-    if _is_initial_reason(order.reason):
-        runner.initial_filled = True
-    runner.next_decision_ts = datetime.now(timezone.utc).timestamp()
-    _log_tag("LIMIT FILLED", slug=runner.contract.slug, side=order.side, order_id=order.order_id)
-    del clob
 
 
 def _next_retry_delay(reason: str) -> float:
@@ -1115,6 +1078,44 @@ def _log_pnl_projection(runner: WindowRunner, *, side: str, ask_px: float, amoun
     )
 
 
+def _wait_active_deal(runner: WindowRunner, *, cfg: KngtopConfig, clob: KngtopClob | None) -> bool:
+    """If a deal is in flight: refresh PM, close only on PM fill. Returns True while waiting."""
+    order = lo.active_order(runner)
+    if order is None:
+        return False
+    if clob is not None:
+        confirmed = _confirmed_position_state(runner)
+        lo.reconcile_runner_orders(
+            runner,
+            clob=clob,
+            open_order_rows=clob.get_open_orders(),
+            now_ts=time.time(),
+            pre_shares_by_side={"UP": confirmed.shares_up, "DOWN": confirmed.shares_down},
+        )
+    _refresh_positions_from_pm(runner, cfg=cfg)
+    confirmed = _confirmed_position_state(runner)
+    current_shares = _shares_for_side(confirmed, order.side)
+    if not lo.deal_done_on_pm(order, current_shares):
+        _refresh_positions_from_pm(runner, cfg=cfg)
+        confirmed = _confirmed_position_state(runner)
+        current_shares = _shares_for_side(confirmed, order.side)
+    on_clob = bool(
+        order.order_id
+        and any(v.order_id == order.order_id for v in lo.runner_open_order_views(runner))
+    )
+    if lo.complete_deal_if_pm_confirmed(runner, order, current_shares=current_shares, on_clob=on_clob):
+        runner.local_positions = _copy_position_state(confirmed)
+        if _is_initial_reason(order.reason):
+            runner.initial_filled = True
+        runner.last_successful_buy_ts = order.sent_ts
+        runner.next_decision_ts = datetime.now(timezone.utc).timestamp()
+        return False
+    if order.status in lo.TERMINAL_STATUSES:
+        return False
+    lo.log_deal_state(runner)
+    return True
+
+
 def _send_limit_buy(
     *,
     runner: WindowRunner,
@@ -1127,7 +1128,8 @@ def _send_limit_buy(
 ) -> bool:
     if price <= 0.0 or price > min(MAX_ORDER_PRICE, float(cfg.market_buy_max_price)) + 1e-12:
         return False
-    pre_state = _copy_position_state(runner.positions)
+    pre_state = _copy_position_state(_confirmed_position_state(runner))
+    pre_shares = _shares_for_side(pre_state, side)
     shares = _limit_order_shares(price)
     amount_usd = shares * price
     if not _can_place_limit_buy(runner, side, price, cfg):
@@ -1139,21 +1141,25 @@ def _send_limit_buy(
             price=f"{price:.4f}",
             shares=f"{shares:.6f}",
             amount=f"{amount_usd:.2f}",
+            up_shares=f"{pre_state.shares_up:.6f}",
+            down_shares=f"{pre_state.shares_down:.6f}",
         )
         return False
-    if not cfg.dry_run and clob is not None and lo.has_active_order(runner):
-        _log_tag("LIMIT BLOCK", slug=runner.contract.slug, side=side, reason="active_open_order_exists")
+    if lo.has_active_order(runner):
+        _log_tag("LIMIT BLOCK", slug=runner.contract.slug, side=side, reason="in_flight_deal")
         return False
     confirmed = _confirmed_position_state(runner)
     required_side = _required_hedge_side(confirmed, cfg)
-    if not cfg.dry_run and clob is not None and lo.enforce_single_order(runner, clob=clob, required_side=required_side):
-        _log_tag("LIMIT BLOCK", slug=runner.contract.slug, side=side, reason="active_open_order_exists")
-        return False
+    if not cfg.dry_run and clob is not None:
+        lo.enforce_single_order(runner, clob=clob, required_side=required_side)
+        if lo.has_active_order(runner):
+            _log_tag("LIMIT BLOCK", slug=runner.contract.slug, side=side, reason="clob_open_order_exists")
+            return False
 
     _log_current_pnl_state(runner)
     _log_pnl_projection(runner, side=side, ask_px=price, amount_usd=amount_usd)
     _record_order_intent(runner, side=side)
-    if _is_initial_reason(reason) and runner.positions.total_deals == 0:
+    if _is_initial_reason(reason) and confirmed.total_deals == 0:
         _record_initial_intent(runner, side=side, ask_px=price, elapsed=elapsed)
 
     token = _token_for_side(runner, side)
@@ -1165,22 +1171,15 @@ def _send_limit_buy(
         price=price,
         shares=shares,
         reason=reason,
+        pre_shares=pre_shares,
         sent_ts=sent_ts,
     )
-    _log_tag(
-        "LIMIT SENT",
-        slug=runner.contract.slug,
-        side=side,
-        reason=reason,
-        price=f"{price:.4f}",
-        shares=f"{shares:.6f}",
-        amount=f"{amount_usd:.2f}",
-        client_id=live_order.client_id,
-    )
+    if live_order is None:
+        return False
 
     if cfg.dry_run or clob is None:
-        lo.mark_filled(live_order)
         _record_local_fill(runner, side, price, amount_usd, shares)
+        lo.mark_filled(live_order, pm_shares=pre_shares + shares)
         if _is_initial_reason(reason):
             runner.initial_filled = True
         _schedule_next_decision(runner, now_ts=sent_ts, reason=reason)
@@ -1192,43 +1191,30 @@ def _send_limit_buy(
         order_id = _extract_order_id(payload)
         if not order_id:
             lo.mark_failed(live_order, error="missing order id")
-            if _is_initial_reason(reason) and runner.positions.total_deals == 0:
+            if _is_initial_reason(reason) and confirmed.total_deals == 0:
                 _record_initial_failure(runner, side=side)
             _schedule_next_decision(runner, now_ts=sent_ts, reason=reason)
             return False
         lo.mark_posted(live_order, order_id=order_id)
-        if clob is not None:
-            lo.reconcile_runner_orders(
-                runner,
-                clob=clob,
-                open_order_rows=clob.get_open_orders(),
-                now_ts=sent_ts,
-            )
-        for _ in range(2):
-            _refresh_positions_from_pm(runner, cfg=cfg)
-            if _shares_for_side(runner.positions, side) > _shares_for_side(pre_state, side) + 1e-6:
-                break
-        if _shares_for_side(runner.positions, side) > _shares_for_side(pre_state, side) + 1e-6:
-            filled_delta = _shares_for_side(runner.positions, side) - _shares_for_side(pre_state, side)
-            if filled_delta > 1e-12 and price > 1e-12:
-                _record_local_fill(runner, side, price, filled_delta * price, filled_delta, ensure_floor=False)
-            lo.mark_filled(live_order)
-            if _is_initial_reason(reason):
-                runner.initial_filled = True
-            _schedule_next_decision(runner, now_ts=sent_ts, reason=reason)
-            _log_tag("LIMIT FILLED_IMMEDIATE", slug=runner.contract.slug, side=side, order_id=order_id)
-            return True
-        _log_tag("LIMIT POSTED", slug=runner.contract.slug, side=side, order_id=order_id)
+        lo.reconcile_runner_orders(
+            runner,
+            clob=clob,
+            open_order_rows=clob.get_open_orders(),
+            now_ts=sent_ts,
+        )
+        _log_tag(
+            "DEAL WAITING",
+            slug=runner.contract.slug,
+            side=side,
+            order_id=order_id,
+            pre_shares=f"{pre_shares:.6f}",
+            send_n=str(runner.orders_sent),
+        )
         return True
     except Exception as exc:  # noqa: BLE001
         if live_order.order_id:
-            _refresh_positions_from_pm(runner, cfg=cfg)
-            if _shares_for_side(runner.positions, side) > _shares_for_side(pre_state, side) + 1e-6:
-                lo.mark_filled(live_order)
-                if _is_initial_reason(reason):
-                    runner.initial_filled = True
-                _log_tag("LIMIT FILLED_AFTER_ERROR", slug=runner.contract.slug, side=side, error=str(exc))
-                _schedule_next_decision(runner, now_ts=sent_ts, reason=reason)
+            _wait_active_deal(runner, cfg=cfg, clob=clob)
+            if not lo.has_active_order(runner):
                 return True
         lo.mark_failed(live_order, error=str(exc))
         if _is_balance_or_allowance_error(exc):
@@ -1239,7 +1225,7 @@ def _send_limit_buy(
             _log_tag("LIMIT CROSSED", slug=runner.contract.slug, side=side, reason=reason, error=str(exc))
             _schedule_next_decision(runner, now_ts=sent_ts, reason=reason)
             return False
-        if _is_initial_reason(reason) and runner.positions.total_deals == 0:
+        if _is_initial_reason(reason) and confirmed.total_deals == 0:
             _record_initial_failure(runner, side=side)
         _log_tag("LIMIT FAILED", slug=runner.contract.slug, side=side, reason=reason, error=str(exc))
         _schedule_next_decision(runner, now_ts=sent_ts, reason=reason)
@@ -1349,19 +1335,29 @@ def _choose_guarded_pnl_buy(
         and not has_real_position(confirmed, "DOWN")
     ):
         return _choose_initial_buy(runner, up_ask=up_ask, down_ask=down_ask, elapsed=elapsed, cfg=cfg)
-    over_cap_side = _over_cap_side(state, cfg)
+    over_cap_side = _over_cap_side(confirmed, cfg)
+    required_side = _required_hedge_side(confirmed, cfg)
     if over_cap_side is not None:
-        runner.stop_reason = "over_cap_position"
+        if required_side is None or required_side == over_cap_side:
+            runner.stop_reason = "over_cap_position"
+            _log_tag(
+                "STOP",
+                slug=runner.contract.slug,
+                reason="over_cap_position",
+                side=over_cap_side,
+                up_shares=f"{confirmed.shares_up:.6f}",
+                down_shares=f"{confirmed.shares_down:.6f}",
+                max_side_shares=f"{_configured_max_shares_per_side(cfg):.6f}",
+            )
+            return None
         _log_tag(
-            "STOP",
+            "OVER_CAP_HEDGE",
             slug=runner.contract.slug,
-            reason="over_cap_position",
-            side=over_cap_side,
-            up_shares=f"{state.shares_up:.6f}",
-            down_shares=f"{state.shares_down:.6f}",
-            max_side_shares=f"{_configured_max_shares_per_side(cfg):.6f}",
+            over_side=over_cap_side,
+            hedge_side=required_side,
+            up_shares=f"{confirmed.shares_up:.6f}",
+            down_shares=f"{confirmed.shares_down:.6f}",
         )
-        return None
     if _locked_profit_stop_reached(state, cfg):
         runner.stop_reason = "locked_profit"
         _log_tag(
@@ -1376,7 +1372,6 @@ def _choose_guarded_pnl_buy(
         )
         return None
 
-    required_side = _required_hedge_side(confirmed, cfg)
     if required_side is not None:
         if (hedge_action := _hedge_limit_repair_action(runner, up_ask=up_ask, down_ask=down_ask, cfg=cfg)) is not None:
             return hedge_action
@@ -1710,14 +1705,21 @@ def _tick_runner(
     if not cfg.dry_run:
         try:
             _apply_cached_reconcile_snapshot(runner, runtime_state=state, cfg=cfg, clob=clob)
-            _reconcile_fills_from_pm(runner, cfg=cfg, clob=clob)
             confirmed = _confirmed_position_state(runner)
             required_side = _required_hedge_side(confirmed, cfg)
             if clob is not None:
+                if not lo.has_active_order(runner):
+                    lo.reconcile_runner_orders(
+                        runner,
+                        clob=clob,
+                        open_order_rows=clob.get_open_orders(),
+                        now_ts=time.time(),
+                        pre_shares_by_side={"UP": confirmed.shares_up, "DOWN": confirmed.shares_down},
+                    )
                 lo.enforce_single_order(runner, clob=clob, required_side=required_side)
         except Exception as exc:  # noqa: BLE001
             _log_tag("RECONCILE", slug=runner.contract.slug, status="error", error=str(exc))
-    if lo.has_active_order(runner):
+    if _wait_active_deal(runner, cfg=cfg, clob=clob):
         return
     if runner.next_decision_ts > now_ts + 1e-12:
         return
@@ -1764,6 +1766,8 @@ def _tick_runner(
         cfg=cfg,
         current_winning_side=current_winning_side,
     ):
+        if not cfg.dry_run:
+            _wait_active_deal(runner, cfg=cfg, clob=clob)
         return
     runner.next_decision_ts = now_ts + float(ACTIVE_REPAIR_INTERVAL_SEC)
 

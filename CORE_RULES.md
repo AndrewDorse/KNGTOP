@@ -1,25 +1,28 @@
 # Core Rules
 
-- Trade BTC 5m UP/DOWN windows only.
-- First buy: lower-ask side, max `$2`, only if ask is `<= 0.55`.
-- If first buy fails/no-fills, retries are `$1+`, not another blind `$2`.
-- Always confirm live fills from Polymarket positions before counting shares/spend.
-- Missing side gets priority until both sides are open.
-- After both sides are open, keep buying the worse PnL side if that side improves, until both sides are profitable.
-- Repair buys after both sides are open should be below that side's current avg, so avg sum improves.
-- Prefer the current winning side to be equal or slightly bigger, while keeping sizes close.
-- Later buys can be any cent amount from `$1.00` to `$2.00`.
-- Max `15` shares per side by default.
-- Max share gap `2` shares between UP and DOWN after each fill.
-- If share gap exceeds max, only buy the smaller side until balanced.
-- One limit order at a time; wait for fill/cancel before sending another.
-- Every 1 second, reconcile Polymarket positions (REST) and all CLOB open orders; wake strategy on updates.
-- All orders live in `runner.orders` (`LiveOrder` registry in `live_orders.py`); cleared on new window.
-- Order lifecycle transitions happen only in reconcile: `intent → posting → open → partial → filled/cancelled/failed`.
-- Register intent before CLOB post; confirm fills from PM positions (never blocking sleep in send path).
-- Adopt orphan CLOB open orders into the registry; cancel wrong-side/duplicate limits via `enforce_single_order`.
-- Act only on reconciled state: PM positions for decisions, `has_active_order()` for send gates, registry for lifecycle.
-- If imbalanced and no active order exists, place a balance limit immediately (do not wait for repair slot).
-- Hedge side is decided from confirmed fills only; never stack more on an already-open one-sided leg.
-- Do not buy if it breaks budget/share cap; avg-sum/balance guards apply after both sides are profitable.
-- Stop only when both outcomes reach the configured ROI target.
+## Deal gate — ONE order, wait for PM, then next
+
+1. **Send one order** — `register_intent()` refuses if any deal is in flight.
+2. **Do nothing until PM confirms** — after post, every tick runs `_wait_active_deal()`: refresh PM API, compare `shares_side` to `order.pre_shares`. No strategy until fill confirmed or order failed/cancelled.
+3. **Only then next order** — deal closes with `[ORDER DONE]` when PM shows new shares; next send allowed.
+4. **Count sends** — `runner.orders_sent` + log `[ORDER SEND] send_n=N`.
+
+## Position truth
+
+- All cap/gap/hedge decisions from PM-confirmed positions (`_confirmed_position_state`).
+- Never buy the over-cap side; still hedge the smaller side when the other leg is over cap.
+
+## Strategy (unchanged)
+
+- BTC 5m UP/DOWN only.
+- Missing/smaller side gets priority when share gap > max (default 2).
+- Max 15 shares per side; one limit at a time.
+- Reconcile CLOB + PM every 1s.
+
+## Logs
+
+- `[ORDER SEND]` — order going out
+- `[ORDER ON BOOK]` — posted, waiting PM
+- `[DEAL] state=WAIT_PM_FILL` — blocked, waiting fill
+- `[ORDER DONE]` — PM confirmed, idle again
+- `[OVER_CAP_HEDGE]` — over cap on one side, hedging the other

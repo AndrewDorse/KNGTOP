@@ -6,40 +6,19 @@ alwaysApply: false
 
 # Live Trading Pre-Commit Checklist
 
-Run before every commit touching order/position/reconcile logic:
-
 ```bash
 pytest tests/test_live_kilemo2.py tests/test_live_orders.py -q
 ```
 
-## Invariants (must never break)
+## Invariants
 
-1. **Hedge from confirmed fills only** — `_required_hedge_side(_confirmed_position_state(), cfg)`.
-2. **One active limit per window** — `lo.has_active_order(runner)` gates all sends.
-3. **Missing side → opposite leg only** — cancel wrong-side via `lo.enforce_single_order()`.
-4. **No rebootstrap with existing leg** — initial buy only when both sides empty.
-5. **PM positions authoritative** — `_merge_effective_positions()` max shares, never shrink local.
-6. **Every send registered** — `lo.register_intent()` before CLOB call; lifecycle in reconcile only.
-7. **Partial fill stays active** — PM delta + CLOB still open ⇒ `ORDER_PARTIAL`, not terminal.
-8. **New window clears orders** — `lo.clear_window_orders()` on window purge.
-
-## Common bugs (historical)
-
-| Bug | Symptom | Check |
-|-----|---------|-------|
-| Re-bootstrap on one-sided leg | Second UP after UP fill | `test_up_position_with_zero_deals_posts_down_limit_not_second_up` |
-| Duplicate limits | Multiple CLOB orders | `enforce_single_order` + `has_active_order` |
-| Orphan CLOB order not tracked | Duplicate send | `test_orphan_open_order_is_adopted` |
-| PM seq consumed before post fill | Fill missed same tick | Double PM refresh after post |
-| Stray PM row during bootstrap | Wrong side counted | Bootstrap PM filter when zero confirmed shares |
-| Exception before order_id | False fill confirm | Only PM-confirm on exception if `order_id` set |
+1. **One deal in flight** — `has_active_order()` blocks strategy; `register_intent()` refuses second send.
+2. **Wait for PM fill** — `_wait_active_deal()` every tick; deal closes only when PM shares > `order.pre_shares`.
+3. **No strategy while waiting** — tick returns immediately after `[DEAL] state=WAIT_PM_FILL`.
+4. **Hedge under-cap side** — when one leg over cap (e.g. 20 UP), still post limit on smaller side (DOWN).
+5. **Never buy over-cap side** — `_side_over_cap()` blocks that side only.
+6. **Adopted CLOB orders** — baseline `pre_shares` from PM at adopt time (no false fill).
 
 ## Tick order
 
-`_apply_cached_reconcile_snapshot` → `_reconcile_fills_from_pm` → `enforce_single_order` → `has_active_order` gate → strategy.
-
-## Code hygiene
-
-- Order logic lives in `live_orders.py`; strategy in `live_kilemo2.py`.
-- No `pending_*` fields; use `LiveOrder` registry + properties for compatibility.
-- No `_send_fak_buy` or blocking `_confirm_fill_from_pm` loops in send path.
+reconcile PM+CLOB → adopt orphans → `_wait_active_deal` → (if idle) strategy → send → `_wait_active_deal` again

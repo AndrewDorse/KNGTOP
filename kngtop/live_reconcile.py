@@ -39,8 +39,17 @@ SentOrderRecord = LiveOrder
 TrackedLimitOrder = OpenOrderView
 
 
-def register_sent_order(runner, *, order_id: str, side: str, token_id: str, price: float, shares: float, reason: str, sent_ts: float):
-    order = register_intent(runner, side=side, token_id=token_id, price=price, shares=shares, reason=reason, sent_ts=sent_ts)
+def register_sent_order(runner, *, order_id: str, side: str, token_id: str, price: float, shares: float, reason: str, sent_ts: float, pre_shares: float = 0.0):
+    order = register_intent(
+        runner,
+        side=side,
+        token_id=token_id,
+        price=price,
+        shares=shares,
+        reason=reason,
+        pre_shares=pre_shares,
+        sent_ts=sent_ts,
+    )
     if order_id:
         from kngtop.live_orders import mark_posted
 

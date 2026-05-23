@@ -25,6 +25,7 @@ def _inject_active_order(
         price=price,
         shares=shares,
         reason="test",
+        pre_shares=0.0,
         sent_ts=0.0,
     )
     lo.mark_posted(order, order_id=order_id)
@@ -314,7 +315,7 @@ def test_high_price_above_065_is_blocked_before_240s() -> None:
     assert clob.calls == []
 
 
-def test_final_60_blocks_when_existing_position_is_over_cap() -> None:
+def test_final_60_hedges_smaller_side_when_other_over_cap() -> None:
     state = PositionState(spent_up=2.0, shares_up=1.0, spent_down=8.0, shares_down=25.0, orders_up=1, orders_down=4, total_deals=5)
     runner = _runner(1_700_000_000, positions=state)
     clob = _tick(
@@ -327,15 +328,11 @@ def test_final_60_blocks_when_existing_position_is_over_cap() -> None:
                 _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=1.0, avg_price=2.0),
                 _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=25.0, avg_price=0.32),
             ],
-            [
-                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=3.5, avg_price=1.142857),
-                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=25.0, avg_price=0.32),
-            ],
         ],
     )
 
-    assert clob.calls == []
-    assert runner.stop_reason == "over_cap_position"
+    assert clob.calls == [("up-token", 3.95, 0.79)]
+    assert runner.pending_side == "UP"
 
 
 def test_locked_profit_only_allows_cheap_or_imbalanced_buys() -> None:
@@ -398,7 +395,7 @@ def test_budget_cap_blocks_new_buy() -> None:
     assert runner.positions.spent_total() <= 20.0
 
 
-def test_over_cap_other_side_stops_instead_of_chasing_balance() -> None:
+def test_over_cap_other_side_skips_when_hedge_side_at_cap() -> None:
     state = PositionState(spent_up=8.0, shares_up=12.0, spent_down=8.0, shares_down=20.0, orders_up=5, orders_down=4, total_deals=9)
     runner = _runner(1_700_000_000, positions=state)
     clob = _tick(
@@ -411,15 +408,11 @@ def test_over_cap_other_side_stops_instead_of_chasing_balance() -> None:
                 _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=12.0, avg_price=8.0 / 12.0),
                 _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=20.0, avg_price=0.40),
             ],
-            [
-                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=14.727272727, avg_price=9.2 / 14.727272727),
-                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=20.0, avg_price=0.40),
-            ],
         ],
     )
 
     assert clob.calls == []
-    assert runner.stop_reason == "over_cap_position"
+    assert runner.stop_reason is None
 
 
 def test_share_cap_blocks_repair_past_max_even_when_other_side_over_cap() -> None:
@@ -440,6 +433,36 @@ def test_share_cap_blocks_repair_past_max_even_when_other_side_over_cap() -> Non
 
     assert clob.calls == []
     assert runner.positions.shares_up == 14.5
+
+
+def test_20_up_10_down_posts_down_hedge_not_more_up() -> None:
+    state = PositionState(
+        spent_up=11.4,
+        shares_up=20.0,
+        spent_down=5.2,
+        shares_down=10.0,
+        orders_up=4,
+        orders_down=2,
+        total_deals=6,
+    )
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.57,
+        down=0.52,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=20.0, avg_price=0.57),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=10.0, avg_price=0.52),
+            ],
+        ],
+    )
+
+    assert len(clob.calls) == 1
+    assert clob.calls[0][0] == "down-token"
+    assert all(call[0] != "up-token" for call in clob.calls)
+    assert runner.pending_side == "DOWN"
 
 
 def test_overloaded_17_vs_12_does_not_buy_larger_up_side() -> None:
@@ -680,7 +703,6 @@ def test_failed_order_does_not_update_position_and_waits_before_retry() -> None:
         down=0.49,
         clob=clob,
         positions_seq=[
-            [],
             [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.245)],
         ],
     )
@@ -921,7 +943,6 @@ def test_pm_discovered_bootstrap_fill_triggers_missing_side_buy() -> None:
         down=0.50,
         clob=clob,
         positions_seq=[
-            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.060606061, avg_price=0.33)],
             [
                 _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.060606061, avg_price=0.33),
                 _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.50),

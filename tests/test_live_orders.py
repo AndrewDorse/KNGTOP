@@ -77,6 +77,7 @@ def test_register_intent_before_post() -> None:
         price=0.48,
         shares=5.0,
         reason="bootstrap",
+        pre_shares=0.0,
         sent_ts=1_700_000_000.0,
     )
     assert order.status == lo.ORDER_INTENT
@@ -92,6 +93,7 @@ def test_reconcile_updates_partial_status() -> None:
         price=0.48,
         shares=5.0,
         reason="bootstrap",
+        pre_shares=0.0,
         sent_ts=1_700_000_000.0,
     )
     lo.mark_posted(order, order_id="ord-1")
@@ -122,6 +124,7 @@ def test_missing_from_open_marks_filled_when_fully_matched() -> None:
         price=0.40,
         shares=5.0,
         reason="balance",
+        pre_shares=0.0,
         sent_ts=1_700_000_000.0,
     )
     lo.mark_posted(order, order_id="ord-2")
@@ -168,11 +171,39 @@ def test_clear_window_orders() -> None:
         price=0.48,
         shares=5.0,
         reason="bootstrap",
+        pre_shares=0.0,
         sent_ts=1_700_000_000.0,
     )
     lo.clear_window_orders(runner)
     assert runner.orders == {}
     assert runner.open_orders == {"UP": [], "DOWN": []}
+
+
+def test_register_intent_refuses_second_in_flight() -> None:
+    runner = _runner(1_700_000_000)
+    first = lo.register_intent(
+        runner,
+        side="DOWN",
+        token_id="down-token",
+        price=0.48,
+        shares=5.0,
+        reason="bootstrap",
+        pre_shares=0.0,
+        sent_ts=1_700_000_000.0,
+    )
+    second = lo.register_intent(
+        runner,
+        side="UP",
+        token_id="up-token",
+        price=0.40,
+        shares=5.0,
+        reason="bootstrap",
+        pre_shares=0.0,
+        sent_ts=1_700_000_001.0,
+    )
+    assert first is not None
+    assert second is None
+    assert runner.orders_sent == 1
 
 
 def test_post_failure_does_not_block_forever() -> None:
@@ -184,6 +215,7 @@ def test_post_failure_does_not_block_forever() -> None:
         price=0.48,
         shares=5.0,
         reason="bootstrap",
+        pre_shares=0.0,
         sent_ts=1_700_000_000.0,
     )
     lo.mark_failed(order, error="boom")

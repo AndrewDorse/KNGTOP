@@ -1,4 +1,4 @@
-"""Unified live order registry, reconcile, and CLOB I/O."""
+"""One deal at a time. Send → wait for PM fill → only then next order."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
 from kngtop.clob_client import KngtopClob
@@ -43,12 +43,15 @@ class OpenOrderView:
 
 @dataclass(slots=True)
 class LiveOrder:
+    """One live deal. Stays active until PM confirms fill or terminal CLOB state."""
+
     client_id: str
     side: str
     token_id: str
     price: float
     shares: float
     reason: str
+    pre_shares: float = 0.0
     order_id: str | None = None
     status: str = ORDER_INTENT
     sent_ts: float = 0.0
@@ -67,10 +70,37 @@ class LiveOrder:
             return self.remaining_shares
         return self.shares
 
+    def phase_label(self) -> str:
+        if self.status in {ORDER_INTENT, ORDER_POSTING}:
+            return "SENDING"
+        if self.status in {ORDER_OPEN, ORDER_PARTIAL}:
+            return "WAIT_PM_FILL"
+        return self.status.upper()
+
 
 def _log_tag(tag: str, **fields: object) -> None:
     parts = [f"{key}={value}" for key, value in fields.items() if value is not None]
     LOGGER.info("[%s] %s", tag, " ".join(parts))
+
+
+def log_deal_state(runner: WindowRunner) -> None:
+    order = active_order(runner)
+    if order is None:
+        _log_tag("DEAL", slug=runner.contract.slug, state="IDLE", sent=str(getattr(runner, "orders_sent", 0)))
+        return
+    _log_tag(
+        "DEAL",
+        slug=runner.contract.slug,
+        state=order.phase_label(),
+        side=order.side,
+        order_id=order.order_id,
+        send_n=str(getattr(runner, "orders_sent", 0)),
+        pre_shares=f"{order.pre_shares:.6f}",
+        matched=f"{order.matched_shares:.6f}",
+        target=f"{order.shares:.6f}",
+        price=f"{order.price:.4f}",
+        reason=order.reason,
+    )
 
 
 def _extract_order_id(payload: dict[str, object]) -> str | None:
@@ -197,26 +227,6 @@ def runner_open_order_views(runner: WindowRunner) -> list[OpenOrderView]:
     return list(runner.open_orders.get("UP", [])) + list(runner.open_orders.get("DOWN", []))
 
 
-def _derive_open_orders_from_registry(runner: WindowRunner) -> dict[str, list[OpenOrderView]]:
-    parsed = _side_orders_map()
-    for order in runner.orders.values():
-        if order.status not in {ORDER_OPEN, ORDER_PARTIAL} or not order.order_id:
-            continue
-        remaining = order.remaining_shares if order.remaining_shares > 1e-12 else max(0.0, order.shares - order.matched_shares)
-        if remaining <= 1e-12:
-            continue
-        parsed[order.side].append(
-            OpenOrderView(order_id=order.order_id, side=order.side, price=order.price, remaining_shares=remaining)
-        )
-    for side in ("UP", "DOWN"):
-        parsed[side].sort(key=lambda item: item.order_id)
-    return parsed
-
-
-def _sync_open_orders_cache(runner: WindowRunner, clob_open: dict[str, list[OpenOrderView]]) -> None:
-    runner.open_orders = clob_open
-
-
 def register_intent(
     runner: WindowRunner,
     *,
@@ -225,8 +235,19 @@ def register_intent(
     price: float,
     shares: float,
     reason: str,
+    pre_shares: float,
     sent_ts: float,
-) -> LiveOrder:
+) -> LiveOrder | None:
+    if has_active_order(runner):
+        existing = active_order(runner)
+        _log_tag(
+            "ORDER BLOCK",
+            slug=runner.contract.slug,
+            reason="deal_in_flight",
+            existing_side=existing.side if existing else None,
+            existing_id=existing.order_id if existing else None,
+        )
+        return None
     order = LiveOrder(
         client_id=str(uuid.uuid4()),
         side=str(side).upper(),
@@ -234,18 +255,21 @@ def register_intent(
         price=float(price),
         shares=float(shares),
         reason=str(reason),
+        pre_shares=float(pre_shares),
         status=ORDER_INTENT,
         sent_ts=float(sent_ts),
         remaining_shares=float(shares),
     )
     runner.orders[order.client_id] = order
+    runner.orders_sent = int(getattr(runner, "orders_sent", 0)) + 1
     _log_tag(
-        "ORDER INTENT",
+        "ORDER SEND",
         slug=runner.contract.slug,
-        client_id=order.client_id,
+        send_n=str(runner.orders_sent),
         side=order.side,
         price=f"{order.price:.4f}",
         shares=f"{order.shares:.6f}",
+        pre_shares=f"{order.pre_shares:.6f}",
         reason=order.reason,
     )
     return order
@@ -260,7 +284,7 @@ def mark_posted(order: LiveOrder, *, order_id: str) -> None:
     order.status = ORDER_OPEN
     order.remaining_shares = order.shares
     order.matched_shares = 0.0
-    _log_tag("ORDER POSTED", order_id=order.order_id, side=order.side, status=order.status)
+    _log_tag("ORDER ON BOOK", order_id=order.order_id, side=order.side, waiting="pm_fill")
 
 
 def mark_failed(order: LiveOrder, *, error: str) -> None:
@@ -268,23 +292,29 @@ def mark_failed(order: LiveOrder, *, error: str) -> None:
     order.last_error = error
     order.remaining_shares = 0.0
     order.last_checked_ts = time.time()
+    _log_tag("ORDER FAILED", order_id=order.order_id, side=order.side, error=error)
 
 
-def mark_filled(order: LiveOrder) -> None:
+def mark_filled(order: LiveOrder, *, pm_shares: float) -> None:
     order.status = ORDER_FILLED
-    order.matched_shares = order.shares
+    order.matched_shares = max(order.matched_shares, pm_shares - order.pre_shares)
     order.remaining_shares = 0.0
     order.last_checked_ts = time.time()
+    _log_tag(
+        "ORDER DONE",
+        order_id=order.order_id,
+        side=order.side,
+        pm_shares=f"{pm_shares:.6f}",
+        pre_shares=f"{order.pre_shares:.6f}",
+        filled=f"{order.matched_shares:.6f}",
+    )
 
 
 def _update_order_from_open_row(order: LiveOrder, open_row: OpenOrderView, *, now_ts: float) -> None:
     order.last_checked_ts = now_ts
     order.remaining_shares = open_row.remaining_shares
     order.matched_shares = max(0.0, order.shares - open_row.remaining_shares)
-    if order.matched_shares > 1e-12 and open_row.remaining_shares > 1e-12:
-        order.status = ORDER_PARTIAL
-    else:
-        order.status = ORDER_OPEN
+    order.status = ORDER_PARTIAL if order.matched_shares > 1e-12 and open_row.remaining_shares > 1e-12 else ORDER_OPEN
 
 
 def _update_order_from_get_order(order: LiveOrder, payload: dict[str, object], *, now_ts: float) -> None:
@@ -336,19 +366,19 @@ def _reconcile_order_statuses(
         if not isinstance(payload, dict) or not payload:
             continue
         _update_order_from_get_order(order, payload, now_ts=now_ts)
-        if order.status in TERMINAL_STATUSES:
-            _log_tag(
-                "ORDER LIFECYCLE",
-                slug=runner.contract.slug,
-                order_id=order.order_id,
-                side=order.side,
-                status=order.status,
-                matched=f"{order.matched_shares:.6f}",
-            )
 
 
-def _adopt_orphan_open_orders(runner: WindowRunner, open_lookup: dict[str, OpenOrderView], *, now_ts: float) -> None:
+def _adopt_orphan_open_orders(
+    runner: WindowRunner,
+    open_lookup: dict[str, OpenOrderView],
+    *,
+    now_ts: float,
+    pre_shares_by_side: dict[str, float] | None = None,
+) -> None:
+    if has_active_order(runner):
+        return
     token_by_side = {"UP": runner.contract.up.token_id, "DOWN": runner.contract.down.token_id}
+    baseline = pre_shares_by_side or {}
     for view in open_lookup.values():
         if _find_order_by_clob_id(runner, view.order_id) is not None:
             continue
@@ -359,6 +389,7 @@ def _adopt_orphan_open_orders(runner: WindowRunner, open_lookup: dict[str, OpenO
             price=view.price,
             shares=view.remaining_shares,
             reason="adopted_open_order",
+            pre_shares=float(baseline.get(view.side, 0.0)),
             order_id=view.order_id,
             status=ORDER_OPEN,
             sent_ts=now_ts,
@@ -370,9 +401,9 @@ def _adopt_orphan_open_orders(runner: WindowRunner, open_lookup: dict[str, OpenO
             slug=runner.contract.slug,
             order_id=order.order_id,
             side=order.side,
-            price=f"{order.price:.4f}",
-            shares=f"{order.remaining_shares:.6f}",
+            pre_shares=f"{order.pre_shares:.6f}",
         )
+        return
 
 
 def reconcile_runner_orders(
@@ -381,17 +412,59 @@ def reconcile_runner_orders(
     clob: KngtopClob | None,
     open_order_rows: list[dict[str, Any]],
     now_ts: float,
+    pre_shares_by_side: dict[str, float] | None = None,
 ) -> None:
     scoped_open = _filtered_open_orders_for_runner(runner, open_order_rows)
     clob_open = _parse_open_orders_for_runner(runner, scoped_open)
     open_lookup = _open_order_lookup(clob_open)
-    _adopt_orphan_open_orders(runner, open_lookup, now_ts=now_ts)
+    _adopt_orphan_open_orders(runner, open_lookup, now_ts=now_ts, pre_shares_by_side=pre_shares_by_side)
     _reconcile_order_statuses(runner, clob=clob, open_lookup=open_lookup, now_ts=now_ts)
-    _sync_open_orders_cache(runner, clob_open)
+    runner.open_orders = clob_open
+
+
+def pm_fill_delta(order: LiveOrder, current_shares: float) -> float:
+    return max(0.0, float(current_shares) - float(order.pre_shares))
+
+
+def deal_done_on_pm(order: LiveOrder, current_shares: float) -> bool:
+    """PM must show new shares on the order side before we send another order."""
+    return pm_fill_delta(order, current_shares) > 1e-6
+
+
+def complete_deal_if_pm_confirmed(
+    runner: WindowRunner,
+    order: LiveOrder,
+    *,
+    current_shares: float,
+    on_clob: bool,
+) -> bool:
+    """Close deal only when PM confirms fill. Returns True if deal is now terminal."""
+    delta = pm_fill_delta(order, current_shares)
+    if delta <= 1e-6:
+        if order.status in {ORDER_CANCELLED, ORDER_FAILED}:
+            return True
+        return False
+    order.matched_shares = delta
+    fully_on_pm = delta + 1e-6 >= order.shares
+    gone_from_book = not on_clob
+    if fully_on_pm or gone_from_book:
+        mark_filled(order, pm_shares=current_shares)
+        return True
+    order.status = ORDER_PARTIAL
+    order.remaining_shares = max(0.0, order.shares - delta)
+    _log_tag(
+        "ORDER PARTIAL",
+        slug=runner.contract.slug,
+        order_id=order.order_id,
+        side=order.side,
+        pm_delta=f"{delta:.6f}",
+        remaining=f"{order.remaining_shares:.6f}",
+    )
+    return False
 
 
 def projected_positions(runner: WindowRunner, base: PositionState) -> PositionState:
-    from kngtop.live_kilemo2 import PositionState as PS, _copy_position_state
+    from kngtop.live_kilemo2 import _copy_position_state
 
     state = _copy_position_state(base)
     order = active_order(runner)
@@ -422,32 +495,16 @@ def cancel_open_order(
     try:
         clob.cancel_order_by_id(view.order_id)
     except Exception as exc:  # noqa: BLE001
-        _log_tag(
-            "LIMIT CANCEL",
-            slug=runner.contract.slug,
-            side=view.side,
-            order_id=view.order_id,
-            reason=reason,
-            error=str(exc),
-        )
+        _log_tag("LIMIT CANCEL", slug=runner.contract.slug, order_id=view.order_id, error=str(exc))
         return False
     record = _find_order_by_clob_id(runner, view.order_id)
     if record is not None:
         record.status = ORDER_CANCELLED
         record.remaining_shares = 0.0
-        record.last_checked_ts = time.time()
     runner.open_orders[view.side] = [
         row for row in runner.open_orders.get(view.side, []) if row.order_id != view.order_id
     ]
-    _log_tag(
-        "LIMIT CANCEL",
-        slug=runner.contract.slug,
-        side=view.side,
-        order_id=view.order_id,
-        reason=reason,
-        price=f"{view.price:.4f}",
-        shares=f"{view.remaining_shares:.6f}",
-    )
+    _log_tag("LIMIT CANCEL", slug=runner.contract.slug, order_id=view.order_id, reason=reason)
     return True
 
 
@@ -459,36 +516,14 @@ def enforce_single_order(
 ) -> bool:
     open_views = runner_open_order_views(runner)
     if required_side is not None:
-        wrong = [row for row in open_views if row.side != required_side]
-        for row in wrong:
+        for row in [v for v in open_views if v.side != required_side]:
             cancel_open_order(runner, clob=clob, view=row, reason="wrong_balance_side")
         open_views = [row for row in open_views if row.side == required_side]
-
     if len(open_views) > MAX_ACTIVE_LIMIT_ORDERS:
-        keep = open_views[0]
         for extra in open_views[MAX_ACTIVE_LIMIT_ORDERS:]:
             cancel_open_order(runner, clob=clob, view=extra, reason="duplicate_open_order")
-        open_views = [keep]
-        _log_tag(
-            "OPEN_ORDERS",
-            slug=runner.contract.slug,
-            status="deduped",
-            kept=keep.order_id,
-            cancelled=str(len(open_views) - 1),
-        )
-
-    if open_views:
-        _log_tag(
-            "OPEN_ORDERS",
-            slug=runner.contract.slug,
-            status="active",
-            side=open_views[0].side,
-            order_id=open_views[0].order_id,
-            price=f"{open_views[0].price:.4f}",
-            shares=f"{open_views[0].remaining_shares:.6f}",
-        )
-        return True
-    return has_active_order(runner)
+        open_views = open_views[:MAX_ACTIVE_LIMIT_ORDERS]
+    return bool(open_views) or has_active_order(runner)
 
 
 def reconcile_all(
@@ -501,24 +536,13 @@ def reconcile_all(
     position_rows = fetch_user_positions(user=cfg.funder, timeout=cfg.request_timeout_sec)
     open_order_rows = clob.get_open_orders()
     now_ts = time.time()
-    now_mono = time.perf_counter()
-
     for runner in runners.values():
         reconcile_runner_orders(runner, clob=clob, open_order_rows=open_order_rows, now_ts=now_ts)
-
     runtime_state["reconcile_positions"] = position_rows
     runtime_state["reconcile_open_orders"] = open_order_rows
-    runtime_state["reconcile_cache_at"] = now_mono
+    runtime_state["reconcile_cache_at"] = time.perf_counter()
     runtime_state["reconcile_wall_ts"] = now_ts
     runtime_state["reconcile_seq"] = int(runtime_state.get("reconcile_seq", 0)) + 1
-    _log_tag(
-        "RECONCILE",
-        scope="global",
-        seq=str(runtime_state["reconcile_seq"]),
-        positions=str(len(position_rows)),
-        open_orders=str(len(open_order_rows)),
-        windows=str(len(runners)),
-    )
 
 
 def run_live_reconcile_loop(
@@ -546,3 +570,4 @@ def run_live_reconcile_loop(
 def clear_window_orders(runner: WindowRunner) -> None:
     runner.orders.clear()
     runner.open_orders = {"UP": [], "DOWN": []}
+    runner.orders_sent = 0
