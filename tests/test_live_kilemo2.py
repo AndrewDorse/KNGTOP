@@ -5,7 +5,32 @@ from unittest.mock import patch
 
 from kngtop.config import KngtopConfig
 from kngtop.gamma import ActiveContract, TokenMarket
+from kngtop import live_orders as lo
 from kngtop.live_kilemo2 import ORDER_IN_FLIGHT, PositionState, WindowRunner, _choose_guarded_pnl_buy, _effective_state_with_pending, _tick_runner
+
+
+def _inject_active_order(
+    runner: WindowRunner,
+    *,
+    side: str = "UP",
+    price: float = 0.5,
+    shares: float = 5.0,
+    order_id: str = "test-active",
+) -> None:
+    token_id = "up-token" if side == "UP" else "down-token"
+    order = lo.register_intent(
+        runner,
+        side=side,
+        token_id=token_id,
+        price=price,
+        shares=shares,
+        reason="test",
+        sent_ts=0.0,
+    )
+    lo.mark_posted(order, order_id=order_id)
+    runner.open_orders[side] = [
+        lo.OpenOrderView(order_id=order_id, side=side, price=price, remaining_shares=shares),
+    ]
 
 
 def _cfg() -> KngtopConfig:
@@ -636,8 +661,7 @@ def test_twelve_vs_eight_position_does_not_stop_before_roi_and_balance() -> None
 
 def test_pending_order_blocks_new_buy() -> None:
     runner = _runner(1_700_000_000)
-    runner.pending_order = True
-    runner.execution_state = ORDER_IN_FLIGHT
+    _inject_active_order(runner)
     clob = _tick(runner, elapsed=0, up=0.52, down=0.49)
 
     assert clob.calls == []
@@ -1128,10 +1152,8 @@ def test_api_underreport_does_not_reduce_confirmed_local_position() -> None:
 def test_pending_reserved_shares_count_toward_effective_share_cap() -> None:
     state = PositionState(spent_up=7.0, shares_up=14.0, spent_down=3.0, shares_down=8.0, orders_up=4, orders_down=2, total_deals=6)
     runner = _runner(1_700_000_000, positions=state)
-    runner.pending_order = True
-    runner.pending_side = "UP"
-    runner.pending_amount_usd = 0.40
-    runner.pending_reserved_shares = 1.0
+    _inject_active_order(runner, side="UP", price=0.40, shares=1.0, order_id="pending-up")
+    runner.orders[list(runner.orders.keys())[0]].sent_ts = 0.0
 
     effective = _effective_state_with_pending(runner)
 

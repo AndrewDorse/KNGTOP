@@ -14,9 +14,11 @@
 - If share gap exceeds max, only buy the smaller side until balanced.
 - One limit order at a time; wait for fill/cancel before sending another.
 - Every 1 second, reconcile Polymarket positions (REST) and all CLOB open orders; wake strategy on updates.
-- Register every sent order locally; track status (`sent`, `open`, `partial`, `filled`, `cancelled`, `failed`) from open-order sync and `get_order`.
-- Act only on reconciled state: confirmed PM positions for decisions, open-order cache for blocking duplicates, sent-order registry for lifecycle.
-- Sync open orders from CLOB every tick; cancel duplicates so only one active order exists per window.
+- All orders live in `runner.orders` (`LiveOrder` registry in `live_orders.py`); cleared on new window.
+- Order lifecycle transitions happen only in reconcile: `intent → posting → open → partial → filled/cancelled/failed`.
+- Register intent before CLOB post; confirm fills from PM positions (never blocking sleep in send path).
+- Adopt orphan CLOB open orders into the registry; cancel wrong-side/duplicate limits via `enforce_single_order`.
+- Act only on reconciled state: PM positions for decisions, `has_active_order()` for send gates, registry for lifecycle.
 - If imbalanced and no active order exists, place a balance limit immediately (do not wait for repair slot).
 - Hedge side is decided from confirmed fills only; never stack more on an already-open one-sided leg.
 - Do not buy if it breaks budget/share cap; avg-sum/balance guards apply after both sides are profitable.

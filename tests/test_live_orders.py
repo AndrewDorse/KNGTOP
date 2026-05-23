@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from kngtop.config import KngtopConfig
 from kngtop.gamma import ActiveContract, TokenMarket
-from kngtop import live_reconcile as lr
+from kngtop import live_orders as lo
 from kngtop.live_kilemo2 import PositionState, WindowRunner
 
 
@@ -68,11 +68,10 @@ class _FakeClob:
         return dict(self.order_payloads.get(str(order_id), {}))
 
 
-def test_register_sent_order_tracks_active_status() -> None:
+def test_register_intent_before_post() -> None:
     runner = _runner(1_700_000_000)
-    record = lr.register_sent_order(
+    order = lo.register_intent(
         runner,
-        order_id="ord-1",
         side="DOWN",
         token_id="down-token",
         price=0.48,
@@ -80,17 +79,14 @@ def test_register_sent_order_tracks_active_status() -> None:
         reason="bootstrap",
         sent_ts=1_700_000_000.0,
     )
-
-    assert record.status == lr.SENT_SENT
-    assert record.is_active()
-    assert runner.sent_orders["ord-1"] is record
+    assert order.status == lo.ORDER_INTENT
+    assert lo.has_active_order(runner)
 
 
-def test_refresh_live_reconcile_cache_updates_open_orders_and_sent_status() -> None:
+def test_reconcile_updates_partial_status() -> None:
     runner = _runner(1_700_000_000)
-    lr.register_sent_order(
+    order = lo.register_intent(
         runner,
-        order_id="ord-1",
         side="DOWN",
         token_id="down-token",
         price=0.48,
@@ -98,6 +94,7 @@ def test_refresh_live_reconcile_cache_updates_open_orders_and_sent_status() -> N
         reason="bootstrap",
         sent_ts=1_700_000_000.0,
     )
+    lo.mark_posted(order, order_id="ord-1")
     clob = _FakeClob(
         open_orders=[
             {
@@ -107,41 +104,19 @@ def test_refresh_live_reconcile_cache_updates_open_orders_and_sent_status() -> N
                 "price": 0.48,
                 "original_size": 5.0,
                 "size_left": 3.0,
-                "size_matched": 2.0,
             }
         ]
     )
-    runtime_state: dict[str, object] = {"reconcile_seq": 0}
-    positions = [
-        {
-            "slug": runner.contract.slug,
-            "outcome": "DOWN",
-            "asset": "down-token",
-            "size": 2.0,
-            "avgPrice": 0.48,
-        }
-    ]
-
-    with patch("kngtop.live_reconcile.fetch_user_positions", return_value=positions):
-        lr.refresh_live_reconcile_cache(
-            clob=clob,  # type: ignore[arg-type]
-            cfg=_cfg(),
-            runtime_state=runtime_state,
-            runners={1_700_000_000: runner},
-        )
-
-    assert lr.runner_has_active_open_order(runner)
-    assert runner.sent_orders["ord-1"].status == lr.SENT_PARTIAL
-    assert runner.sent_orders["ord-1"].matched_shares == 2.0
-    assert len(runner.open_orders["DOWN"]) == 1
-    assert runtime_state["reconcile_seq"] == 1
+    lo.reconcile_runner_orders(runner, clob=clob, open_order_rows=clob.get_open_orders(), now_ts=1_700_000_001.0)
+    assert lo.has_active_order(runner)
+    assert order.status == lo.ORDER_PARTIAL
+    assert order.matched_shares == 2.0
 
 
-def test_sent_order_marked_filled_when_missing_from_open_orders() -> None:
+def test_missing_from_open_marks_filled_when_fully_matched() -> None:
     runner = _runner(1_700_000_000)
-    lr.register_sent_order(
+    order = lo.register_intent(
         runner,
-        order_id="ord-2",
         side="UP",
         token_id="up-token",
         price=0.40,
@@ -149,18 +124,67 @@ def test_sent_order_marked_filled_when_missing_from_open_orders() -> None:
         reason="balance",
         sent_ts=1_700_000_000.0,
     )
-    runner.sent_orders["ord-2"].status = lr.SENT_OPEN
-    runner.sent_orders["ord-2"].matched_shares = 5.0
+    lo.mark_posted(order, order_id="ord-2")
+    order.matched_shares = 5.0
+    order.status = lo.ORDER_OPEN
     clob = _FakeClob(open_orders=[])
-    runtime_state: dict[str, object] = {"reconcile_seq": 0}
+    clob.order_payloads["ord-2"] = {
+        "id": "ord-2",
+        "status": "filled",
+        "size_matched": 5.0,
+        "original_size": 5.0,
+        "size_left": 0.0,
+    }
+    lo.reconcile_runner_orders(runner, clob=clob, open_order_rows=[], now_ts=1_700_000_002.0)
+    assert order.status == lo.ORDER_FILLED
+    assert not lo.has_active_order(runner)
 
-    with patch("kngtop.live_reconcile.fetch_user_positions", return_value=[]):
-        lr.refresh_live_reconcile_cache(
-            clob=clob,  # type: ignore[arg-type]
-            cfg=_cfg(),
-            runtime_state=runtime_state,
-            runners={1_700_000_000: runner},
-        )
 
-    assert runner.sent_orders["ord-2"].status == lr.SENT_FILLED
-    assert not lr.runner_has_active_open_order(runner)
+def test_orphan_open_order_is_adopted() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob(
+        open_orders=[
+            {
+                "id": "orphan-1",
+                "asset_id": "down-token",
+                "side": "BUY",
+                "price": 0.50,
+                "original_size": 5.0,
+                "size_left": 5.0,
+            }
+        ]
+    )
+    lo.reconcile_runner_orders(runner, clob=clob, open_order_rows=clob.get_open_orders(), now_ts=1_700_000_000.0)
+    assert lo.has_active_order(runner)
+    assert runner.pending_order_id == "orphan-1"
+
+
+def test_clear_window_orders() -> None:
+    runner = _runner(1_700_000_000)
+    lo.register_intent(
+        runner,
+        side="DOWN",
+        token_id="down-token",
+        price=0.48,
+        shares=5.0,
+        reason="bootstrap",
+        sent_ts=1_700_000_000.0,
+    )
+    lo.clear_window_orders(runner)
+    assert runner.orders == {}
+    assert runner.open_orders == {"UP": [], "DOWN": []}
+
+
+def test_post_failure_does_not_block_forever() -> None:
+    runner = _runner(1_700_000_000)
+    order = lo.register_intent(
+        runner,
+        side="DOWN",
+        token_id="down-token",
+        price=0.48,
+        shares=5.0,
+        reason="bootstrap",
+        sent_ts=1_700_000_000.0,
+    )
+    lo.mark_failed(order, error="boom")
+    assert not lo.has_active_order(runner)
