@@ -10,16 +10,15 @@ alwaysApply: false
 pytest tests/test_live_kilemo2.py tests/test_live_orders.py -q
 ```
 
-## Invariants
+## ONE path invariants
 
-1. **One cycle in flight** — `cycle_is_busy()` blocks strategy; max 2 sends per cycle (primary + hedge).
-2. **Primary once, then wait CLOB** — no re-send while `wait_primary`; poll until on book.
-3. **Hedge once after primary on book** — immediate if under-cap/missing side needs it; then PM wait.
-4. **5× PM stable before next** — `PM_STABLE_CONFIRMS=5` at 1s interval; only then `cycle_reset()`.
-5. **Hedge under-cap side** — when one leg over cap (e.g. 20 UP), post limit on smaller side (DOWN).
-6. **Never buy over-cap side** — `_side_over_cap()` blocks that side only.
-7. **Adopt orphan CLOB orders** — `adopt_open_order()` tracks existing book orders without sending.
+1. **Balanced → no trade** — gap ≤ max and both sides filled → strategy returns None.
+2. **Imbalanced → required side only** — never winning-side / repair buys when balanced.
+3. **One cycle in flight** — max 2 sends (primary + hedge); `order_on_clob` by order id only.
+4. **Cycle closes only when** — PM fills reflected, gap ≤ max, no over-cap, 5× stable PM.
+5. **Never skip hedge** when `required_side != primary_side` after primary on book.
+6. **Adopt orphan CLOB orders** — track in cycle, no re-send.
 
 ## Tick order
 
-reconcile PM+CLOB → adopt/cancel dupes → `_advance_order_cycle` → (if idle) strategy → send primary → `_advance_order_cycle`
+reconcile → advance cycle → (if idle + imbalanced) send required side → advance cycle

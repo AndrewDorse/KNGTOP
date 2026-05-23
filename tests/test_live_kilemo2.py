@@ -6,7 +6,7 @@ from unittest.mock import patch
 from kngtop.config import KngtopConfig
 from kngtop.gamma import ActiveContract, TokenMarket
 from kngtop import live_orders as lo
-from kngtop.live_kilemo2 import ORDER_IN_FLIGHT, PositionState, WindowRunner, _choose_guarded_pnl_buy, _effective_state_with_pending, _tick_runner
+from kngtop.live_kilemo2 import ORDER_IN_FLIGHT, PositionState, WindowRunner, _choose_guarded_pnl_buy, _cycle_ready_to_close, _effective_state_with_pending, _tick_runner
 
 
 def _inject_active_order(
@@ -255,13 +255,17 @@ def test_initial_buy_is_2_usd_lower_ask_under_bootstrap_cap() -> None:
         down=0.49,
         clob=clob,
         positions_seq=[
-            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.081632653, avg_price=0.49)],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.081632653, avg_price=0.49),
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=4.081632653, avg_price=0.51),
+            ],
         ],
     )
 
-    assert clob.calls == [("down-token", 2.4, 0.48)]
+    assert clob.calls == [("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
     assert runner.positions.orders_down == 1
-    assert abs(runner.positions.spent_total() - 2.0) < 1e-6
+    assert runner.positions.orders_up == 1
+    assert abs(runner.positions.spent_total() - 4.0) < 0.5
 
 
 def test_initial_buy_skips_when_lower_ask_above_bootstrap_cap() -> None:
@@ -499,6 +503,64 @@ def test_20_up_10_down_posts_down_hedge_not_more_up() -> None:
     assert runner.pending_side == "DOWN"
 
 
+def test_balanced_10_10_does_not_send_one_sided() -> None:
+    state = PositionState(
+        spent_up=5.0,
+        shares_up=10.0,
+        spent_down=5.0,
+        shares_down=10.0,
+        orders_up=2,
+        orders_down=2,
+        total_deals=4,
+    )
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.55,
+        down=0.45,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=10.0, avg_price=0.50),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=10.0, avg_price=0.50),
+            ],
+        ],
+    )
+
+    assert clob.calls == []
+    assert lo.cycle_is_idle(runner)
+
+
+def test_cycle_does_not_close_on_stale_pm_while_imbalanced() -> None:
+    runner = _runner(1_700_000_000)
+    runner.cycle.phase = lo.PHASE_WAIT_PM
+    runner.cycle.cycle_n = 1
+    runner.cycle.primary_side = "UP"
+    runner.cycle.primary_shares = 5.0
+    runner.cycle.hedge_sent = True
+    runner.cycle.hedge_side = "DOWN"
+    runner.cycle.hedge_shares = 5.0
+    runner.cycle.pm_up_start = 10.0
+    runner.cycle.pm_down_start = 10.0
+    runner.cycle.pm_up = 10.0
+    runner.cycle.pm_down = 10.0
+    runner.cycle.pm_stable_streak = 4
+    runner.positions = PositionState(
+        spent_up=5.0,
+        shares_up=15.0,
+        spent_down=5.0,
+        shares_down=10.0,
+        orders_up=2,
+        orders_down=2,
+        total_deals=4,
+    )
+    runner.api_positions = runner.positions
+    runner.local_positions = runner.positions
+
+    assert not _cycle_ready_to_close(runner, _cfg())
+    assert lo.cycle_is_busy(runner)
+
+
 def test_overloaded_17_vs_12_does_not_buy_larger_up_side() -> None:
     state = PositionState(spent_up=8.5, shares_up=17.0, spent_down=6.0, shares_down=12.0, orders_up=6, orders_down=4, total_deals=10)
     runner = _runner(1_700_000_000, positions=state)
@@ -605,7 +667,7 @@ def test_zero_avg_price_from_pm_uses_pending_order_price_for_cost() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 2.4, 0.48)]
+    assert clob.calls == [("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
     assert runner.positions.shares_down == 4.081632653
     assert abs(runner.positions.spent_down - 1.95918367344) < 1e-6
     assert runner.positions.total_deals == 1
@@ -652,7 +714,7 @@ def test_bootstrap_amount_is_capped_by_max_shares_per_side() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.05, 0.09000000000000001)]
+    assert clob.calls == [("up-token", 1.05, 0.09000000000000001), ("down-token", 4.45, 0.89)]
     assert runner.positions.shares_up == 15.0
 
 
@@ -741,7 +803,7 @@ def test_failed_order_does_not_update_position_and_waits_before_retry() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 2.4, 0.48), ("down-token", 2.4, 0.48)]
+    assert clob.calls == [("down-token", 2.4, 0.48), ("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
     assert runner.positions.total_deals == 1
     assert runner.positions.orders_down == 1
 
@@ -926,13 +988,17 @@ def test_nofill_response_still_counts_fill_when_pm_confirms_position() -> None:
         down=0.66,
         clob=clob,
         positions_seq=[
-            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.882352941, avg_price=0.34)],
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.882352941, avg_price=0.34),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=5.882352941, avg_price=0.65),
+            ],
         ],
     )
 
-    assert clob.calls == [("up-token", 1.6500000000000001, 0.33)]
+    assert clob.calls == [("up-token", 1.6500000000000001, 0.33), ("down-token", 3.25, 0.65)]
     assert runner.positions.orders_up == 1
-    assert runner.positions.total_deals == 1
+    assert runner.positions.orders_down == 1
+    assert runner.positions.total_deals == 2
     assert runner.initial_failed_up == 0
     assert runner.initial_filled is True
 
@@ -987,24 +1053,14 @@ def test_pm_discovered_bootstrap_fill_triggers_missing_side_buy() -> None:
         down=0.67,
         clob=clob,
         positions_seq=[
-            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.060606061, avg_price=0.33)],
-        ],
-    )
-    _tick(
-        runner,
-        elapsed=5,
-        up=0.50,
-        down=0.50,
-        clob=clob,
-        positions_seq=[
             [
                 _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.060606061, avg_price=0.33),
-                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.0, avg_price=0.50),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=6.060606061, avg_price=0.66),
             ],
         ],
     )
 
-    assert clob.calls == [("up-token", 1.6, 0.32), ("down-token", 2.45, 0.49)]
+    assert clob.calls == [("up-token", 1.6, 0.32), ("down-token", 3.3000000000000003, 0.66)]
     assert runner.positions.orders_up == 1
     assert runner.positions.orders_down == 1
     assert runner.positions.total_deals == 2
