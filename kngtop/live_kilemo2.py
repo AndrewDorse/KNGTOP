@@ -20,6 +20,7 @@ from kngtop.gamma import (
     discover_updown_window_by_start,
     window_start_ts_from_slug,
 )
+from kngtop import live_reconcile as lr
 from kngtop.pm_data import fetch_user_positions
 from kngtop.rest_poll import run_ws_rest_fallback_loop
 from kngtop.ws_market import MarketWsFeed
@@ -154,6 +155,10 @@ class WindowRunner:
     initial_failed_down: int = 0
     intent_count_up: int = 0
     intent_count_down: int = 0
+    sent_orders: dict[str, lr.SentOrderRecord] = field(default_factory=dict)
+    open_orders: dict[str, list[TrackedLimitOrder]] = field(default_factory=lambda: {"UP": [], "DOWN": []})
+    last_reconcile_monotonic: float = 0.0
+    reconcile_seq: int = 0
 
     def start_sec(self) -> int | None:
         return window_start_ts_from_slug(self.contract.slug)
@@ -245,6 +250,9 @@ def _parse_open_buy_order_row(row: dict[str, object], *, token_id: str, side: st
 
 
 def _fetch_window_open_buy_orders(runner: WindowRunner, clob: KngtopClob | None) -> list[TrackedLimitOrder]:
+    cached = lr.runner_active_open_orders(runner)
+    if cached:
+        return cached
     if clob is None:
         return []
     orders: list[TrackedLimitOrder] = []
@@ -261,6 +269,22 @@ def _fetch_window_open_buy_orders(runner: WindowRunner, clob: KngtopClob | None)
             if parsed is not None:
                 orders.append(parsed)
     return orders
+
+
+def _drop_open_order_from_runner_cache(runner: WindowRunner, order_id: str) -> None:
+    for side in ("UP", "DOWN"):
+        runner.open_orders[side] = [
+            order for order in runner.open_orders.get(side, []) if order.order_id != order_id
+        ]
+
+
+def _set_runner_open_orders_cache(runner: WindowRunner, open_orders: list[TrackedLimitOrder]) -> None:
+    cached = lr._side_orders_map()
+    for order in open_orders:
+        cached[order.side].append(order)
+    for side in ("UP", "DOWN"):
+        cached[side].sort(key=lambda item: item.order_id)
+    runner.open_orders = cached
 
 
 def _cancel_tracked_limit_order(
@@ -287,6 +311,8 @@ def _cancel_tracked_limit_order(
     if runner.pending_order_id == order.order_id:
         _clear_pending_limit_state(runner)
         runner.execution_state = READY
+    for side_orders in runner.open_orders.values():
+        side_orders[:] = [row for row in side_orders if row.order_id != order.order_id]
     _log_tag(
         "LIMIT CANCEL",
         slug=runner.contract.slug,
@@ -349,6 +375,7 @@ def _sync_and_enforce_single_open_limit(
             price=f"{active.price:.4f}",
             shares=f"{active.remaining_shares:.6f}",
         )
+        _set_runner_open_orders_cache(runner, open_orders)
         return True
 
     if runner.pending_order:
@@ -357,6 +384,7 @@ def _sync_and_enforce_single_open_limit(
             runner.execution_state = READY
         else:
             return True
+    _set_runner_open_orders_cache(runner, open_orders)
     return False
 
 
@@ -623,7 +651,7 @@ def _effective_state_with_pending(runner: WindowRunner) -> PositionState:
 
 
 def _can_place_limit_buy(runner: WindowRunner, side: str, price: float, cfg: KngtopConfig) -> bool:
-    if runner.pending_order:
+    if runner.pending_order or lr.runner_has_active_open_order(runner):
         return False
     shares = _limit_order_shares(price)
     cost = shares * max(price, 0.0)
@@ -992,6 +1020,7 @@ def _refresh_positions_from_pm(
     runner: WindowRunner,
     *,
     cfg: KngtopConfig,
+    rows: list[dict[str, object]] | None = None,
 ) -> PositionState:
     _ensure_local_position_floor(runner)
     prev_effective = _sync_effective_positions(runner)
@@ -1001,7 +1030,26 @@ def _refresh_positions_from_pm(
     prev_spent_down = prev_effective.spent_down
     prev_orders_up = prev_effective.orders_up
     prev_orders_down = prev_effective.orders_down
-    rows = fetch_user_positions(user=cfg.funder, timeout=cfg.request_timeout_sec)
+    if rows is None:
+        rows = fetch_user_positions(user=cfg.funder, timeout=cfg.request_timeout_sec)
+    if (
+        runner.pending_order
+        and not runner.initial_filled
+        and runner.pending_side in {"UP", "DOWN"}
+        and prev_shares_up <= 1e-6
+        and prev_shares_down <= 1e-6
+    ):
+        pending_token = runner.contract.up.token_id if runner.pending_side == "UP" else runner.contract.down.token_id
+        scoped_rows: list[dict[str, object]] = []
+        for row in rows:
+            slug = str(row.get("slug") or row.get("marketSlug") or row.get("market_slug") or "")
+            asset_id = str(row.get("asset") or row.get("asset_id") or row.get("token_id") or "")
+            outcome = str(row.get("outcome") or "").strip().upper()
+            if slug and slug == runner.contract.slug and outcome == runner.pending_side:
+                scoped_rows.append(row)
+            elif asset_id and asset_id == pending_token:
+                scoped_rows.append(row)
+        rows = scoped_rows
     token_by_side = {"UP": runner.contract.up.token_id, "DOWN": runner.contract.down.token_id}
     shares_by_side = {"UP": 0.0, "DOWN": 0.0}
     cost_by_side = {"UP": 0.0, "DOWN": 0.0}
@@ -1077,6 +1125,90 @@ def _refresh_positions_from_pm(
     return _sync_effective_positions(runner)
 
 
+def _apply_cached_reconcile_snapshot(
+    runner: WindowRunner,
+    *,
+    runtime_state: dict[str, Any],
+    cfg: KngtopConfig,
+    clob: KngtopClob | None,
+) -> None:
+    seq = int(runtime_state.get("reconcile_seq", 0))
+    if seq <= runner.reconcile_seq:
+        if cfg.dry_run or clob is None:
+            return
+        if time.perf_counter() - runner.last_reconcile_monotonic + 1e-12 < lr.RECONCILE_INTERVAL_SEC:
+            return
+        _refresh_positions_from_pm(runner, cfg=cfg)
+        runner.open_orders = lr._parse_open_orders_for_runner(
+            runner,
+            lr._filtered_open_orders_for_runner(runner, clob.get_open_orders()),
+        )
+        now_ts = time.time()
+        open_lookup = lr._open_order_lookup(runner.open_orders)
+        lr._update_sent_orders_from_open_lookup(runner, open_lookup=open_lookup, now_ts=now_ts)
+        lr._update_sent_orders_from_get_order(runner, clob=clob, open_lookup=open_lookup, now_ts=now_ts)
+        runner.last_reconcile_monotonic = time.perf_counter()
+        return
+
+    position_rows = lr._filtered_positions_for_runner(
+        runner,
+        list(runtime_state.get("reconcile_positions", [])),
+    )
+    open_rows = lr._filtered_open_orders_for_runner(
+        runner,
+        list(runtime_state.get("reconcile_open_orders", [])),
+    )
+    _refresh_positions_from_pm(runner, cfg=cfg, rows=position_rows)
+    runner.open_orders = lr._parse_open_orders_for_runner(runner, open_rows)
+    now_ts = float(runtime_state.get("reconcile_wall_ts", time.time()))
+    open_lookup = lr._open_order_lookup(runner.open_orders)
+    lr._update_sent_orders_from_open_lookup(runner, open_lookup=open_lookup, now_ts=now_ts)
+    if clob is not None:
+        lr._update_sent_orders_from_get_order(runner, clob=clob, open_lookup=open_lookup, now_ts=now_ts)
+    runner.reconcile_seq = seq
+    runner.last_reconcile_monotonic = float(runtime_state.get("reconcile_cache_at", time.perf_counter()))
+    _log_tag(
+        "RECONCILE",
+        slug=runner.contract.slug,
+        seq=str(runner.reconcile_seq),
+        up_open=str(len(runner.open_orders.get("UP", []))),
+        down_open=str(len(runner.open_orders.get("DOWN", []))),
+        sent_active=str(sum(1 for row in runner.sent_orders.values() if row.is_active())),
+    )
+
+
+def _process_sent_order_lifecycle(runner: WindowRunner, *, cfg: KngtopConfig) -> None:
+    for record in list(runner.sent_orders.values()):
+        if record.status in {lr.SENT_FILLED, lr.SENT_CANCELLED, lr.SENT_FAILED}:
+            if runner.pending_order_id == record.order_id:
+                _clear_pending_limit_state(runner)
+                runner.execution_state = READY
+            _log_tag(
+                "ORDER LIFECYCLE",
+                slug=runner.contract.slug,
+                order_id=record.order_id,
+                side=record.side,
+                status=record.status,
+                matched=f"{record.matched_shares:.6f}",
+                remaining=f"{record.remaining_shares:.6f}",
+            )
+    del cfg
+
+
+def _sync_pending_from_reconciled_open_orders(runner: WindowRunner) -> bool:
+    active = lr.runner_active_open_orders(runner)
+    if not active:
+        return False
+    order = active[0]
+    if (
+        not runner.pending_order
+        or runner.pending_order_id != order.order_id
+        or runner.pending_side != order.side
+    ):
+        _adopt_tracked_limit_order(runner, order, reason="reconcile_open_order")
+    return True
+
+
 def _confirm_fill_from_pm(
     runner: WindowRunner,
     *,
@@ -1125,7 +1257,36 @@ def _reconcile_pending_limit_order(
                 )
             runner.last_successful_buy_ts = runner.pending_created_ts
             runner.last_position_refresh_ts = runner.pending_created_ts
+            still_open: list[TrackedLimitOrder] = []
+            if clob is not None:
+                still_open = [
+                    order
+                    for order in _fetch_window_open_buy_orders(runner, clob)
+                    if order.order_id == runner.pending_order_id
+                ]
+            if still_open:
+                active = still_open[0]
+                _adopt_tracked_limit_order(runner, active, reason="partial_fill_reconcile")
+                record = runner.sent_orders.get(str(runner.pending_order_id or ""))
+                if record is not None:
+                    record.remaining_shares = active.remaining_shares
+                    record.matched_shares = max(0.0, record.shares - active.remaining_shares)
+                    record.status = lr.SENT_PARTIAL if active.remaining_shares > 1e-12 else lr.SENT_FILLED
+                _log_tag(
+                    "LIMIT PARTIAL",
+                    slug=runner.contract.slug,
+                    side=side,
+                    order_id=runner.pending_order_id,
+                    matched=f"{filled_delta:.6f}",
+                    remaining=f"{active.remaining_shares:.6f}",
+                )
+                return True
             filled_order_id = runner.pending_order_id
+            record = runner.sent_orders.get(str(filled_order_id or ""))
+            if record is not None:
+                record.status = lr.SENT_FILLED
+                record.remaining_shares = 0.0
+                record.matched_shares = record.shares
             _clear_pending_limit_state(runner)
             runner.execution_state = WAIT_NEXT_DECISION
             runner.next_decision_ts = datetime.now(timezone.utc).timestamp()
@@ -1291,6 +1452,9 @@ def _send_limit_buy(
             amount=f"{amount_usd:.2f}",
         )
         return False
+    if not cfg.dry_run and clob is not None and lr.runner_has_active_open_order(runner):
+        _log_tag("LIMIT BLOCK", slug=runner.contract.slug, side=side, reason="active_open_order_exists")
+        return False
     if not cfg.dry_run and clob is not None and _sync_and_enforce_single_open_limit(runner, clob=clob, cfg=cfg):
         _log_tag("LIMIT BLOCK", slug=runner.contract.slug, side=side, reason="active_open_order_exists")
         return False
@@ -1337,10 +1501,26 @@ def _send_limit_buy(
         token = _token_for_side(runner, side)
         payload = clob.limit_buy_shares(token, price=price, shares=shares, post_only=True)
         runner.pending_order_id = _extract_order_id(payload)
+        if runner.pending_order_id:
+            lr.register_sent_order(
+                runner,
+                order_id=runner.pending_order_id,
+                side=side,
+                token_id=token.token_id,
+                price=price,
+                shares=shares,
+                reason=reason,
+                sent_ts=datetime.now(timezone.utc).timestamp(),
+            )
         if _confirm_fill_from_pm(runner, side=side, pre_state=pre_state, cfg=cfg):
             order_id = runner.pending_order_id
             filled_delta = max(0.0, _shares_for_side(runner.positions, side) - _shares_for_side(pre_state, side))
             _record_local_fill(runner, side, price, filled_delta * price, filled_delta, ensure_floor=False)
+            if order_id and order_id in runner.sent_orders:
+                record = runner.sent_orders[order_id]
+                record.status = lr.SENT_FILLED
+                record.matched_shares = record.shares
+                record.remaining_shares = 0.0
             _drop_tracked_open_order(clob, order_id)
             _clear_pending_limit_state(runner)
             if _is_initial_reason(reason):
@@ -1352,8 +1532,10 @@ def _send_limit_buy(
         _log_tag("LIMIT POSTED", slug=runner.contract.slug, side=side, order_id=runner.pending_order_id)
         return True
     except Exception as exc:  # noqa: BLE001
+        failed_order_id = runner.pending_order_id
         _clear_pending_limit_state(runner)
         runner.execution_state = READY
+        lr.mark_sent_order_failed(runner, failed_order_id, error=str(exc))
         if _is_balance_or_allowance_error(exc):
             runner.stop_reason = "balance_or_allowance"
             _log_tag("STOP", slug=runner.contract.slug, side=side, reason="balance_or_allowance", error=str(exc))
@@ -2040,18 +2222,26 @@ def _tick_runner(
     binance: BinanceCombinedTradeFeed,
     clob: KngtopClob | None,
     cfg: KngtopConfig,
+    runtime_state: dict[str, Any] | None = None,
 ) -> None:
     now_ts = datetime.now(timezone.utc).timestamp()
     if runner.stop_reason is not None:
         return
-    if not cfg.dry_run and clob is not None:
-        if _sync_and_enforce_single_open_limit(runner, clob=clob, cfg=cfg):
-            _reconcile_pending_limit_order(runner, cfg=cfg, clob=clob)
+    state = runtime_state if runtime_state is not None else {}
+    if not cfg.dry_run:
+        try:
+            _apply_cached_reconcile_snapshot(runner, runtime_state=state, cfg=cfg, clob=clob)
+            _process_sent_order_lifecycle(runner, cfg=cfg)
+            _sync_pending_from_reconciled_open_orders(runner)
+            if clob is not None and _sync_and_enforce_single_open_limit(runner, clob=clob, cfg=cfg):
+                _reconcile_pending_limit_order(runner, cfg=cfg, clob=clob)
+        except Exception as exc:  # noqa: BLE001
+            _log_tag("RECONCILE", slug=runner.contract.slug, status="error", error=str(exc))
             return
     elif runner.pending_order:
         if _reconcile_pending_limit_order(runner, cfg=cfg, clob=clob):
             return
-    if runner.execution_state == ORDER_IN_FLIGHT:
+    if lr.runner_has_active_open_order(runner):
         return
     if runner.next_decision_ts > now_ts + 1e-12:
         runner.execution_state = WAIT_NEXT_DECISION
@@ -2062,12 +2252,6 @@ def _tick_runner(
         return
     if elapsed < 0:
         return
-    if not cfg.dry_run:
-        try:
-            _refresh_positions_from_pm(runner, cfg=cfg)
-        except Exception as exc:  # noqa: BLE001
-            _log_tag("RECONCILE", slug=runner.contract.slug, status="error", error=str(exc))
-            return
     if runner.window_open_px is None:
         start_sec = runner.start_sec()
         if start_sec is None:
@@ -2118,13 +2302,16 @@ def _run_iteration(
     poly: MarketWsFeed,
     binance: BinanceCombinedTradeFeed,
     clob: KngtopClob | None,
+    runtime_state: dict[str, Any] | None = None,
 ) -> None:
+    state = runtime_state if runtime_state is not None else {}
+    state["runners"] = runners
     binance_symbol = dict(cfg.trading_pairs).get(TRADE_PAIR_KEY, "BTCUSDT")
     _discover_target_windows(cfg, runners=runners, binance_symbol=binance_symbol, clob=clob)
     _refresh_subscriptions(runners=runners, poly=poly)
     for runner in list(runners.values()):
         try:
-            _tick_runner(runner, poly=poly, binance=binance, clob=clob, cfg=cfg)
+            _tick_runner(runner, poly=poly, binance=binance, clob=clob, cfg=cfg, runtime_state=state)
         except Exception as exc:  # noqa: BLE001
             _log_tag("ERROR", slug=runner.contract.slug, stage="tick", error=str(exc))
     _purge_finished_windows(runners=runners)
@@ -2135,7 +2322,8 @@ def main() -> None:
     _setup_logging(cfg.log_level)
     btc_binance_symbol = dict(cfg.trading_pairs).get(TRADE_PAIR_KEY, "BTCUSDT")
     coord = EvalCoordinator(debounce_sec=0.0, heartbeat_sec=cfg.poll_interval_sec)
-    runtime_state: dict[str, Any] = {}
+    runtime_state: dict[str, Any] = {"runners": {}}
+    reconcile_stop = threading.Event()
 
     def _on_poly_quote() -> None:
         _log_ws_update(runtime_state, feed="polymarket")
@@ -2179,11 +2367,26 @@ def main() -> None:
         )
 
     runners: dict[int, WindowRunner] = {}
+    runtime_state["runners"] = runners
+    if not cfg.dry_run and clob is not None:
+        threading.Thread(
+            target=lr.run_live_reconcile_loop,
+            args=(reconcile_stop,),
+            kwargs={
+                "clob": clob,
+                "cfg": cfg,
+                "runtime_state": runtime_state,
+                "on_update": coord.notify,
+            },
+            name="live-reconcile",
+            daemon=True,
+        ).start()
     _log_tag(
         "INIT",
         pair=TRADE_PAIR_KEY,
         window_minutes=str(TRADE_WINDOW_MINUTES),
         strategy="guarded_pnl_balance_C",
+        reconcile_interval_sec=f"{lr.RECONCILE_INTERVAL_SEC:.1f}",
         bootstrap="initial_lower_ask<=0.55_amount2",
         active_repair="5s_weak_outcome_cheap<=0.45_high_guard<=0.60",
         high_repair="pre240<=0.65_final60_danger<=0.80",
@@ -2198,7 +2401,7 @@ def main() -> None:
     while True:
         try:
             coord.wait_for_turn()
-            _run_iteration(cfg, runners=runners, poly=poly, binance=binance, clob=clob)
+            _run_iteration(cfg, runners=runners, poly=poly, binance=binance, clob=clob, runtime_state=runtime_state)
         except Exception as exc:  # noqa: BLE001
             _log_tag("ERROR", stage="main_loop", error=str(exc))
 

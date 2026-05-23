@@ -13,6 +13,9 @@
 - Max share gap `2` shares between UP and DOWN after each fill.
 - If share gap exceeds max, only buy the smaller side until balanced.
 - One limit order at a time; wait for fill/cancel before sending another.
+- Every 1 second, reconcile Polymarket positions (REST) and all CLOB open orders; wake strategy on updates.
+- Register every sent order locally; track status (`sent`, `open`, `partial`, `filled`, `cancelled`, `failed`) from open-order sync and `get_order`.
+- Act only on reconciled state: confirmed PM positions for decisions, open-order cache for blocking duplicates, sent-order registry for lifecycle.
 - Sync open orders from CLOB every tick; cancel duplicates so only one active order exists per window.
 - If imbalanced and no active order exists, place a balance limit immediately (do not wait for repair slot).
 - Hedge side is decided from confirmed fills only; never stack more on an already-open one-sided leg.

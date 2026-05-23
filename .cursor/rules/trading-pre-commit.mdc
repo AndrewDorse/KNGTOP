@@ -1,0 +1,46 @@
+---
+description: Pre-commit checklist for live trading logic (kngtop live engine)
+globs: kngtop/live_*.py,tests/test_live_*.py,CORE_RULES.md
+alwaysApply: false
+---
+
+# Live Trading Pre-Commit Checklist
+
+Run before every commit touching order/position/reconcile logic:
+
+```bash
+pytest tests/test_live_kilemo2.py tests/test_live_reconcile.py -q
+```
+
+## Invariants (must never break)
+
+1. **Hedge from confirmed fills only** — `_required_hedge_side(_confirmed_position_state(), cfg)`; never use pending-inflated state for hedge direction.
+2. **One active limit per window** — `MAX_ACTIVE_LIMIT_ORDERS=1`, `runner_has_active_open_order()`, `_can_place_limit_buy()` all agree.
+3. **Missing side → opposite leg only** — UP filled ⇒ next buy DOWN; cancel wrong-side open limits in `_sync_and_enforce_single_open_limit`.
+4. **No rebootstrap with existing leg** — initial buy only when both sides empty and `total_deals==0`.
+5. **PM positions authoritative** — decisions from merged API+local via `_merge_effective_positions()` (max shares, never shrink confirmed local).
+6. **Every sent limit registered** — `lr.register_sent_order()` in `_send_limit_buy()`; lifecycle updated via reconcile.
+7. **Partial fill keeps pending** — `_reconcile_pending_limit_order()` must re-adopt if order still open; never clear pending on first PM delta alone.
+
+## Common bugs (historical)
+
+| Bug | Symptom | Check |
+|-----|---------|-------|
+| Re-bootstrap on one-sided leg | Second UP after UP fill | `test_up_position_with_zero_deals_posts_down_limit_not_second_up` |
+| Pending pollutes hedge side | Wrong hedge direction | Use `_confirmed_position_state`, not `_effective_state_with_pending` for hedge |
+| Duplicate limits | Multiple CLOB orders | Reconcile cache + dedupe in `_sync_and_enforce_single_open_limit` |
+| Stale open_orders after cancel | Blocked tick or duplicate send | `_set_runner_open_orders_cache()` updated after cancel/dedupe |
+| Partial fill → duplicate post | Two limits same side | PM delta + still_open check before `_clear_pending_limit_state` |
+| Stray PM row during bootstrap | Wrong side counted | Bootstrap PM filter only when zero confirmed shares |
+| Sent order stuck `sent` | No lifecycle | Both paths call `_update_sent_orders_from_get_order` |
+| Immediate fill not tracked | Orphan sent record | Mark `SENT_FILLED` in `_send_limit_buy` after PM confirm |
+
+## Tick order (do not reorder casually)
+
+`_apply_cached_reconcile_snapshot` → `_process_sent_order_lifecycle` → `_sync_pending_from_reconciled_open_orders` → `_sync_and_enforce_single_open_limit` → `_reconcile_pending_limit_order` → strategy.
+
+## Code hygiene
+
+- No duplicate function definitions in `live_kilemo2.py` or test fakes.
+- `_fetch_window_open_buy_orders` prefers reconcile cache over per-asset API.
+- `_sync_pending_from_reconciled_open_orders` adopts open orders; does not clear pending on empty cache.

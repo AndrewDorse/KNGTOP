@@ -102,6 +102,25 @@ class _FakeClob:
             if str(row.get("asset_id")) == token.token_id and float(row.get("size_left") or 0.0) > 0.0
         ]
 
+    def get_open_orders(self) -> list[dict[str, object]]:  # noqa: ANN201
+        return [
+            dict(row)
+            for row in self.open_orders
+            if float(row.get("size_left") or row.get("original_size") or 0.0) > 0.0
+        ]
+
+    def get_order(self, order_id: str) -> dict[str, object]:  # noqa: ANN201
+        for row in self.open_orders:
+            if str(row.get("id")) == str(order_id):
+                return dict(row)
+        return {
+            "id": order_id,
+            "status": "filled",
+            "size_matched": 0.0,
+            "original_size": 0.0,
+            "size_left": 0.0,
+        }
+
     def cancel_order_by_id(self, order_id: str) -> dict[str, object]:  # noqa: ANN201
         self.drop_open_order(str(order_id))
         return {"success": True}
