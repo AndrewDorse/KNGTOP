@@ -335,8 +335,11 @@ def _tick_runner(
     state = runtime_state if runtime_state is not None else {}
     rows = state.get("reconcile_positions")
     _refresh_positions(runner, cfg=cfg, rows=list(rows) if isinstance(rows, list) else None)
-    open_rows = state.get("reconcile_open_orders")
-    _sync_open_orders(runner, clob=clob, rows=list(open_rows) if isinstance(open_rows, list) else None)
+    if clob is not None:
+        _sync_open_orders(runner, clob=clob)
+    else:
+        open_rows = state.get("reconcile_open_orders")
+        _sync_open_orders(runner, clob=clob, rows=list(open_rows) if isinstance(open_rows, list) else None)
     if elapsed < -PRESTART_SEC - 1e-12:
         return
     up_quote = poly.best_bid_ask_for(runner.contract.up.token_id, max_age_sec=cfg.poly_mid_max_age_sec)

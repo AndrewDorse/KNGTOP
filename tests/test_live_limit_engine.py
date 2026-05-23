@@ -118,11 +118,43 @@ def _tick(
     return fake_clob
 
 
+def _tick_with_stale_empty_cache(
+    runner: WindowRunner,
+    *,
+    elapsed: int,
+    up: float,
+    down: float,
+    clob: _FakeClob,
+) -> None:
+    with patch("kngtop.live_limit_engine.datetime") as fake_dt:
+        fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_000 + elapsed, timezone.utc)
+        _tick_runner(
+            runner,
+            poly=_FakePoly(up=up, down=down),
+            clob=clob,
+            cfg=_cfg(),
+            runtime_state={"reconcile_positions": [], "reconcile_open_orders": []},
+        )
+
+
 def test_prestart_places_one_order_per_side_at_47() -> None:
     runner = _runner(1_700_000_000)
     clob = _tick(runner, elapsed=-10, up=0.55, down=0.55)
 
     assert clob.calls == [("up-token", 0.47, 5.0), ("down-token", 0.47, 5.0)]
+
+
+def test_repeated_ticks_do_not_duplicate_orders_with_stale_empty_reconcile_cache() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob()
+
+    _tick_with_stale_empty_cache(runner, elapsed=-10, up=0.55, down=0.55, clob=clob)
+    _tick_with_stale_empty_cache(runner, elapsed=-10, up=0.55, down=0.55, clob=clob)
+    _tick_with_stale_empty_cache(runner, elapsed=-9, up=0.55, down=0.55, clob=clob)
+
+    assert clob.calls == [("up-token", 0.47, 5.0), ("down-token", 0.47, 5.0)]
+    assert len([row for row in clob.open_orders if row["asset_id"] == "up-token"]) == 1
+    assert len([row for row in clob.open_orders if row["asset_id"] == "down-token"]) == 1
 
 
 def test_duplicate_same_side_order_is_cancelled_before_new_work() -> None:
