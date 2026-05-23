@@ -1,4 +1,4 @@
-# KNGTOP - copy .env.example to .env, set POLY_DRY_RUN=false for live FAK buys
+# KNGTOP - copy .env.example to .env, set POLY_DRY_RUN=false for live limit buys
 services:
   kngtop:
     build: .
