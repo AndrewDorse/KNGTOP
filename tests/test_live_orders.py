@@ -72,7 +72,31 @@ def test_cycle_begin_primary_marks_busy() -> None:
     lo.cycle_begin_primary(runner, side="DOWN", price=0.48, shares=5.0, reason="bootstrap")
     assert lo.has_active_order(runner)
     assert runner.cycle.phase == lo.PHASE_WAIT_PRIMARY
+    assert runner.orders_sent == 0
+
+
+def test_cycle_mark_primary_sent_counts_side() -> None:
+    runner = _runner(1_700_000_000)
+    lo.cycle_begin_primary(runner, side="DOWN", price=0.48, shares=5.0, reason="bootstrap")
+    lo.cycle_mark_primary_sent(runner, "ord-1")
+    assert runner.sends_down == 1
     assert runner.orders_sent == 1
+
+
+def test_mandatory_hedge_side_when_flat() -> None:
+    from kngtop.live_kilemo2 import _required_cycle_hedge_side
+
+    runner = _runner(1_700_000_000)
+    lo.cycle_begin_primary(runner, side="DOWN", price=0.48, shares=5.0, reason="initial_lower_ask")
+    assert _required_cycle_hedge_side(runner, runner.positions, _cfg()) == "UP"
+
+
+def test_send_cap_blocks_fourth_order_on_side() -> None:
+    from kngtop.live_kilemo2 import _can_send_on_side
+
+    runner = _runner(1_700_000_000)
+    runner.sends_up = 3
+    assert not _can_send_on_side(runner, "UP", _cfg())
 
 
 def test_order_on_clob_detects_open_order() -> None:

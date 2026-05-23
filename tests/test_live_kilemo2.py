@@ -825,10 +825,9 @@ def test_initial_two_usd_attempt_happens_only_once_after_nofill() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 2.4, 0.48)]
+    assert clob.calls == [("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
     assert runner.initial_intent_attempted is True
     assert runner.pending_order is True
-    assert runner.positions.spent_total() == 0.0
     assert runner.intent_count_down == 1
     assert runner.intent_count_up == 0
 
@@ -926,7 +925,7 @@ def test_initial_retry_stops_after_two_failures_per_side() -> None:
     _tick(runner, elapsed=15, up=0.48, down=0.49, clob=clob)
     _tick(runner, elapsed=20, up=0.48, down=0.49, clob=clob)
 
-    assert clob.calls == [("down-token", 2.4, 0.48)]
+    assert clob.calls == [("down-token", 2.4, 0.48), ("up-token", 2.55, 0.51)]
     assert runner.stop_reason is None
     assert runner.pending_order is True
     assert runner.intent_count_down == 1
@@ -960,9 +959,8 @@ def test_bootstrap_waits_for_other_side_after_first_side_exhausted() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.6500000000000001, 0.33)]
-    assert runner.pending_order is True
-    assert runner.positions.orders_down == 0
+    assert ("up-token", 1.6500000000000001, 0.33) in clob.calls
+    assert runner.positions.shares_down == 2.0
     assert runner.stop_reason is None
 
 
@@ -1133,7 +1131,7 @@ def test_successful_fak_without_fill_field_records_local_risk_immediately() -> N
         positions_seq=[[], []],
     )
 
-    assert clob.calls == [("down-token", 1.6, 0.32)]
+    assert clob.calls == [("down-token", 1.6, 0.32), ("up-token", 2.9499999999999997, 0.59)]
     assert runner.pending_order is True
     assert runner.positions.shares_down == 0.0
 

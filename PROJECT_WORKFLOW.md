@@ -48,7 +48,7 @@
 
 ## Wallet History Command
 
-- Command: "get wallet history from `<window_start>` 5m btc window and report" means fetch Polymarket activity for wallet `0x9016105aaD4bc837E275110DA4CdCf4249b9edE1` around the BTC 5m UP/DOWN window starting at `<window_start>`.
+- Command: "get wallet history from `<window_start>` 5m btc window and report" means fetch Polymarket activity for wallet `` around the BTC 5m UP/DOWN window starting at `<window_start>`.
 - Analyze activity per window: buys/spend, sells/proceeds, redeems/claimed amount, net cash, shares by side, and final per-window summary.
 - If the user gives a broader time range, group activity by each BTC 5m window slug or start timestamp.
 
