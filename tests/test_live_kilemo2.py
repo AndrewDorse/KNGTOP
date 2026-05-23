@@ -17,21 +17,44 @@ def _inject_active_order(
     shares: float = 5.0,
     order_id: str = "test-active",
 ) -> None:
-    token_id = "up-token" if side == "UP" else "down-token"
-    order = lo.register_intent(
-        runner,
-        side=side,
-        token_id=token_id,
-        price=price,
-        shares=shares,
-        reason="test",
-        pre_shares=0.0,
-        sent_ts=0.0,
-    )
-    lo.mark_posted(order, order_id=order_id)
+    lo.cycle_begin_primary(runner, side=side, price=price, shares=shares, reason="test")
+    lo.cycle_mark_primary_id(runner, order_id)
     runner.open_orders[side] = [
         lo.OpenOrderView(order_id=order_id, side=side, price=price, remaining_shares=shares),
     ]
+
+
+def _finish_cycle(
+    runner: WindowRunner,
+    *,
+    elapsed: int,
+    up: float,
+    down: float,
+    clob: _FakeClob | None = None,
+    positions_seq: list[list[dict[str, object]]] | None = None,
+    pm_ticks: int = 8,
+) -> _FakeClob:
+    """Advance in-flight order cycle until idle — no new strategy sends."""
+    from kngtop.live_kilemo2 import _advance_order_cycle
+
+    fake_clob = clob or _FakeClob()
+    seq = list(positions_seq or [[]])
+
+    def _fake_positions(*, user: str, timeout: float, limit: int = 500):  # noqa: ANN202
+        del user, timeout, limit
+        if len(seq) > 1:
+            return seq.pop(0)
+        return seq[0]
+
+    for step in range(pm_ticks):
+        with patch("kngtop.live_kilemo2.datetime") as fake_dt:
+            fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_000 + elapsed + step, timezone.utc)
+            with patch("kngtop.live_kilemo2.fetch_user_positions", side_effect=_fake_positions):
+                with patch.object(lo, "PM_STABLE_INTERVAL_SEC", 0.0):
+                    if not lo.cycle_is_busy(runner):
+                        break
+                    _advance_order_cycle(runner, clob=fake_clob, cfg=_cfg(), up_ask=up, down_ask=down)
+    return fake_clob
 
 
 def _cfg() -> KngtopConfig:
@@ -208,7 +231,8 @@ def _tick(
     with patch("kngtop.live_kilemo2.datetime") as fake_dt:
         fake_dt.now.return_value = datetime.fromtimestamp(1_700_000_000 + elapsed, timezone.utc)
         with patch("kngtop.live_kilemo2.fetch_user_positions", side_effect=_fake_positions):
-            _tick_runner(runner, poly=_Poly(up=up, down=down), binance=_FakeBinance(), clob=fake_clob, cfg=_cfg())
+            with patch.object(lo, "PM_STABLE_INTERVAL_SEC", 0.0):
+                _tick_runner(runner, poly=_Poly(up=up, down=down), binance=_FakeBinance(), clob=fake_clob, cfg=_cfg())
     return fake_clob
 
 
@@ -221,6 +245,16 @@ def test_initial_buy_is_2_usd_lower_ask_under_bootstrap_cap() -> None:
         down=0.49,
         positions_seq=[
             [],
+            [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.081632653, avg_price=0.49)],
+        ],
+    )
+    _finish_cycle(
+        runner,
+        elapsed=1,
+        up=0.52,
+        down=0.49,
+        clob=clob,
+        positions_seq=[
             [_positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=4.081632653, avg_price=0.49)],
         ],
     )
@@ -885,6 +919,16 @@ def test_nofill_response_still_counts_fill_when_pm_confirms_position() -> None:
             [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.882352941, avg_price=0.34)],
         ],
     )
+    _finish_cycle(
+        runner,
+        elapsed=1,
+        up=0.34,
+        down=0.66,
+        clob=clob,
+        positions_seq=[
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.882352941, avg_price=0.34)],
+        ],
+    )
 
     assert clob.calls == [("up-token", 1.6500000000000001, 0.33)]
     assert runner.positions.orders_up == 1
@@ -933,6 +977,16 @@ def test_pm_discovered_bootstrap_fill_triggers_missing_side_buy() -> None:
         clob=clob,
         positions_seq=[
             [],
+            [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.060606061, avg_price=0.33)],
+        ],
+    )
+    _finish_cycle(
+        runner,
+        elapsed=1,
+        up=0.33,
+        down=0.67,
+        clob=clob,
+        positions_seq=[
             [_positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=6.060606061, avg_price=0.33)],
         ],
     )
@@ -1174,7 +1228,6 @@ def test_pending_reserved_shares_count_toward_effective_share_cap() -> None:
     state = PositionState(spent_up=7.0, shares_up=14.0, spent_down=3.0, shares_down=8.0, orders_up=4, orders_down=2, total_deals=6)
     runner = _runner(1_700_000_000, positions=state)
     _inject_active_order(runner, side="UP", price=0.40, shares=1.0, order_id="pending-up")
-    runner.orders[list(runner.orders.keys())[0]].sent_ts = 0.0
 
     effective = _effective_state_with_pending(runner)
 

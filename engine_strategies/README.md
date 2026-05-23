@@ -1,6 +1,7 @@
 # Engine Strategy Snapshots
 
-- `engine_88_live_kilemo2.py` + `engine_88_live_orders.py`: unified `LiveOrder` registry, non-blocking send, reconcile-only lifecycle (current push).
+- `engine_86_live_kilemo2.py` + `engine_86_live_orders.py`: strict two-leg `OrderCycle` — one primary, confirm CLOB, one hedge, 5× PM stable, then next (current push).
+- `engine_88_live_kilemo2.py` + `engine_88_live_orders.py`: unified `LiveOrder` registry, non-blocking send, reconcile-only lifecycle.
 - `engine_99_live_kilemo2.py`: last pushed engine strategy from commit `06dacb6`.
 - `engine_98_live_kilemo2.py`: tighter avg-sum repair strategy from commit `2d9a845`.
 - `engine_97_live_kilemo2.py`: effective-position risk repair for API lag, hard caps, and one-sided end-window guard.

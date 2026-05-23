@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import patch
 
 from kngtop.config import KngtopConfig
 from kngtop.gamma import ActiveContract, TokenMarket
@@ -68,35 +67,18 @@ class _FakeClob:
         return dict(self.order_payloads.get(str(order_id), {}))
 
 
-def test_register_intent_before_post() -> None:
+def test_cycle_begin_primary_marks_busy() -> None:
     runner = _runner(1_700_000_000)
-    order = lo.register_intent(
-        runner,
-        side="DOWN",
-        token_id="down-token",
-        price=0.48,
-        shares=5.0,
-        reason="bootstrap",
-        pre_shares=0.0,
-        sent_ts=1_700_000_000.0,
-    )
-    assert order.status == lo.ORDER_INTENT
+    lo.cycle_begin_primary(runner, side="DOWN", price=0.48, shares=5.0, reason="bootstrap")
     assert lo.has_active_order(runner)
+    assert runner.cycle.phase == lo.PHASE_WAIT_PRIMARY
+    assert runner.orders_sent == 1
 
 
-def test_reconcile_updates_partial_status() -> None:
+def test_order_on_clob_detects_open_order() -> None:
     runner = _runner(1_700_000_000)
-    order = lo.register_intent(
-        runner,
-        side="DOWN",
-        token_id="down-token",
-        price=0.48,
-        shares=5.0,
-        reason="bootstrap",
-        pre_shares=0.0,
-        sent_ts=1_700_000_000.0,
-    )
-    lo.mark_posted(order, order_id="ord-1")
+    lo.cycle_begin_primary(runner, side="DOWN", price=0.48, shares=5.0, reason="bootstrap")
+    lo.cycle_mark_primary_id(runner, "ord-1")
     clob = _FakeClob(
         open_orders=[
             {
@@ -105,118 +87,33 @@ def test_reconcile_updates_partial_status() -> None:
                 "side": "BUY",
                 "price": 0.48,
                 "original_size": 5.0,
-                "size_left": 3.0,
-            }
-        ]
-    )
-    lo.reconcile_runner_orders(runner, clob=clob, open_order_rows=clob.get_open_orders(), now_ts=1_700_000_001.0)
-    assert lo.has_active_order(runner)
-    assert order.status == lo.ORDER_PARTIAL
-    assert order.matched_shares == 2.0
-
-
-def test_missing_from_open_marks_filled_when_fully_matched() -> None:
-    runner = _runner(1_700_000_000)
-    order = lo.register_intent(
-        runner,
-        side="UP",
-        token_id="up-token",
-        price=0.40,
-        shares=5.0,
-        reason="balance",
-        pre_shares=0.0,
-        sent_ts=1_700_000_000.0,
-    )
-    lo.mark_posted(order, order_id="ord-2")
-    order.matched_shares = 5.0
-    order.status = lo.ORDER_OPEN
-    clob = _FakeClob(open_orders=[])
-    clob.order_payloads["ord-2"] = {
-        "id": "ord-2",
-        "status": "filled",
-        "size_matched": 5.0,
-        "original_size": 5.0,
-        "size_left": 0.0,
-    }
-    lo.reconcile_runner_orders(runner, clob=clob, open_order_rows=[], now_ts=1_700_000_002.0)
-    assert order.status == lo.ORDER_FILLED
-    assert not lo.has_active_order(runner)
-
-
-def test_orphan_open_order_is_adopted() -> None:
-    runner = _runner(1_700_000_000)
-    clob = _FakeClob(
-        open_orders=[
-            {
-                "id": "orphan-1",
-                "asset_id": "down-token",
-                "side": "BUY",
-                "price": 0.50,
-                "original_size": 5.0,
                 "size_left": 5.0,
             }
         ]
     )
-    lo.reconcile_runner_orders(runner, clob=clob, open_order_rows=clob.get_open_orders(), now_ts=1_700_000_000.0)
-    assert lo.has_active_order(runner)
-    assert runner.pending_order_id == "orphan-1"
+    assert lo.order_on_clob(runner, clob=clob, order_id="ord-1", side="DOWN")
+
+
+def test_pm_stable_requires_five_checks() -> None:
+    runner = _runner(1_700_000_000)
+    lo.cycle_start_pm_wait(runner, up_shares=5.0, down_shares=5.0, now_ts=1_700_000_000.0)
+    ts = 1_700_000_000.0
+    for i in range(1, 4):
+        assert not lo.tick_pm_stable(runner, up_shares=5.0, down_shares=5.0, now_ts=ts + i)
+    assert lo.tick_pm_stable(runner, up_shares=5.0, down_shares=5.0, now_ts=ts + 4.0)
 
 
 def test_clear_window_orders() -> None:
     runner = _runner(1_700_000_000)
-    lo.register_intent(
-        runner,
-        side="DOWN",
-        token_id="down-token",
-        price=0.48,
-        shares=5.0,
-        reason="bootstrap",
-        pre_shares=0.0,
-        sent_ts=1_700_000_000.0,
-    )
+    lo.cycle_begin_primary(runner, side="DOWN", price=0.48, shares=5.0, reason="bootstrap")
     lo.clear_window_orders(runner)
     assert runner.orders == {}
     assert runner.open_orders == {"UP": [], "DOWN": []}
-
-
-def test_register_intent_refuses_second_in_flight() -> None:
-    runner = _runner(1_700_000_000)
-    first = lo.register_intent(
-        runner,
-        side="DOWN",
-        token_id="down-token",
-        price=0.48,
-        shares=5.0,
-        reason="bootstrap",
-        pre_shares=0.0,
-        sent_ts=1_700_000_000.0,
-    )
-    second = lo.register_intent(
-        runner,
-        side="UP",
-        token_id="up-token",
-        price=0.40,
-        shares=5.0,
-        reason="bootstrap",
-        pre_shares=0.0,
-        sent_ts=1_700_000_001.0,
-    )
-    assert first is not None
-    assert second is None
-    assert runner.orders_sent == 1
-
-
-def test_post_failure_does_not_block_forever() -> None:
-    runner = _runner(1_700_000_000)
-    order = lo.register_intent(
-        runner,
-        side="DOWN",
-        token_id="down-token",
-        price=0.48,
-        shares=5.0,
-        reason="bootstrap",
-        pre_shares=0.0,
-        sent_ts=1_700_000_000.0,
-    )
-    lo.mark_failed(order, error="boom")
     assert not lo.has_active_order(runner)
+
+
+def test_cycle_reset_returns_idle() -> None:
+    runner = _runner(1_700_000_000)
+    lo.cycle_begin_primary(runner, side="DOWN", price=0.48, shares=5.0, reason="bootstrap")
+    lo.cycle_reset(runner)
+    assert lo.cycle_is_idle(runner)

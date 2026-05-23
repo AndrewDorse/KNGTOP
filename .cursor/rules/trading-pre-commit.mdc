@@ -12,13 +12,14 @@ pytest tests/test_live_kilemo2.py tests/test_live_orders.py -q
 
 ## Invariants
 
-1. **One deal in flight** — `has_active_order()` blocks strategy; `register_intent()` refuses second send.
-2. **Wait for PM fill** — `_wait_active_deal()` every tick; deal closes only when PM shares > `order.pre_shares`.
-3. **No strategy while waiting** — tick returns immediately after `[DEAL] state=WAIT_PM_FILL`.
-4. **Hedge under-cap side** — when one leg over cap (e.g. 20 UP), still post limit on smaller side (DOWN).
-5. **Never buy over-cap side** — `_side_over_cap()` blocks that side only.
-6. **Adopted CLOB orders** — baseline `pre_shares` from PM at adopt time (no false fill).
+1. **One cycle in flight** — `cycle_is_busy()` blocks strategy; max 2 sends per cycle (primary + hedge).
+2. **Primary once, then wait CLOB** — no re-send while `wait_primary`; poll until on book.
+3. **Hedge once after primary on book** — immediate if under-cap/missing side needs it; then PM wait.
+4. **5× PM stable before next** — `PM_STABLE_CONFIRMS=5` at 1s interval; only then `cycle_reset()`.
+5. **Hedge under-cap side** — when one leg over cap (e.g. 20 UP), post limit on smaller side (DOWN).
+6. **Never buy over-cap side** — `_side_over_cap()` blocks that side only.
+7. **Adopt orphan CLOB orders** — `adopt_open_order()` tracks existing book orders without sending.
 
 ## Tick order
 
-reconcile PM+CLOB → adopt orphans → `_wait_active_deal` → (if idle) strategy → send → `_wait_active_deal` again
+reconcile PM+CLOB → adopt/cancel dupes → `_advance_order_cycle` → (if idle) strategy → send primary → `_advance_order_cycle`
