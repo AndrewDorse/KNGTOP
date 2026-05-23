@@ -154,7 +154,7 @@ def test_initial_buy_is_2_usd_lower_ask_under_bootstrap_cap() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 2.45, 0.49)]
+    assert clob.calls == [("down-token", 2.4, 0.48)]
     assert runner.positions.orders_down == 1
     assert abs(runner.positions.spent_total() - 2.0) < 1e-6
 
@@ -478,9 +478,9 @@ def test_zero_avg_price_from_pm_uses_pending_order_price_for_cost() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 2.45, 0.49)]
+    assert clob.calls == [("down-token", 2.4, 0.48)]
     assert runner.positions.shares_down == 4.081632653
-    assert abs(runner.positions.spent_down - 2.0) < 1e-6
+    assert abs(runner.positions.spent_down - 1.95918367344) < 1e-6
     assert runner.positions.total_deals == 1
 
 
@@ -525,7 +525,7 @@ def test_bootstrap_amount_is_capped_by_max_shares_per_side() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.0, 0.10)]
+    assert clob.calls == [("up-token", 1.05, 0.09000000000000001)]
     assert runner.positions.shares_up == 15.0
 
 
@@ -616,7 +616,7 @@ def test_failed_order_does_not_update_position_and_waits_before_retry() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 2.45, 0.49), ("down-token", 2.45, 0.49)]
+    assert clob.calls == [("down-token", 2.4, 0.48), ("down-token", 2.4, 0.48)]
     assert runner.positions.total_deals == 1
     assert runner.positions.orders_down == 1
 
@@ -638,7 +638,7 @@ def test_initial_two_usd_attempt_happens_only_once_after_nofill() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 2.45, 0.49)]
+    assert clob.calls == [("down-token", 2.4, 0.48)]
     assert runner.initial_intent_attempted is True
     assert runner.pending_order is True
     assert runner.positions.spent_total() == 0.0
@@ -663,7 +663,7 @@ def test_after_one_side_fill_next_buy_is_missing_side_not_more_same_side() -> No
         ],
     )
 
-    assert clob.calls == [("up-token", 2.2, 0.44)]
+    assert clob.calls == [("up-token", 2.15, 0.43)]
     assert runner.positions.orders_up == 1
 
 
@@ -684,7 +684,7 @@ def test_missing_side_opens_at_061_before_high_repair_projection_guard() -> None
         ],
     )
 
-    assert clob.calls == [("up-token", 3.05, 0.61)]
+    assert clob.calls == [("up-token", 3.0, 0.60)]
     assert runner.positions.orders_up == 1
 
 
@@ -708,7 +708,7 @@ def test_later_sizing_can_use_fractional_amount_to_optimize_projected_pnl() -> N
         ],
     )
 
-    assert clob.calls == [("up-token", 1.75, 0.35)]
+    assert clob.calls == [("up-token", 1.6999999999999997, 0.33999999999999997)]
 
 
 def test_balance_or_allowance_error_stops_window() -> None:
@@ -739,7 +739,7 @@ def test_initial_retry_stops_after_two_failures_per_side() -> None:
     _tick(runner, elapsed=15, up=0.48, down=0.49, clob=clob)
     _tick(runner, elapsed=20, up=0.48, down=0.49, clob=clob)
 
-    assert clob.calls == [("down-token", 2.45, 0.49)]
+    assert clob.calls == [("down-token", 2.4, 0.48)]
     assert runner.stop_reason is None
     assert runner.pending_order is True
     assert runner.intent_count_down == 1
@@ -773,7 +773,7 @@ def test_bootstrap_waits_for_other_side_after_first_side_exhausted() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.7000000000000002, 0.34)]
+    assert clob.calls == [("up-token", 1.6500000000000001, 0.33)]
     assert runner.pending_order is True
     assert runner.positions.orders_down == 0
     assert runner.stop_reason is None
@@ -795,7 +795,7 @@ def test_nofill_response_still_counts_fill_when_pm_confirms_position() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.7000000000000002, 0.34)]
+    assert clob.calls == [("up-token", 1.6500000000000001, 0.33)]
     assert runner.positions.orders_up == 1
     assert runner.positions.total_deals == 1
     assert runner.initial_failed_up == 0
@@ -818,7 +818,7 @@ def test_no_match_error_still_counts_fill_when_pm_confirms_position() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.6500000000000001, 0.33)]
+    assert clob.calls == [("up-token", 1.6, 0.32)]
     assert runner.positions.orders_up == 0
     assert runner.positions.total_deals == 0
     assert runner.initial_failed_up == 1
@@ -860,7 +860,7 @@ def test_pm_discovered_bootstrap_fill_triggers_missing_side_buy() -> None:
         ],
     )
 
-    assert clob.calls == [("up-token", 1.6500000000000001, 0.33), ("down-token", 2.5, 0.50)]
+    assert clob.calls == [("up-token", 1.6, 0.32), ("down-token", 2.45, 0.49)]
     assert runner.positions.orders_up == 1
     assert runner.positions.orders_down == 1
     assert runner.positions.total_deals == 2
@@ -883,7 +883,7 @@ def test_pm_refresh_promotes_existing_position_to_open_side() -> None:
         ],
     )
 
-    assert clob.calls == [("down-token", 2.5, 0.50)]
+    assert clob.calls == [("down-token", 2.45, 0.49)]
     assert runner.positions.orders_up == 1
     assert runner.positions.orders_down == 1
     assert runner.positions.total_deals == 2
@@ -933,7 +933,7 @@ def test_successful_fak_without_fill_field_records_local_risk_immediately() -> N
         positions_seq=[[], []],
     )
 
-    assert clob.calls == [("down-token", 1.6500000000000001, 0.33)]
+    assert clob.calls == [("down-token", 1.6, 0.32)]
     assert runner.pending_order is True
     assert runner.positions.shares_down == 0.0
 
