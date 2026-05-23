@@ -1215,6 +1215,69 @@ def test_active_open_order_blocks_second_balance_post() -> None:
     assert runner.pending_order_id == "live-1"
 
 
+def test_up_position_with_zero_deals_posts_down_limit_not_second_up() -> None:
+    state = PositionState(
+        spent_up=1.65,
+        shares_up=5.0,
+        spent_down=0.0,
+        shares_down=0.0,
+        orders_up=0,
+        orders_down=0,
+        total_deals=0,
+    )
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=5,
+        up=0.26,
+        down=0.75,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.33),
+            ]
+        ],
+    )
+
+    assert len(clob.calls) == 1
+    assert clob.calls[0][0] == "down-token"
+    assert runner.pending_side == "DOWN"
+
+
+def test_open_up_order_cancelled_when_hedge_requires_down() -> None:
+    state = PositionState(
+        spent_up=1.65,
+        shares_up=5.0,
+        spent_down=0.0,
+        shares_down=0.0,
+        orders_up=1,
+        orders_down=0,
+        total_deals=1,
+    )
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _FakeClob()
+    clob.open_orders = [
+        {"id": "bad-up", "asset_id": "up-token", "side": "BUY", "price": 0.25, "original_size": 5.0, "size_left": 5.0},
+    ]
+    clob.open_order_ids = {"bad-up"}
+
+    _tick(
+        runner,
+        elapsed=5,
+        up=0.26,
+        down=0.75,
+        clob=clob,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.33),
+            ]
+        ],
+    )
+
+    assert "bad-up" not in clob.open_order_ids
+    assert len(clob.calls) == 1
+    assert clob.calls[0][0] == "down-token"
+
+
 def test_late_one_sided_window_stops_when_missing_side_cannot_open() -> None:
     state = PositionState(spent_up=2.0, shares_up=5.0, spent_down=0.0, shares_down=0.0, orders_up=1, orders_down=0, total_deals=1)
     runner = _runner(1_700_000_000, positions=state)
@@ -1228,8 +1291,9 @@ def test_late_one_sided_window_stops_when_missing_side_cannot_open() -> None:
         ],
     )
 
-    assert clob.calls == []
-    assert runner.stop_reason == "one_sided_unhedged"
+    assert clob.calls == [("down-token", 4.45, 0.89)]
+    assert runner.pending_side == "DOWN"
+    assert runner.stop_reason is None
 
 
 def test_one_order_per_tick_even_when_many_conditions_true() -> None:

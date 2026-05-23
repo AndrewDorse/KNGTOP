@@ -9,4 +9,5 @@
 - `engine_93_live_kilemo2.py`: explicit imbalance limit repair that places smaller-side orders at needed avg-improving prices.
 - `engine_92_live_kilemo2.py`: hard share-gap guard on every 5-share limit order; balance-first repair with no avg-price blockers.
 - `engine_91_live_kilemo2.py`: CLOB open-order sync each tick, cancel duplicates, max one active limit order, urgent balance when imbalanced.
-- After each new push, save the pushed engine here with the next lower number: `90`, `89`, etc.
+- `engine_90_live_kilemo2.py`: hedge side from confirmed fills only; block rebootstrap and wrong-side limits after one-sided UP/DOWN open.
+- After each new push, save the pushed engine here with the next lower number: `89`, `88`, etc.

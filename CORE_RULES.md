@@ -15,5 +15,6 @@
 - One limit order at a time; wait for fill/cancel before sending another.
 - Sync open orders from CLOB every tick; cancel duplicates so only one active order exists per window.
 - If imbalanced and no active order exists, place a balance limit immediately (do not wait for repair slot).
+- Hedge side is decided from confirmed fills only; never stack more on an already-open one-sided leg.
 - Do not buy if it breaks budget/share cap; avg-sum/balance guards apply after both sides are profitable.
 - Stop only when both outcomes reach the configured ROI target.
