@@ -60,20 +60,11 @@ INITIAL_RETRY_WAIT_SEC = 10.0
 INITIAL_RETRY_PRICE_IMPROVEMENT = 0.02
 MAX_INITIAL_RETRIES_PER_SIDE = 2
 MAX_ORDER_PRICE = 0.99
-MAX_ACTIVE_LIMIT_ORDERS = 1
 POST_ORDER_RECONCILE_TIMEOUT_SEC = 8.0
 POST_ORDER_RECONCILE_POLL_SEC = 0.25
 READY = "READY"
 ORDER_IN_FLIGHT = "ORDER_IN_FLIGHT"
 WAIT_NEXT_DECISION = "WAIT_NEXT_DECISION"
-
-
-@dataclass(slots=True)
-class TrackedLimitOrder:
-    order_id: str
-    side: str
-    price: float
-    remaining_shares: float
 
 
 @dataclass(slots=True)
@@ -193,184 +184,6 @@ def _extract_order_id(payload: object) -> str | None:
         if value:
             return str(value)
     return None
-
-
-def _clear_pending_limit_state(runner: WindowRunner) -> None:
-    runner.pending_order = False
-    runner.pending_order_id = None
-    runner.pending_side = None
-    runner.pending_reason = None
-    runner.pending_ask_px = 0.0
-    runner.pending_amount_usd = 0.0
-    runner.pending_reserved_shares = 0.0
-    runner.pending_created_ts = 0.0
-
-
-def _adopt_tracked_limit_order(runner: WindowRunner, order: TrackedLimitOrder, *, reason: str) -> None:
-    runner.pending_order = True
-    runner.pending_order_id = order.order_id
-    runner.pending_side = order.side
-    runner.pending_reason = reason
-    runner.pending_ask_px = order.price
-    runner.pending_amount_usd = order.remaining_shares * order.price
-    runner.pending_reserved_shares = order.remaining_shares
-    runner.execution_state = ORDER_IN_FLIGHT
-
-
-def _parse_open_buy_order_row(row: dict[str, object], *, token_id: str, side: str) -> TrackedLimitOrder | None:
-    asset_id = str(row.get("asset_id") or row.get("asset") or row.get("token_id") or "")
-    if asset_id and asset_id != token_id:
-        return None
-    raw_side = str(row.get("side") or row.get("order_side") or "").strip().upper()
-    if raw_side and raw_side != "BUY":
-        return None
-    order_id = _extract_order_id(row)
-    price = _extract_numeric(row, "price")
-    if not order_id or price is None or price <= 0.0:
-        return None
-    original_size = _extract_numeric(row, "original_size", "size", "makerAmount", "amount")
-    matched_size = _extract_numeric(row, "size_matched", "matched_amount", "filled_amount", "filled", "makerAmountFilled")
-    remaining_size = _extract_numeric(row, "size_left", "remaining", "remaining_amount", "size_remaining", "makerAmountRemaining")
-    matched = max(0.0, float(matched_size or 0.0))
-    if remaining_size is None and original_size is not None:
-        remaining_size = max(0.0, float(original_size) - matched)
-    if original_size is None and remaining_size is not None:
-        original_size = max(0.0, float(remaining_size) + matched)
-    if remaining_size is None:
-        remaining_size = original_size
-    remaining = max(0.0, float(remaining_size or 0.0))
-    if remaining <= 1e-12:
-        return None
-    return TrackedLimitOrder(order_id=order_id, side=side, price=float(price), remaining_shares=remaining)
-
-
-def _fetch_window_open_buy_orders(runner: WindowRunner, clob: KngtopClob | None) -> list[TrackedLimitOrder]:
-    if clob is None:
-        return []
-    orders: list[TrackedLimitOrder] = []
-    for side, token in (("UP", runner.contract.up), ("DOWN", runner.contract.down)):
-        try:
-            rows = clob.get_open_orders_for_asset(token)
-        except Exception as exc:  # noqa: BLE001
-            _log_tag("OPEN_ORDERS", slug=runner.contract.slug, side=side, status="error", error=str(exc))
-            continue
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            parsed = _parse_open_buy_order_row(row, token_id=token.token_id, side=side)
-            if parsed is not None:
-                orders.append(parsed)
-    return orders
-
-
-def _cancel_tracked_limit_order(
-    runner: WindowRunner,
-    *,
-    clob: KngtopClob | None,
-    order: TrackedLimitOrder,
-    reason: str,
-) -> bool:
-    if clob is None:
-        return False
-    try:
-        clob.cancel_order_by_id(order.order_id)
-    except Exception as exc:  # noqa: BLE001
-        _log_tag(
-            "LIMIT CANCEL",
-            slug=runner.contract.slug,
-            side=order.side,
-            order_id=order.order_id,
-            reason=reason,
-            error=str(exc),
-        )
-        return False
-    if runner.pending_order_id == order.order_id:
-        _clear_pending_limit_state(runner)
-        runner.execution_state = READY
-    _log_tag(
-        "LIMIT CANCEL",
-        slug=runner.contract.slug,
-        side=order.side,
-        order_id=order.order_id,
-        reason=reason,
-        price=f"{order.price:.4f}",
-        shares=f"{order.remaining_shares:.6f}",
-    )
-    return True
-
-
-def _sync_and_enforce_single_open_limit(
-    runner: WindowRunner,
-    *,
-    clob: KngtopClob | None,
-    cfg: KngtopConfig,
-) -> bool:
-    if cfg.dry_run or clob is None:
-        return runner.pending_order
-
-    open_orders = _fetch_window_open_buy_orders(runner, clob)
-    state = _effective_state_with_pending(runner)
-    balance_side = _balance_required_side(state, cfg)
-
-    if balance_side is not None:
-        wrong_side_orders = [order for order in open_orders if order.side != balance_side]
-        for order in wrong_side_orders:
-            _cancel_tracked_limit_order(runner, clob=clob, order=order, reason="wrong_balance_side")
-        open_orders = [order for order in open_orders if order.side == balance_side]
-
-    if len(open_orders) > MAX_ACTIVE_LIMIT_ORDERS:
-        keep = open_orders[0]
-        extras = open_orders[MAX_ACTIVE_LIMIT_ORDERS:]
-        for extra in extras:
-            _cancel_tracked_limit_order(runner, clob=clob, order=extra, reason="duplicate_open_order")
-        open_orders = [keep]
-        _log_tag(
-            "OPEN_ORDERS",
-            slug=runner.contract.slug,
-            status="deduped",
-            kept=keep.order_id,
-            cancelled=str(len(extras)),
-        )
-
-    if open_orders:
-        active = open_orders[0]
-        if (
-            not runner.pending_order
-            or runner.pending_order_id != active.order_id
-            or runner.pending_side != active.side
-        ):
-            _adopt_tracked_limit_order(runner, active, reason="synced_open_order")
-        _log_tag(
-            "OPEN_ORDERS",
-            slug=runner.contract.slug,
-            status="active",
-            side=active.side,
-            order_id=active.order_id,
-            price=f"{active.price:.4f}",
-            shares=f"{active.remaining_shares:.6f}",
-        )
-        return True
-
-    if runner.pending_order:
-        if runner.pending_order_id:
-            _clear_pending_limit_state(runner)
-            runner.execution_state = READY
-        else:
-            return True
-    return False
-
-
-def _drop_tracked_open_order(clob: KngtopClob | None, order_id: str | None) -> None:
-    if clob is None or not order_id:
-        return
-    drop = getattr(clob, "drop_open_order", None)
-    if callable(drop):
-        drop(str(order_id))
-
-
-def _needs_urgent_balance_order(runner: WindowRunner, cfg: KngtopConfig) -> bool:
-    state = _effective_state_with_pending(runner)
-    return _balance_required_side(state, cfg) is not None and not runner.pending_order
 
 
 def _extract_numeric(payload: dict[str, object], *keys: str) -> float | None:
@@ -1094,30 +907,35 @@ def _reconcile_pending_limit_order(
                 )
             runner.last_successful_buy_ts = runner.pending_created_ts
             runner.last_position_refresh_ts = runner.pending_created_ts
-            filled_order_id = runner.pending_order_id
-            _clear_pending_limit_state(runner)
+            runner.pending_order = False
+            runner.pending_order_id = None
+            runner.pending_side = None
+            runner.pending_reason = None
+            runner.pending_ask_px = 0.0
+            runner.pending_amount_usd = 0.0
+            runner.pending_reserved_shares = 0.0
+            runner.pending_created_ts = 0.0
             runner.execution_state = WAIT_NEXT_DECISION
             runner.next_decision_ts = datetime.now(timezone.utc).timestamp()
-            _drop_tracked_open_order(clob, filled_order_id)
             _log_tag("LIMIT FILLED", slug=runner.contract.slug, side=side)
             return False
-        if clob is not None:
-            still_open = _fetch_window_open_buy_orders(runner, clob)
-            if still_open:
-                _adopt_tracked_limit_order(runner, still_open[0], reason="reconcile_open_order")
-                return True
-            if runner.pending_order_id:
-                try:
-                    token = _token_for_side(runner, side)
-                    if clob.is_order_open_for_asset(token, runner.pending_order_id):
-                        return True
-                except Exception as exc:  # noqa: BLE001
-                    _log_tag("LIMIT_RECONCILE", slug=runner.contract.slug, status="open_check_error", error=str(exc))
-                    return True
-            _clear_pending_limit_state(runner)
-            runner.execution_state = READY
-            _log_tag("LIMIT CLOSED_UNFILLED", slug=runner.contract.slug, side=side)
-            return False
+        if clob is not None and runner.pending_order_id:
+            try:
+                token = _token_for_side(runner, side)
+                if not clob.is_order_open_for_asset(token, runner.pending_order_id):
+                    runner.pending_order = False
+                    runner.pending_order_id = None
+                    runner.pending_side = None
+                    runner.pending_reason = None
+                    runner.pending_ask_px = 0.0
+                    runner.pending_amount_usd = 0.0
+                    runner.pending_reserved_shares = 0.0
+                    runner.pending_created_ts = 0.0
+                    runner.execution_state = READY
+                    _log_tag("LIMIT CLOSED_UNFILLED", slug=runner.contract.slug, side=side)
+                    return False
+            except Exception as exc:  # noqa: BLE001
+                _log_tag("LIMIT_RECONCILE", slug=runner.contract.slug, status="open_check_error", error=str(exc))
     return True
 
 
@@ -1260,9 +1078,6 @@ def _send_limit_buy(
             amount=f"{amount_usd:.2f}",
         )
         return False
-    if not cfg.dry_run and clob is not None and _sync_and_enforce_single_open_limit(runner, clob=clob, cfg=cfg):
-        _log_tag("LIMIT BLOCK", slug=runner.contract.slug, side=side, reason="active_open_order_exists")
-        return False
 
     _log_current_pnl_state(runner)
     _log_pnl_projection(runner, side=side, ask_px=price, amount_usd=amount_usd)
@@ -1310,8 +1125,14 @@ def _send_limit_buy(
             order_id = runner.pending_order_id
             filled_delta = max(0.0, _shares_for_side(runner.positions, side) - _shares_for_side(pre_state, side))
             _record_local_fill(runner, side, price, filled_delta * price, filled_delta, ensure_floor=False)
-            _drop_tracked_open_order(clob, order_id)
-            _clear_pending_limit_state(runner)
+            runner.pending_order = False
+            runner.pending_order_id = None
+            runner.pending_side = None
+            runner.pending_reason = None
+            runner.pending_ask_px = 0.0
+            runner.pending_amount_usd = 0.0
+            runner.pending_reserved_shares = 0.0
+            runner.pending_created_ts = 0.0
             if _is_initial_reason(reason):
                 runner.initial_filled = True
             _schedule_next_decision(runner, now_ts=datetime.now(timezone.utc).timestamp(), reason=reason)
@@ -1321,8 +1142,14 @@ def _send_limit_buy(
         _log_tag("LIMIT POSTED", slug=runner.contract.slug, side=side, order_id=runner.pending_order_id)
         return True
     except Exception as exc:  # noqa: BLE001
-        _clear_pending_limit_state(runner)
-        runner.execution_state = READY
+        runner.pending_order = False
+        runner.pending_order_id = None
+        runner.pending_side = None
+        runner.pending_reason = None
+        runner.pending_ask_px = 0.0
+        runner.pending_amount_usd = 0.0
+        runner.pending_reserved_shares = 0.0
+        runner.pending_created_ts = 0.0
         if _is_balance_or_allowance_error(exc):
             runner.stop_reason = "balance_or_allowance"
             _log_tag("STOP", slug=runner.contract.slug, side=side, reason="balance_or_allowance", error=str(exc))
@@ -1878,12 +1705,10 @@ def _maybe_guarded_pnl_buy(
     cfg: KngtopConfig,
     current_winning_side: str | None = None,
 ) -> bool:
-    urgent_balance = _needs_urgent_balance_order(runner, cfg)
     slot = int(elapsed) // ACTIVE_REPAIR_INTERVAL_SEC
-    if not urgent_balance and slot <= runner.last_repair_slot:
+    if slot <= runner.last_repair_slot:
         return False
-    if slot > runner.last_repair_slot:
-        runner.last_repair_slot = slot
+    runner.last_repair_slot = slot
 
     action = _choose_guarded_pnl_buy(
         runner,
@@ -1992,11 +1817,7 @@ def _tick_runner(
     now_ts = datetime.now(timezone.utc).timestamp()
     if runner.stop_reason is not None:
         return
-    if not cfg.dry_run and clob is not None:
-        if _sync_and_enforce_single_open_limit(runner, clob=clob, cfg=cfg):
-            _reconcile_pending_limit_order(runner, cfg=cfg, clob=clob)
-            return
-    elif runner.pending_order:
+    if runner.pending_order:
         if _reconcile_pending_limit_order(runner, cfg=cfg, clob=clob):
             return
     if runner.execution_state == ORDER_IN_FLIGHT:

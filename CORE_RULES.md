@@ -10,5 +10,10 @@
 - Prefer the current winning side to be equal or slightly bigger, while keeping sizes close.
 - Later buys can be any cent amount from `$1.00` to `$2.00`.
 - Max `15` shares per side by default.
+- Max share gap `2` shares between UP and DOWN after each fill.
+- If share gap exceeds max, only buy the smaller side until balanced.
+- One limit order at a time; wait for fill/cancel before sending another.
+- Sync open orders from CLOB every tick; cancel duplicates so only one active order exists per window.
+- If imbalanced and no active order exists, place a balance limit immediately (do not wait for repair slot).
 - Do not buy if it breaks budget/share cap; avg-sum/balance guards apply after both sides are profitable.
 - Stop only when both outcomes reach the configured ROI target.
