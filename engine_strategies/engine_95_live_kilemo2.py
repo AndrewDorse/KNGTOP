@@ -1034,7 +1034,6 @@ def _send_limit_buy(
         payload = clob.limit_buy_shares(token, price=price, shares=shares, post_only=True)
         runner.pending_order_id = _extract_order_id(payload)
         if _confirm_fill_from_pm(runner, side=side, pre_state=pre_state, cfg=cfg):
-            order_id = runner.pending_order_id
             filled_delta = max(0.0, _shares_for_side(runner.positions, side) - _shares_for_side(pre_state, side))
             _record_local_fill(runner, side, price, filled_delta * price, filled_delta, ensure_floor=False)
             runner.pending_order = False
@@ -1048,7 +1047,7 @@ def _send_limit_buy(
             if _is_initial_reason(reason):
                 runner.initial_filled = True
             _schedule_next_decision(runner, now_ts=datetime.now(timezone.utc).timestamp(), reason=reason)
-            _log_tag("LIMIT FILLED_IMMEDIATE", slug=runner.contract.slug, side=side, order_id=order_id)
+            _log_tag("LIMIT FILLED_IMMEDIATE", slug=runner.contract.slug, side=side, order_id=runner.pending_order_id)
             return True
         runner.execution_state = ORDER_IN_FLIGHT
         _log_tag("LIMIT POSTED", slug=runner.contract.slug, side=side, order_id=runner.pending_order_id)
