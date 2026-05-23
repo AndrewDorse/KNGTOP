@@ -965,6 +965,37 @@ def test_after_both_sides_open_repair_targets_smaller_side_not_larger_winning_si
     assert action.amount_usd == 1.0
 
 
+def test_large_up_imbalance_places_down_limit_at_needed_price() -> None:
+    state = PositionState(
+        spent_up=4.5,
+        shares_up=10.0,
+        spent_down=2.4,
+        shares_down=5.0,
+        orders_up=2,
+        orders_down=1,
+        total_deals=3,
+    )
+    runner = _runner(1_700_000_000, positions=state)
+    clob = _tick(
+        runner,
+        elapsed=100,
+        up=0.40,
+        down=0.62,
+        positions_seq=[
+            [
+                _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=10.0, avg_price=0.45),
+                _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=5.0, avg_price=0.48),
+            ]
+        ],
+    )
+
+    assert len(clob.calls) == 1
+    assert clob.calls[0][0] == "down-token"
+    assert abs(clob.calls[0][1] - 2.35) < 1e-9
+    assert clob.calls[0][2] == 0.47
+    assert runner.pending_side == "DOWN"
+
+
 def test_api_underreport_does_not_reduce_confirmed_local_position() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob(responses=[{"orderID": "buy-1", "size_matched": 4.0}])
@@ -1025,7 +1056,7 @@ def test_hard_cap_uses_api_plus_local_effective_state() -> None:
         ],
     )
 
-    assert clob.calls == []
+    assert clob.calls == [("down-token", 1.9500000000000002, 0.39)]
     assert runner.positions.shares_up == 14.8
 
 

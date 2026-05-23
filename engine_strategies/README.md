@@ -6,4 +6,5 @@
 - `engine_96_live_kilemo2.py`: immediate FAK fill-risk accounting and smaller-side balance sizing fix.
 - `engine_95_live_kilemo2.py`: managed limit-order engine with one pending order per window and 5-share/$1 minimum sizing.
 - `engine_94_live_kilemo2.py`: passive limit-order fix using one-tick-below-ask prices and $1.05 notional safety buffer.
-- After each new push, save the pushed engine here with the next lower number: `93`, `92`, etc.
+- `engine_93_live_kilemo2.py`: explicit imbalance limit repair that places smaller-side orders at needed avg-improving prices.
+- After each new push, save the pushed engine here with the next lower number: `92`, `91`, etc.
