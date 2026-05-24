@@ -3,7 +3,7 @@
 Rule shape:
 - Trade fixed 5-share limit buys.
 - Use the C_weak_cap045_high_guard060 rules:
-  - start with the cheaper side if ask <= 0.55;
+  - start with one UP and one DOWN limit buy at 0.47 during the prestart/opening gate;
   - buy the missing hedge side up to 0.70;
   - after both sides exist, repair only cheap/weak or guarded-improving buys;
   - avg_sum_after_buy must stay <= 0.95.
@@ -37,6 +37,7 @@ TRADE_PAIR_KEY = "BTC"
 TRADE_WINDOW_MINUTES = 5
 WINDOW_SECONDS = TRADE_WINDOW_MINUTES * 60
 PRESTART_SEC = 20
+OPENING_GRACE_SEC = 2
 INITIAL_PAIR_PRICE = 0.47
 ORDER_SHARES = 5.0
 MAX_SPENT_PER_WINDOW = 20.0
@@ -585,11 +586,16 @@ def _side_needs_aggressive_reprice(runner: WindowRunner, side: str) -> bool:
 
 def _keep_existing_without_target(runner: WindowRunner, side: str, cfg: KngtopConfig) -> bool:
     pos = runner.positions
-    if pos.shares(side) >= float(cfg.max_shares_per_side) - 1e-12:
+    rows = list(runner.open_orders.get(side, []))
+    if not rows:
         return False
-    if abs(pos.shares_up - pos.shares_down) > C_BALANCE_EPSILON:
+    order = rows[0]
+    if pos.shares(side) + order.remaining_shares > float(cfg.max_shares_per_side) + 1e-12:
         return False
-    return pos.shares(side) + _open_order_shares(runner, side) <= float(cfg.max_shares_per_side) + 1e-12
+    pending_without_this = max(0.0, _local_sent_total_cost(runner) - order.remaining_shares * order.price)
+    if pos.spent_total() + pending_without_this + order.remaining_shares * order.price > MAX_SPENT_PER_WINDOW + 1e-12:
+        return False
+    return True
 
 
 def _can_send_initial_pair(runner: WindowRunner, cfg: KngtopConfig) -> bool:
@@ -600,6 +606,17 @@ def _can_send_initial_pair(runner: WindowRunner, cfg: KngtopConfig) -> bool:
     if _has_unresolved_sent_order(runner, "UP") or _has_unresolved_sent_order(runner, "DOWN"):
         return False
     return _can_place_side_order(runner, "UP", INITIAL_PAIR_PRICE, cfg) and _can_place_side_order(runner, "DOWN", INITIAL_PAIR_PRICE, cfg)
+
+
+def _flat_without_orders(runner: WindowRunner) -> bool:
+    return (
+        not runner.positions.has_side("UP")
+        and not runner.positions.has_side("DOWN")
+        and not runner.open_orders.get("UP")
+        and not runner.open_orders.get("DOWN")
+        and not _has_unresolved_sent_order(runner, "UP")
+        and not _has_unresolved_sent_order(runner, "DOWN")
+    )
 
 
 def _post_initial_pair(runner: WindowRunner, *, clob: KngtopClob | None, cfg: KngtopConfig, now_ts: float) -> bool:
@@ -643,6 +660,10 @@ def _tick_runner(
         open_rows = state.get("reconcile_open_orders")
         _sync_open_orders(runner, clob=clob, rows=list(open_rows) if isinstance(open_rows, list) else None)
     if elapsed < -PRESTART_SEC - 1e-12:
+        return
+    if _flat_without_orders(runner) and elapsed > OPENING_GRACE_SEC + 1e-12:
+        runner.stop_reason = "missed_initial_pair_gate"
+        _log_tag("SKIP WINDOW", slug=runner.contract.slug, reason=runner.stop_reason, elapsed=f"{elapsed:.1f}")
         return
     if not _action_ready(runner, now_ts):
         return

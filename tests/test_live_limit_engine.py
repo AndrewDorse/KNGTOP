@@ -149,6 +149,14 @@ def test_initial_places_one_order_per_side_at_47() -> None:
     assert clob.calls == [("up-token", 0.47, 5.0), ("down-token", 0.47, 5.0)]
 
 
+def test_flat_window_after_opening_gate_is_skipped_instead_of_midwindow_entry() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _tick(runner, elapsed=30, up=0.65, down=0.35)
+
+    assert clob.calls == []
+    assert runner.stop_reason == "missed_initial_pair_gate"
+
+
 def test_repeated_ticks_do_not_duplicate_orders_with_stale_empty_reconcile_cache() -> None:
     runner = _runner(1_700_000_000)
     clob = _FakeClob()
@@ -454,3 +462,20 @@ def test_max_fifteen_shares_per_side_includes_open_and_sent_orders() -> None:
 
     assert clob.calls == []
     assert "up-open" not in clob.cancelled
+
+
+def test_existing_cheap_order_is_kept_when_target_temporarily_absent() -> None:
+    runner = _runner(1_700_000_000)
+    positions = [
+        _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.41),
+        _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=5.0, avg_price=0.16),
+    ]
+    clob = _FakeClob()
+    clob.open_orders = [
+        {"id": "down-cheap", "asset_id": "down-token", "side": "BUY", "price": 0.25, "original_size": 5.0, "size_left": 5.0},
+    ]
+
+    _tick(runner, elapsed=60, up=0.75, down=0.25, clob=clob, positions=positions)
+
+    assert clob.calls == [("up-token", 0.39, 5.0)]
+    assert "down-cheap" not in clob.cancelled
