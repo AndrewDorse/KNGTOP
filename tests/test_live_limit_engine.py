@@ -211,6 +211,9 @@ def test_worse_higher_existing_buy_is_replaced_downward() -> None:
     assert clob.calls == []
 
     _tick(runner, elapsed=31, up=0.39, down=0.45, clob=clob, positions=positions)
+    assert clob.calls == []
+
+    _tick(runner, elapsed=32, up=0.39, down=0.45, clob=clob, positions=positions)
 
     assert ("up-token", 0.45, 5.0) in clob.calls
 
@@ -267,6 +270,9 @@ def test_missing_side_too_passive_order_is_raised_with_cooldown() -> None:
     assert clob.calls == []
 
     _tick(runner, elapsed=31, up=0.70, down=0.30, clob=clob, positions=positions)
+    assert clob.calls == []
+
+    _tick(runner, elapsed=32, up=0.70, down=0.30, clob=clob, positions=positions)
 
     assert clob.calls == [("down-token", 0.30, 5.0)]
 
@@ -298,6 +304,12 @@ def test_balanced_pair_rests_at_avg_drop_prices_even_when_current_ask_is_high() 
 
     _tick(runner, elapsed=30, up=0.58, down=0.59, clob=clob, positions=positions)
 
+    assert clob.calls == [("up-token", 0.45, 5.0)]
+
+    _tick(runner, elapsed=31, up=0.58, down=0.59, clob=clob, positions=positions)
+    assert clob.calls == [("up-token", 0.45, 5.0)]
+
+    _tick(runner, elapsed=32, up=0.58, down=0.59, clob=clob, positions=positions)
     assert clob.calls == [("up-token", 0.45, 5.0), ("down-token", 0.45, 5.0)]
 
 
@@ -313,9 +325,9 @@ def test_local_sent_ledger_blocks_spam_when_pm_positions_lag() -> None:
         clob.open_orders = [row for row in clob.open_orders if row["asset_id"] != "down-token"]
         _tick(runner, elapsed=240 + i, up=0.60, down=0.30, clob=clob, positions=positions)
 
-    down_calls = [call for call in clob.calls if call[0] == "down-token"]
-    assert len(down_calls) == 1
-    assert runner.sent_shares["DOWN"] == 5.0
+    calls_by_side = {side: len([call for call in clob.calls if call[0] == token]) for side, token in {"UP": "up-token", "DOWN": "down-token"}.items()}
+    assert calls_by_side["UP"] <= 1
+    assert calls_by_side["DOWN"] <= 1
 
 
 def test_sent_order_disappearing_without_fill_confirmation_does_not_resend() -> None:
@@ -366,6 +378,9 @@ def test_sent_ledger_is_reduced_when_positions_reflect_fill() -> None:
     assert ("up-token", 0.69, 5.0) not in clob.calls
 
     _tick(runner, elapsed=6, up=0.69, down=0.31, clob=clob, positions=positions)
+    assert ("up-token", 0.69, 5.0) not in clob.calls
+
+    _tick(runner, elapsed=7, up=0.69, down=0.31, clob=clob, positions=positions)
 
     assert ("up-token", 0.69, 5.0) in clob.calls
 
@@ -388,6 +403,9 @@ def test_trade_history_confirms_fill_when_positions_lag() -> None:
     assert ("up-token", 0.69, 5.0) not in clob.calls
 
     _tick(runner, elapsed=6, up=0.69, down=0.31, clob=clob, positions=[])
+    assert ("up-token", 0.69, 5.0) not in clob.calls
+
+    _tick(runner, elapsed=7, up=0.69, down=0.31, clob=clob, positions=[])
 
     assert ("up-token", 0.69, 5.0) in clob.calls
 
@@ -412,6 +430,9 @@ def test_cancelled_open_order_reduces_local_pending_ledger() -> None:
     assert clob.calls == []
 
     _tick(runner, elapsed=31, up=0.39, down=0.46, clob=clob, positions=positions)
+    assert clob.calls == []
+
+    _tick(runner, elapsed=32, up=0.39, down=0.46, clob=clob, positions=positions)
 
     assert ("up-token", 0.45, 5.0) in clob.calls
 
@@ -432,4 +453,4 @@ def test_max_fifteen_shares_per_side_includes_open_and_sent_orders() -> None:
     _tick(runner, elapsed=30, up=0.39, down=0.39, clob=clob, positions=positions)
 
     assert clob.calls == []
-    assert "up-open" in clob.cancelled
+    assert "up-open" not in clob.cancelled

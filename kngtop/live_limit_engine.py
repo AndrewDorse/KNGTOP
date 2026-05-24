@@ -49,6 +49,7 @@ C_WEAK_CAP = 0.45
 C_HIGH_GUARD = 0.60
 C_BALANCE_EPSILON = 1e-9
 REPLACE_COOLDOWN_SEC = 2.0
+ACTION_COOLDOWN_SEC = 2.0
 TRADE_HISTORY_LOOKBACK_SEC = 600
 
 
@@ -118,6 +119,7 @@ class WindowRunner:
     sent_orders: list[SentOrder] = field(default_factory=list)
     trade_history_positions: PositionState = field(default_factory=PositionState)
     last_trade_history_fetch_ts: float = 0.0
+    last_action_ts: float = -1_000_000.0
     stop_reason: str | None = None
 
     def start_sec(self) -> int | None:
@@ -397,6 +399,14 @@ def _has_unresolved_sent_order(runner: WindowRunner, side: str) -> bool:
     return any(sent.side == side and sent.shares > 1e-12 for sent in runner.sent_orders)
 
 
+def _action_ready(runner: WindowRunner, now_ts: float) -> bool:
+    return now_ts - runner.last_action_ts >= ACTION_COOLDOWN_SEC
+
+
+def _mark_action(runner: WindowRunner, now_ts: float) -> None:
+    runner.last_action_ts = now_ts
+
+
 def _avg_sum_max_price(pos: PositionState, side: str) -> float:
     other = "DOWN" if side == "UP" else "UP"
     allowed_side_avg = AVG_SUM_CAP - pos.avg(other)
@@ -528,16 +538,20 @@ def _maintain_side_order(
     desired_price: float | None,
     clob: KngtopClob | None,
     cfg: KngtopConfig,
-    now_monotonic: float,
+    now_ts: float,
 ) -> bool:
     rows = list(runner.open_orders.get(side, []))
     for extra in rows[1:]:
         _cancel_order(runner, clob=clob, order=extra, reason="duplicate_side_order")
+        _mark_action(runner, now_ts)
         return True
     rows = rows[:1]
     if desired_price is None:
+        if rows and _keep_existing_without_target(runner, side, cfg):
+            return False
         for order in rows:
             _cancel_order(runner, clob=clob, order=order, reason="side_complete_or_blocked")
+            _mark_action(runner, now_ts)
             return True
         return False
     if not rows and _has_unresolved_sent_order(runner, side):
@@ -550,13 +564,15 @@ def _maintain_side_order(
             return False
         if aggressive_reprice and abs(order.price - desired_price) <= REPRICE_TOLERANCE:
             return False
-        if now_monotonic - runner.last_replace_ts[side] < REPLACE_COOLDOWN_SEC:
+        if now_ts - runner.last_replace_ts[side] < REPLACE_COOLDOWN_SEC:
             return False
         if not _cancel_order(runner, clob=clob, order=order, reason=f"reprice->{desired_price:.2f}"):
             return False
-        runner.last_replace_ts[side] = now_monotonic
+        runner.last_replace_ts[side] = now_ts
+        _mark_action(runner, now_ts)
         return True
     _post_order(runner, clob=clob, side=side, price=desired_price, cfg=cfg)
+    _mark_action(runner, now_ts)
     return False
 
 
@@ -565,6 +581,36 @@ def _side_needs_aggressive_reprice(runner: WindowRunner, side: str) -> bool:
     side_shares = pos.shares(side)
     other_shares = pos.shares("DOWN" if side == "UP" else "UP")
     return side_shares + C_BALANCE_EPSILON < other_shares
+
+
+def _keep_existing_without_target(runner: WindowRunner, side: str, cfg: KngtopConfig) -> bool:
+    pos = runner.positions
+    if pos.shares(side) >= float(cfg.max_shares_per_side) - 1e-12:
+        return False
+    if abs(pos.shares_up - pos.shares_down) > C_BALANCE_EPSILON:
+        return False
+    return pos.shares(side) + _open_order_shares(runner, side) <= float(cfg.max_shares_per_side) + 1e-12
+
+
+def _can_send_initial_pair(runner: WindowRunner, cfg: KngtopConfig) -> bool:
+    if runner.positions.has_side("UP") or runner.positions.has_side("DOWN"):
+        return False
+    if runner.open_orders.get("UP") or runner.open_orders.get("DOWN"):
+        return False
+    if _has_unresolved_sent_order(runner, "UP") or _has_unresolved_sent_order(runner, "DOWN"):
+        return False
+    return _can_place_side_order(runner, "UP", INITIAL_PAIR_PRICE, cfg) and _can_place_side_order(runner, "DOWN", INITIAL_PAIR_PRICE, cfg)
+
+
+def _post_initial_pair(runner: WindowRunner, *, clob: KngtopClob | None, cfg: KngtopConfig, now_ts: float) -> bool:
+    if not _can_send_initial_pair(runner, cfg):
+        return False
+    first = _post_order(runner, clob=clob, side="UP", price=INITIAL_PAIR_PRICE, cfg=cfg)
+    second = _post_order(runner, clob=clob, side="DOWN", price=INITIAL_PAIR_PRICE, cfg=cfg)
+    if first or second:
+        _mark_action(runner, now_ts)
+        return True
+    return False
 
 
 def _tick_runner(
@@ -598,6 +644,10 @@ def _tick_runner(
         _sync_open_orders(runner, clob=clob, rows=list(open_rows) if isinstance(open_rows, list) else None)
     if elapsed < -PRESTART_SEC - 1e-12:
         return
+    if not _action_ready(runner, now_ts):
+        return
+    if _post_initial_pair(runner, clob=clob, cfg=cfg, now_ts=now_ts):
+        return
     up_quote = poly.best_bid_ask_for(runner.contract.up.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     down_quote = poly.best_bid_ask_for(runner.contract.down.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     desired = _c_target_prices(
@@ -606,11 +656,12 @@ def _tick_runner(
         down_ask=down_quote[1] if down_quote else None,
         cfg=cfg,
     )
-    now_monotonic = time.monotonic()
-    if _maintain_side_order(runner, side="UP", desired_price=desired["UP"], clob=clob, cfg=cfg, now_monotonic=now_monotonic):
+    if _maintain_side_order(runner, side="UP", desired_price=desired["UP"], clob=clob, cfg=cfg, now_ts=now_ts):
+        return
+    if not _action_ready(runner, now_ts):
         return
     _sync_open_orders(runner, clob=clob)
-    _maintain_side_order(runner, side="DOWN", desired_price=desired["DOWN"], clob=clob, cfg=cfg, now_monotonic=now_monotonic)
+    _maintain_side_order(runner, side="DOWN", desired_price=desired["DOWN"], clob=clob, cfg=cfg, now_ts=now_ts)
 
 
 def _discover_target_windows(cfg: KngtopConfig, *, runners: dict[int, WindowRunner], binance_symbol: str) -> None:
