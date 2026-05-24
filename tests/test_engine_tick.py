@@ -11,6 +11,7 @@ import pytest
 from kngtop.config import KngtopConfig
 from kngtop.engine import (
     DiscoveryState,
+    ManagedOrder,
     WindowRunner,
     _candidate_window_starts,
     _compute_limit_buy_price,
@@ -174,7 +175,7 @@ def test_tick_places_trigger_ask_and_discounted_hedge_pair(monkeypatch: pytest.M
     ]
 
 
-def test_tick_boosts_smaller_side_size_when_imbalanced(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_posts_immediate_repair_when_imbalanced(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=False)
     start = int(datetime.now(timezone.utc).timestamp()) - 60
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
@@ -192,13 +193,10 @@ def test_tick_boosts_smaller_side_size_when_imbalanced(monkeypatch: pytest.Monke
         runtime_state=_runtime_cache(positions=positions),
     )
 
-    assert clob.limit_calls == [
-        ("tid_up", pytest.approx(0.43), pytest.approx(5.0)),
-        ("tid_dn", pytest.approx(0.46), pytest.approx(10.0)),
-    ]
+    assert clob.limit_calls == [("tid_dn", pytest.approx(0.46), pytest.approx(10.0))]
 
 
-def test_new_signal_cancels_hanging_order_before_restage(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_repair_mode_preserves_hanging_weak_side_order(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=False)
     start = int(datetime.now(timezone.utc).timestamp()) - 60
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
@@ -221,7 +219,84 @@ def test_new_signal_cancels_hanging_order_before_restage(monkeypatch: pytest.Mon
         runtime_state=_runtime_cache(positions=positions, open_orders=open_orders),
     )
 
-    assert clob.cancelled == ["ord1"]
+    assert clob.cancelled == []
+    assert clob.limit_calls == []
+
+
+def test_reconcile_missing_open_order_keeps_recent_local_hedge(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    start = int(datetime.now(timezone.utc).timestamp()) - 60
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
+    clob = _FakeClob()
+    runner.local_expected_orders["DOWN"].append(
+        ManagedOrder(
+            order_id="ord-hedge",
+            side="DOWN",
+            token_id="tid_dn",
+            price=0.40,
+            original_size=5.0,
+            remaining_size=5.0,
+            matched_size=0.0,
+            first_seen_monotonic=time.perf_counter(),
+        )
+    )
+
+    _tick_runner(
+        runner,
+        poly=_FakePoly({"tid_up": (0.53, 0.55), "tid_dn": (0.44, 0.46)}),
+        binance=_FakeBinanceCombo(current_px=100_005.0, past_px=100_000.0, volume_ratio=1.2),
+        clob=clob,
+        cfg=cfg,
+        runtime_state=_runtime_cache(
+            positions=[{"slug": runner.contract.slug, "asset": "tid_up", "outcome": "UP", "size": 5, "avgPrice": 0.55}],
+            open_orders=[],
+        ),
+    )
+
+    assert runner.open_order_count("DOWN") == 1
+
+
+def test_missing_hedge_is_reposted_immediately_after_one_side_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    start = int(datetime.now(timezone.utc).timestamp()) - 60
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
+    clob = _FakeClob()
+
+    _tick_runner(
+        runner,
+        poly=_FakePoly({"tid_up": (0.53, 0.55), "tid_dn": (0.44, 0.46)}),
+        binance=_FakeBinanceCombo(current_px=100_005.0, past_px=100_000.0, volume_ratio=1.2),
+        clob=clob,
+        cfg=cfg,
+        runtime_state=_runtime_cache(
+            positions=[{"slug": runner.contract.slug, "asset": "tid_up", "outcome": "UP", "size": 5, "avgPrice": 0.55}],
+            open_orders=[],
+        ),
+    )
+
+    assert clob.limit_calls == [("tid_dn", pytest.approx(0.46), pytest.approx(10.0))]
+
+
+def test_imbalance_mode_cancels_stronger_side_open_order_before_any_new_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(monkeypatch, dry_run=False)
+    start = int(datetime.now(timezone.utc).timestamp()) - 60
+    runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
+    runner.order_first_seen = {"ord-up": time.perf_counter() - 20}
+    clob = _FakeClob()
+
+    _tick_runner(
+        runner,
+        poly=_FakePoly({"tid_up": (0.53, 0.55), "tid_dn": (0.44, 0.46)}),
+        binance=_FakeBinanceCombo(current_px=100_030.0, past_px=100_000.0, volume_ratio=2.1),
+        clob=clob,
+        cfg=cfg,
+        runtime_state=_runtime_cache(
+            positions=[{"slug": runner.contract.slug, "asset": "tid_up", "outcome": "UP", "size": 5, "avgPrice": 0.55}],
+            open_orders=[{"id": "ord-up", "asset_id": "tid_up", "side": "BUY", "price": 0.55, "original_size": 5, "size_left": 5}],
+        ),
+    )
+
+    assert clob.cancelled == ["ord-up"]
     assert clob.limit_calls == []
 
 
@@ -248,7 +323,7 @@ def test_tick_cancels_orders_after_30_seconds(monkeypatch: pytest.MonkeyPatch) -
     assert clob.limit_calls == []
 
 
-def test_tick_respects_max_shares_per_side(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tick_allows_repair_on_smaller_side_even_if_larger_side_at_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(monkeypatch, dry_run=False)
     start = int(datetime.now(timezone.utc).timestamp()) - 60
     runner = WindowRunner("BTC", "BTCUSDT", _contract(slug=f"btc-updown-5m-{start}"), 5)
@@ -266,7 +341,7 @@ def test_tick_respects_max_shares_per_side(monkeypatch: pytest.MonkeyPatch) -> N
         runtime_state=_runtime_cache(positions=positions),
     )
 
-    assert clob.limit_calls == []
+    assert clob.limit_calls == [("tid_dn", pytest.approx(0.46), pytest.approx(10.0))]
 
 
 def test_tick_skips_pair_when_avg_sum_cap_would_break(monkeypatch: pytest.MonkeyPatch) -> None:

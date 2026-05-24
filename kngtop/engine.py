@@ -56,6 +56,7 @@ DISCOVERY_RETRY_SEC_WHEN_MISSING = 2.0
 RECONCILE_COOLDOWN_SEC = 2.0
 FAST_RECONCILE_AFTER_ACTION_SEC = 0.75
 SENT_ORDER_CACHE_SEC = 10.0
+LOCAL_EXPECTED_ORDER_GRACE_SEC = 12.0
 CANCEL_REPLACE_COOLDOWN_SEC = 5.0
 SAME_SIDE_ORDER_COOLDOWN_SEC = 5.0
 WS_UPDATE_LOG_COOLDOWN_SEC = 1.0
@@ -100,6 +101,7 @@ class WindowRunner:
     filled_shares: dict[str, float] = field(default_factory=_side_float_map)
     filled_cost: dict[str, float] = field(default_factory=_side_float_map)
     open_orders: dict[str, list[ManagedOrder]] = field(default_factory=_side_orders_map)
+    local_expected_orders: dict[str, list[ManagedOrder]] = field(default_factory=_side_orders_map)
     order_first_seen: dict[str, float] = field(default_factory=dict)
     sent_order_cache: dict[str, float] = field(default_factory=dict)
     last_place_monotonic: dict[str, float] = field(default_factory=_side_time_map)
@@ -108,6 +110,7 @@ class WindowRunner:
     reconcile_after_action_monotonic: float = 0.0
     force_reconcile: bool = True
     last_signal_monotonic: float = -10_000.0
+    last_signal_diag_monotonic: float = -10_000.0
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def start_sec(self) -> int | None:
@@ -304,6 +307,16 @@ def _open_order_shares(runner: WindowRunner, side: str) -> float:
     return sum(max(0.0, order.remaining_size) for order in runner.open_orders.get(side, []))
 
 
+@dataclass(frozen=True, slots=True)
+class SpikeProbe:
+    signal_side: str | None
+    current_px: float | None
+    past_px: float | None
+    move_usd: float | None
+    volume_ratio: float | None
+    reason: str
+
+
 def _pair_projected_avg_sum(
     runner: WindowRunner,
     *,
@@ -321,12 +334,12 @@ def _pair_projected_avg_sum(
     return up_avg + down_avg
 
 
-def _spike_signal_side(
+def _spike_probe(
     *,
     runner: WindowRunner,
     binance: BinanceCombinedTradeFeed,
     cfg: KngtopConfig,
-) -> str | None:
+) -> SpikeProbe:
     px_pair = binance.price_then_now(
         runner.binance_symbol,
         lookback_sec=cfg.spike_move_lookback_sec,
@@ -338,16 +351,16 @@ def _spike_signal_side(
         max_age_sec=cfg.binance_max_age_sec,
     )
     if px_pair is None or volume_ratio is None:
-        return None
+        return SpikeProbe(None, None, None, None, volume_ratio, "binance_probe_missing")
     current_px, past_px = px_pair
     move = float(current_px) - float(past_px)
     if volume_ratio + 1e-12 < cfg.spike_volume_ratio_min:
-        return None
+        return SpikeProbe(None, current_px, past_px, move, volume_ratio, "volume_below_threshold")
     if move >= cfg.spike_move_threshold_usd - 1e-12:
-        return "UP"
+        return SpikeProbe("UP", current_px, past_px, move, volume_ratio, "up_spike")
     if move <= -cfg.spike_move_threshold_usd + 1e-12:
-        return "DOWN"
-    return None
+        return SpikeProbe("DOWN", current_px, past_px, move, volume_ratio, "down_spike")
+    return SpikeProbe(None, current_px, past_px, move, volume_ratio, "move_below_threshold")
 
 
 def _pair_order_prices(
@@ -443,6 +456,30 @@ def _parse_order_rows(
     return parsed
 
 
+def _merge_local_expected_orders(
+    runner: WindowRunner,
+    *,
+    live_order_ids: set[str],
+    now_monotonic: float,
+) -> None:
+    for side in ("UP", "DOWN"):
+        survivors: list[ManagedOrder] = []
+        merged = list(runner.open_orders.get(side, []))
+        seen = {order.order_id for order in merged}
+        for order in runner.local_expected_orders.get(side, []):
+            if order.order_id in live_order_ids:
+                continue
+            if order.age_sec(now_monotonic) > LOCAL_EXPECTED_ORDER_GRACE_SEC:
+                continue
+            survivors.append(order)
+            if order.order_id not in seen:
+                merged.append(order)
+                seen.add(order.order_id)
+        merged.sort(key=lambda item: (item.first_seen_monotonic, item.order_id))
+        runner.local_expected_orders[side] = survivors
+        runner.open_orders[side] = merged
+
+
 def _apply_reconcile_snapshot(
     runner: WindowRunner,
     *,
@@ -464,6 +501,8 @@ def _apply_reconcile_snapshot(
         order_first_seen=runner.order_first_seen,
         now_monotonic=now_monotonic,
     )
+    live_order_ids = {order.order_id for orders in runner.open_orders.values() for order in orders}
+    _merge_local_expected_orders(runner, live_order_ids=live_order_ids, now_monotonic=now_monotonic)
     live_order_ids = {order.order_id for orders in runner.open_orders.values() for order in orders}
     stale_ids = [oid for oid in runner.order_first_seen if oid not in live_order_ids]
     for oid in stale_ids:
@@ -493,7 +532,6 @@ def _apply_reconcile_snapshot(
     runner.last_reconcile_monotonic = now_monotonic
     runner.reconcile_after_action_monotonic = 0.0
     runner.force_reconcile = False
-    runner.sent_order_cache.clear()
     _log_tag(
         "POSITION",
         slug=runner.contract.slug,
@@ -609,6 +647,9 @@ def _cancel_order(
         return False
     now_monotonic = time.perf_counter()
     runner.last_cancel_monotonic[order.side] = now_monotonic
+    runner.local_expected_orders[order.side] = [
+        row for row in runner.local_expected_orders.get(order.side, []) if row.order_id != order.order_id
+    ]
     runner.force_reconcile = True
     runner.reconcile_after_action_monotonic = now_monotonic + FAST_RECONCILE_AFTER_ACTION_SEC
     _log_tag("CANCEL", slug=runner.contract.slug, side=order.side, order_id=order.order_id, reason=reason)
@@ -688,12 +729,67 @@ def _place_limit_buy(
         return False
     order_id = _extract_order_id(payload) or "unknown"
     now_monotonic = time.perf_counter()
+    managed = ManagedOrder(
+        order_id=order_id,
+        side=side,
+        token_id=str(token.token_id),
+        price=float(price),
+        original_size=float(shares),
+        remaining_size=float(shares),
+        matched_size=0.0,
+        first_seen_monotonic=now_monotonic,
+    )
     runner.last_place_monotonic[side] = now_monotonic
     runner.sent_order_cache[f"{side}:{price:.2f}:{shares:.2f}"] = now_monotonic
+    runner.local_expected_orders[side].append(managed)
+    runner.open_orders[side].append(managed)
+    runner.open_orders[side].sort(key=lambda order: (order.first_seen_monotonic, order.order_id))
+    runner.order_first_seen[order_id] = now_monotonic
     runner.force_reconcile = True
     runner.reconcile_after_action_monotonic = now_monotonic + FAST_RECONCILE_AFTER_ACTION_SEC
     _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{shares:.2f}", order_id=order_id)
     return True
+
+
+def _place_imbalance_repair(
+    runner: WindowRunner,
+    *,
+    clob: KngtopClob | None,
+    weak_side: str,
+    weak_book: BookSnapshot,
+) -> bool:
+    if weak_book.ask is None:
+        return False
+    shares = BOOST_ORDER_SHARES if abs(runner.imbalance_shares()) >= MAX_IMBALANCE_SHARES - 1e-12 else BASE_ORDER_SHARES
+    if float(runner.filled_shares[weak_side]) + _open_order_shares(runner, weak_side) + shares > _max_side_shares() + 1e-12:
+        _log_tag("SIGNAL BLOCKED", slug=runner.contract.slug, side=weak_side, reason="repair_max_side_shares")
+        return False
+    price = round(max(MIN_BUY_PRICE, min(MAX_BUY_PRICE, float(weak_book.ask))), 2)
+    token = runner.contract.up if weak_side == "UP" else runner.contract.down
+    if _place_limit_buy(runner, clob=clob, token=token, side=weak_side, price=price, shares=shares):
+        _log_tag(
+            "REPAIR POSTED",
+            slug=runner.contract.slug,
+            side=weak_side,
+            price=f"{price:.2f}",
+            shares=f"{shares:.2f}",
+            reason="missing_hedge_restore",
+        )
+        return True
+    return False
+
+
+def _cancel_stronger_side_orders_for_repair(
+    runner: WindowRunner,
+    *,
+    clob: KngtopClob | None,
+    stronger_side: str,
+) -> bool:
+    rows = list(runner.open_orders.get(stronger_side, []))
+    if not rows:
+        return False
+    oldest = min(rows, key=lambda order: order.first_seen_monotonic)
+    return _cancel_order(runner, clob=clob, order=oldest, reason="repair_mode_cancel_stronger_side")
 
 
 def _maybe_cancel_orders(
@@ -763,23 +859,15 @@ def _tick_runner(
         _prune_sent_order_cache(runner, now_monotonic)
         spot = binance.last_price(runner.binance_symbol, max_age_sec=cfg.binance_max_age_sec)
         if spot is None:
-            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="binance_stale")
+            if (now_monotonic - runner.last_signal_diag_monotonic) >= 15.0:
+                runner.last_signal_diag_monotonic = now_monotonic
+                _log_tag("SIGNAL WAIT", slug=runner.contract.slug, reason="binance_stale")
             return
-        _log_tag(
-            "WINDOW",
-            slug=runner.contract.slug,
-            elapsed_sec=f"{elapsed:.1f}",
-            remaining_sec=f"{remaining:.1f}",
-            stopped=str(runner.stopped).lower(),
-            btc_spot=f"{spot:.2f}",
-        )
         if elapsed < 0:
-            _log_tag("WINDOW", slug=runner.contract.slug, state="prestart_watch")
             return
         if _runner_needs_reconcile(runner, now_monotonic):
             cache_at = float(runtime_state.get("reconcile_cache_at", 0.0))
             if cache_at <= runner.last_reconcile_monotonic:
-                _log_tag("SKIP BUY", slug=runner.contract.slug, reason="reconcile_pending")
                 return
             open_rows = list(runtime_state.get("reconcile_open_orders", []))
             position_rows = _filtered_positions_for_runner(
@@ -795,35 +883,17 @@ def _tick_runner(
         imbalance = runner.imbalance_shares()
         up_book = _snapshot_for_side(runner, "UP", poly, cfg)
         down_book = _snapshot_for_side(runner, "DOWN", poly, cfg)
-        _log_tag(
-            "REAL BOOK",
-            slug=runner.contract.slug,
-            up_bid="-" if up_book.bid is None else f"{up_book.bid:.2f}",
-            up_ask="-" if up_book.ask is None else f"{up_book.ask:.2f}",
-            down_bid="-" if down_book.bid is None else f"{down_book.bid:.2f}",
-            down_ask="-" if down_book.ask is None else f"{down_book.ask:.2f}",
-        )
         _record_live_book_snapshot(runtime_state=runtime_state, runner=runner, up_book=up_book, down_book=down_book)
-        _log_tag(
-            "IMBALANCE",
-            slug=runner.contract.slug,
-            up_shares=f"{runner.filled_shares['UP']:.2f}",
-            down_shares=f"{runner.filled_shares['DOWN']:.2f}",
-            imbalance=f"{imbalance:.2f}",
-        )
         if remaining <= MIN_REMAINING_SEC:
-            _log_tag("LATE WINDOW", slug=runner.contract.slug, remaining_sec=f"{remaining:.1f}")
             _cancel_all_buys(runner, clob=clob, reason="late_window", now_monotonic=now_monotonic)
             return
         if elapsed >= CANCEL_ALL_BUYS_ELAPSED_SEC:
-            _log_tag("LATE WINDOW", slug=runner.contract.slug, elapsed_sec=f"{elapsed:.1f}", reason="cancel_all_buys")
             _cancel_all_buys(runner, clob=clob, reason="late_window_cancel_all", now_monotonic=now_monotonic)
             return
         if runner.stopped:
             _cancel_all_buys(runner, clob=clob, reason=runner.stop_reason or "window_stop", now_monotonic=now_monotonic)
             return
         if elapsed >= STOP_NEW_BUYS_ELAPSED_SEC:
-            _log_tag("LATE WINDOW", slug=runner.contract.slug, elapsed_sec=f"{elapsed:.1f}", reason="no_new_buys")
             return
         for side in ("UP", "DOWN"):
             for order in list(runner.open_orders.get(side, [])):
@@ -831,18 +901,68 @@ def _tick_runner(
                     _cancel_order(runner, clob=clob, order=order, reason="pair_expiry")
                     return
 
-        signal_side = _spike_signal_side(runner=runner, binance=binance, cfg=cfg)
+        if imbalance >= MAX_IMBALANCE_SHARES - 1e-12:
+            if runner.open_order_count("UP") > 0:
+                if _cancel_stronger_side_orders_for_repair(runner, clob=clob, stronger_side="UP"):
+                    return
+            if runner.open_order_count("DOWN") == 0:
+                if _place_imbalance_repair(runner, clob=clob, weak_side="DOWN", weak_book=down_book):
+                    return
+            return
+        if imbalance <= -MAX_IMBALANCE_SHARES + 1e-12:
+            if runner.open_order_count("DOWN") > 0:
+                if _cancel_stronger_side_orders_for_repair(runner, clob=clob, stronger_side="DOWN"):
+                    return
+            if runner.open_order_count("UP") == 0:
+                if _place_imbalance_repair(runner, clob=clob, weak_side="UP", weak_book=up_book):
+                    return
+            return
+
+        probe = _spike_probe(runner=runner, binance=binance, cfg=cfg)
+        signal_side = probe.signal_side
         if signal_side is None:
-            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="no_spike_signal")
+            if (now_monotonic - runner.last_signal_diag_monotonic) >= 15.0:
+                runner.last_signal_diag_monotonic = now_monotonic
+                _log_tag(
+                    "SIGNAL WAIT",
+                    slug=runner.contract.slug,
+                    reason=probe.reason,
+                    elapsed_sec=f"{elapsed:.1f}",
+                    remaining_sec=f"{remaining:.1f}",
+                    btc_spot=f"{spot:.2f}",
+                    current_px="-" if probe.current_px is None else f"{probe.current_px:.2f}",
+                    past_px="-" if probe.past_px is None else f"{probe.past_px:.2f}",
+                    move_usd="-" if probe.move_usd is None else f"{probe.move_usd:.2f}",
+                    volume_ratio="-" if probe.volume_ratio is None else f"{probe.volume_ratio:.2f}",
+                    up_ask="-" if up_book.ask is None else f"{up_book.ask:.2f}",
+                    down_ask="-" if down_book.ask is None else f"{down_book.ask:.2f}",
+                )
             return
         if (now_monotonic - runner.last_signal_monotonic) < cfg.pair_cooldown_sec:
-            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="pair_cooldown")
             return
         if runner.open_order_count() > 0:
             side_order = runner.open_orders.get("UP", []) + runner.open_orders.get("DOWN", [])
             oldest = min(side_order, key=lambda order: order.first_seen_monotonic)
             _cancel_order(runner, clob=clob, order=oldest, reason="new_signal_replace")
             return
+
+        _log_tag(
+            "SIGNAL FIRE",
+            slug=runner.contract.slug,
+            side=signal_side,
+            elapsed_sec=f"{elapsed:.1f}",
+            remaining_sec=f"{remaining:.1f}",
+            btc_spot=f"{spot:.2f}",
+            current_px="-" if probe.current_px is None else f"{probe.current_px:.2f}",
+            past_px="-" if probe.past_px is None else f"{probe.past_px:.2f}",
+            move_usd="-" if probe.move_usd is None else f"{probe.move_usd:.2f}",
+            volume_ratio="-" if probe.volume_ratio is None else f"{probe.volume_ratio:.2f}",
+            up_ask="-" if up_book.ask is None else f"{up_book.ask:.2f}",
+            down_ask="-" if down_book.ask is None else f"{down_book.ask:.2f}",
+            up_shares=f"{runner.filled_shares['UP']:.2f}",
+            down_shares=f"{runner.filled_shares['DOWN']:.2f}",
+            imbalance=f"{imbalance:.2f}",
+        )
 
         prices = _pair_order_prices(
             trigger_side=signal_side,
@@ -851,7 +971,7 @@ def _tick_runner(
             opposite_side_discount=cfg.opposite_side_discount,
         )
         if prices is None:
-            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="invalid_pair_prices")
+            _log_tag("SIGNAL BLOCKED", slug=runner.contract.slug, reason="invalid_pair_prices")
             return
         up_price, down_price = prices
         up_shares, down_shares = _pair_order_sizes(runner)
@@ -862,22 +982,22 @@ def _tick_runner(
             down_price=down_price,
             down_shares=down_shares,
         ) > cfg.repair_avg_sum_cap + 1e-12:
-            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="pair_avg_sum_cap")
+            _log_tag("SIGNAL BLOCKED", slug=runner.contract.slug, reason="pair_avg_sum_cap")
             return
         if runner.total_exposure() + (up_price * up_shares) + (down_price * down_shares) > MAX_TOTAL_EXPOSURE_PER_WINDOW + 1e-12:
-            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="max_total_exposure")
+            _log_tag("SIGNAL BLOCKED", slug=runner.contract.slug, reason="max_total_exposure")
             return
         if runner.side_exposure("UP") + (up_price * up_shares) > MAX_ONE_SIDE_EXPOSURE + 1e-12:
-            _log_tag("SKIP BUY", slug=runner.contract.slug, side="UP", reason="max_one_side_exposure")
+            _log_tag("SIGNAL BLOCKED", slug=runner.contract.slug, side="UP", reason="max_one_side_exposure")
             return
         if runner.side_exposure("DOWN") + (down_price * down_shares) > MAX_ONE_SIDE_EXPOSURE + 1e-12:
-            _log_tag("SKIP BUY", slug=runner.contract.slug, side="DOWN", reason="max_one_side_exposure")
+            _log_tag("SIGNAL BLOCKED", slug=runner.contract.slug, side="DOWN", reason="max_one_side_exposure")
             return
         if float(runner.filled_shares["UP"]) + _open_order_shares(runner, "UP") + up_shares > _max_side_shares() + 1e-12:
-            _log_tag("SKIP BUY", slug=runner.contract.slug, side="UP", reason="max_side_shares")
+            _log_tag("SIGNAL BLOCKED", slug=runner.contract.slug, side="UP", reason="max_side_shares")
             return
         if float(runner.filled_shares["DOWN"]) + _open_order_shares(runner, "DOWN") + down_shares > _max_side_shares() + 1e-12:
-            _log_tag("SKIP BUY", slug=runner.contract.slug, side="DOWN", reason="max_side_shares")
+            _log_tag("SIGNAL BLOCKED", slug=runner.contract.slug, side="DOWN", reason="max_side_shares")
             return
 
         sent_up = _place_limit_buy(
@@ -1075,7 +1195,7 @@ def main() -> None:
         state="boot",
         pair=TRADE_PAIR_KEY,
         window_minutes=str(TRADE_WINDOW_MINUTES),
-        strategy="binance_looser_10usd_13x",
+        strategy="binance_looser_10usd_13x+immediate_repair_mkt",
         base_order_shares=f"{BASE_ORDER_SHARES:.0f}",
         boost_order_shares=f"{BOOST_ORDER_SHARES:.0f}",
         max_shares_per_side=f"{cfg.max_shares_per_side:.0f}",
