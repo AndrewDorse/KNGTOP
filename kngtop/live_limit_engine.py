@@ -49,6 +49,7 @@ C_WEAK_CAP = 0.45
 C_HIGH_GUARD = 0.60
 C_BALANCE_EPSILON = 1e-9
 REPLACE_COOLDOWN_SEC = 0.75
+TRADE_HISTORY_LOOKBACK_SEC = 600
 
 
 @dataclass(slots=True)
@@ -94,6 +95,15 @@ class OpenOrder:
 
 
 @dataclass(slots=True)
+class SentOrder:
+    order_id: str | None
+    side: str
+    price: float
+    shares: float
+    created_ts: float
+
+
+@dataclass(slots=True)
 class WindowRunner:
     pair_key: str
     binance_symbol: str
@@ -105,6 +115,9 @@ class WindowRunner:
     last_replace_ts: dict[str, float] = field(default_factory=lambda: {"UP": 0.0, "DOWN": 0.0})
     sent_shares: dict[str, float] = field(default_factory=lambda: {"UP": 0.0, "DOWN": 0.0})
     sent_cost: dict[str, float] = field(default_factory=lambda: {"UP": 0.0, "DOWN": 0.0})
+    sent_orders: list[SentOrder] = field(default_factory=list)
+    trade_history_positions: PositionState = field(default_factory=PositionState)
+    last_trade_history_fetch_ts: float = 0.0
     stop_reason: str | None = None
 
     def start_sec(self) -> int | None:
@@ -171,6 +184,14 @@ def _extract_numeric(row: dict[str, object], *keys: str) -> float | None:
     return None
 
 
+def _extract_text(row: dict[str, object], *keys: str) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            return str(value)
+    return ""
+
+
 def _parse_side_from_position(row: dict[str, object], runner: WindowRunner) -> str | None:
     outcome = str(row.get("outcome") or row.get("title") or "").strip().upper()
     if outcome in {"UP", "DOWN"}:
@@ -181,6 +202,20 @@ def _parse_side_from_position(row: dict[str, object], runner: WindowRunner) -> s
     if asset == runner.contract.down.token_id:
         return "DOWN"
     return None
+
+
+def _choose_richer_side(base: PositionState, history: PositionState, side: str) -> tuple[float, float]:
+    base_shares = base.shares(side)
+    hist_shares = history.shares(side)
+    if hist_shares > base_shares + 1e-9:
+        return hist_shares, hist_shares * history.avg(side)
+    return base_shares, base_shares * base.avg(side)
+
+
+def _merge_position_sources(base: PositionState, history: PositionState) -> PositionState:
+    up_shares, up_spent = _choose_richer_side(base, history, "UP")
+    down_shares, down_spent = _choose_richer_side(base, history, "DOWN")
+    return PositionState(spent_up=up_spent, spent_down=down_spent, shares_up=up_shares, shares_down=down_shares)
 
 
 def _refresh_positions(runner: WindowRunner, *, cfg: KngtopConfig, rows: list[dict[str, object]] | None = None) -> PositionState:
@@ -210,14 +245,70 @@ def _refresh_positions(runner: WindowRunner, *, cfg: KngtopConfig, rows: list[di
         else:
             pos.shares_down += size
             pos.spent_down += cost
+    merged = _merge_position_sources(pos, runner.trade_history_positions)
     for side in ("UP", "DOWN"):
-        reflected_shares = max(0.0, pos.shares(side) - previous.shares(side))
+        reflected_shares = max(0.0, merged.shares(side) - previous.shares(side))
         if reflected_shares > 1e-12:
             runner.sent_shares[side] = max(0.0, _local_sent_shares(runner, side) - reflected_shares)
-            reflected_cost = reflected_shares * pos.avg(side)
+            reflected_cost = reflected_shares * merged.avg(side)
             runner.sent_cost[side] = max(0.0, float(runner.sent_cost.get(side, 0.0)) - reflected_cost)
-    runner.positions = pos
+    runner.positions = merged
+    return merged
+
+
+def _parse_trade_history(runner: WindowRunner, rows_by_side: dict[str, list[dict[str, Any]]], *, cfg: KngtopConfig) -> PositionState:
+    del cfg
+    pos = PositionState()
+    seen: set[str] = set()
+    for side, rows in rows_by_side.items():
+        for row in rows:
+            raw_side = _extract_text(row, "side", "takerSide", "taker_side", "makerSide", "maker_side").upper()
+            if raw_side and raw_side not in {"BUY", "BID"}:
+                continue
+            oid = _extract_text(row, "orderId", "orderID", "order_id", "id", "transactionHash", "transaction_hash")
+            dedupe_key = f"{side}:{oid}" if oid else f"{side}:{row}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            price = _extract_numeric(row, "price", "matchedPrice", "matchPrice", "avgPrice")
+            size = _extract_numeric(row, "size", "amount", "shares", "matchedAmount")
+            if price is None or size is None or price <= 0.0 or size <= 0.0:
+                continue
+            if side == "UP":
+                pos.shares_up += size
+                pos.spent_up += size * price
+            else:
+                pos.shares_down += size
+                pos.spent_down += size * price
     return pos
+
+
+def _refresh_trade_history(
+    runner: WindowRunner,
+    *,
+    clob: KngtopClob | None,
+    cfg: KngtopConfig,
+    rows_by_side: dict[str, list[dict[str, Any]]] | None = None,
+    now_ts: float | None = None,
+) -> PositionState:
+    now = datetime.now(timezone.utc).timestamp() if now_ts is None else float(now_ts)
+    if rows_by_side is None:
+        if clob is None:
+            return runner.trade_history_positions
+        if now - runner.last_trade_history_fetch_ts < 2.0:
+            return runner.trade_history_positions
+        start_sec = runner.start_sec()
+        after_ts = int(max(0.0, (start_sec or int(now)) - TRADE_HISTORY_LOOKBACK_SEC))
+        rows_by_side = {}
+        for side in ("UP", "DOWN"):
+            try:
+                rows_by_side[side] = clob.get_recent_trades(_token_for_side(runner, side), after_ts=after_ts)
+            except Exception as exc:  # noqa: BLE001
+                _log_tag("TRADE HISTORY", slug=runner.contract.slug, side=side, status="error", error=str(exc))
+                rows_by_side[side] = []
+        runner.last_trade_history_fetch_ts = now
+    runner.trade_history_positions = _parse_trade_history(runner, rows_by_side, cfg=cfg)
+    return runner.trade_history_positions
 
 
 def _parse_open_orders(runner: WindowRunner, rows: list[dict[str, Any]]) -> dict[str, list[OpenOrder]]:
@@ -287,7 +378,7 @@ def _can_place_side_order(runner: WindowRunner, side: str, price: float, cfg: Kn
     pos = runner.positions
     if _effective_side_exposure(runner, side) + ORDER_SHARES > float(cfg.max_shares_per_side) + 1e-12:
         return False
-    if max(pos.spent_total(), _local_sent_total_cost(runner)) + price * ORDER_SHARES > MAX_SPENT_PER_WINDOW + 1e-12:
+    if pos.spent_total() + _local_sent_total_cost(runner) + price * ORDER_SHARES > MAX_SPENT_PER_WINDOW + 1e-12:
         return False
     if price * ORDER_SHARES + 1e-12 < MIN_ORDER_USD:
         return False
@@ -353,12 +444,16 @@ def _c_target_prices(runner: WindowRunner, *, up_ask: float | None, down_ask: fl
 
 def _cancel_order(runner: WindowRunner, *, clob: KngtopClob | None, order: OpenOrder, reason: str) -> bool:
     if clob is None:
+        runner.sent_shares[order.side] = max(0.0, _local_sent_shares(runner, order.side) - max(0.0, order.remaining_shares))
+        runner.sent_cost[order.side] = max(0.0, float(runner.sent_cost.get(order.side, 0.0)) - max(0.0, order.remaining_shares) * max(0.0, order.price))
         return True
     try:
         clob.cancel_order_by_id(order.order_id)
     except Exception as exc:  # noqa: BLE001
         _log_tag("CANCEL FAILED", slug=runner.contract.slug, side=order.side, order_id=order.order_id, reason=reason, error=str(exc))
         return False
+    runner.sent_shares[order.side] = max(0.0, _local_sent_shares(runner, order.side) - max(0.0, order.remaining_shares))
+    runner.sent_cost[order.side] = max(0.0, float(runner.sent_cost.get(order.side, 0.0)) - max(0.0, order.remaining_shares) * max(0.0, order.price))
     _log_tag("CANCEL", slug=runner.contract.slug, side=order.side, order_id=order.order_id, price=f"{order.price:.2f}", reason=reason)
     return True
 
@@ -369,6 +464,7 @@ def _post_order(runner: WindowRunner, *, clob: KngtopClob | None, side: str, pri
         _log_tag("DRY ORDER", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{ORDER_SHARES:.2f}")
         runner.sent_shares[side] = _local_sent_shares(runner, side) + ORDER_SHARES
         runner.sent_cost[side] = max(0.0, float(runner.sent_cost.get(side, 0.0))) + ORDER_SHARES * price
+        runner.sent_orders.append(SentOrder(order_id=None, side=side, price=price, shares=ORDER_SHARES, created_ts=time.time()))
         return True
     try:
         payload = clob.limit_buy_shares(_token_for_side(runner, side), price=price, shares=ORDER_SHARES, post_only=True)
@@ -380,6 +476,7 @@ def _post_order(runner: WindowRunner, *, clob: KngtopClob | None, side: str, pri
     order_id = _extract_order_id(payload)
     runner.sent_shares[side] = _local_sent_shares(runner, side) + ORDER_SHARES
     runner.sent_cost[side] = max(0.0, float(runner.sent_cost.get(side, 0.0))) + ORDER_SHARES * price
+    runner.sent_orders.append(SentOrder(order_id=order_id, side=side, price=price, shares=ORDER_SHARES, created_ts=time.time()))
     _log_tag("ORDER SENT", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{ORDER_SHARES:.2f}", order_id=order_id)
     return True
 
@@ -430,6 +527,11 @@ def _tick_runner(
     if remaining <= 0:
         return
     state = runtime_state if runtime_state is not None else {}
+    history_rows = state.get("reconcile_trade_history")
+    if isinstance(history_rows, dict):
+        _refresh_trade_history(runner, clob=clob, cfg=cfg, rows_by_side={str(k): list(v) for k, v in history_rows.items() if isinstance(v, list)}, now_ts=now_ts)
+    elif clob is not None:
+        _refresh_trade_history(runner, clob=clob, cfg=cfg, now_ts=now_ts)
     rows = state.get("reconcile_positions")
     _refresh_positions(runner, cfg=cfg, rows=list(rows) if isinstance(rows, list) else None)
     if clob is not None:
@@ -531,6 +633,12 @@ def _reconcile_loop(
         try:
             runtime_state["reconcile_positions"] = fetch_user_positions(user=cfg.funder, timeout=cfg.request_timeout_sec)
             runtime_state["reconcile_open_orders"] = clob.get_open_orders()
+            runners = runtime_state.get("runners")
+            if isinstance(runners, dict):
+                now_ts = datetime.now(timezone.utc).timestamp()
+                for runner in list(runners.values()):
+                    if isinstance(runner, WindowRunner):
+                        _refresh_trade_history(runner, clob=clob, cfg=cfg, now_ts=now_ts)
             on_update()
         except Exception as exc:  # noqa: BLE001
             _log_tag("RECONCILE", status="error", error=str(exc))

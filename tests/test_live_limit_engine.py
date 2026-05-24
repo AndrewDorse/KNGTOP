@@ -71,6 +71,7 @@ class _FakeClob:
         self.calls: list[tuple[str, float, float]] = []
         self.cancelled: list[str] = []
         self.open_orders: list[dict[str, object]] = []
+        self.recent_trades: dict[str, list[dict[str, object]]] = {"up-token": [], "down-token": []}
         self.next_id = 1
 
     def limit_buy_shares(self, token: TokenMarket, *, price: float, shares: float, post_only: bool = True):  # noqa: ANN201
@@ -90,6 +91,10 @@ class _FakeClob:
 
     def get_open_orders(self) -> list[dict[str, object]]:
         return [dict(row) for row in self.open_orders]
+
+    def get_recent_trades(self, token: TokenMarket, *, after_ts: int) -> list[dict[str, object]]:
+        del after_ts
+        return [dict(row) for row in self.recent_trades.get(token.token_id, [])]
 
 
 def _positions_row(*, slug: str, outcome: str, token_id: str, size: float, avg_price: float) -> dict[str, object]:
@@ -298,6 +303,41 @@ def test_sent_ledger_is_reduced_when_positions_reflect_fill() -> None:
 
     assert runner.sent_shares["DOWN"] == 0.0
     assert ("up-token", 0.69, 5.0) in clob.calls
+
+
+def test_trade_history_confirms_fill_when_positions_lag() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob()
+
+    _tick(runner, elapsed=-10, up=0.54, down=0.48, clob=clob)
+    clob.open_orders = []
+    clob.recent_trades["down-token"] = [{"side": "BUY", "price": 0.48, "size": 5.0, "id": "fill-1"}]
+
+    _tick(runner, elapsed=5, up=0.69, down=0.31, clob=clob, positions=[])
+
+    assert runner.positions.shares_down == 5.0
+    assert runner.sent_shares["DOWN"] == 0.0
+    assert ("up-token", 0.69, 5.0) in clob.calls
+
+
+def test_cancelled_open_order_reduces_local_pending_ledger() -> None:
+    runner = _runner(1_700_000_000)
+    runner.sent_shares["UP"] = 5.0
+    runner.sent_cost["UP"] = 2.75
+    positions = [
+        _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.47),
+        _positions_row(slug=runner.contract.slug, outcome="DOWN", token_id="down-token", size=5.0, avg_price=0.47),
+    ]
+    clob = _FakeClob()
+    clob.open_orders = [
+        {"id": "up-high", "asset_id": "up-token", "side": "BUY", "price": 0.55, "original_size": 5.0, "size_left": 5.0},
+    ]
+
+    _tick(runner, elapsed=30, up=0.39, down=0.46, clob=clob, positions=positions)
+
+    assert "up-high" in clob.cancelled
+    assert runner.sent_shares["UP"] == 5.0
+    assert ("up-token", 0.39, 5.0) in clob.calls
 
 
 def test_max_fifteen_shares_per_side_includes_open_and_sent_orders() -> None:
