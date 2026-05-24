@@ -13,8 +13,10 @@ from kngtop.live_limit_engine import (
     ORDER_SIZE_SHARES,
     LocalPendingOrder,
     PositionState,
+    StrategyDecision,
     WindowRunner,
     _c_target_prices,
+    _execute_decision,
     _tick_runner,
 )
 
@@ -397,3 +399,30 @@ def test_manual_larger_side_order_is_not_cancelled_and_blocks_larger_side_creati
 
     assert clob.cancelled == []
     assert clob.limit_calls == []
+
+
+def test_trade_history_counts_resting_fill_even_when_side_field_is_sell() -> None:
+    runner = _runner()
+    clob = _FakeClob()
+    clob.recent_trades["down-token"] = [{"side": "SELL", "price": 0.47, "size": 5.0, "id": "down-fill"}]
+
+    _tick(runner, elapsed=5, clob=clob, up=0.45, down=0.39, positions=[])
+
+    assert runner.positions.shares_down == pytest.approx(5.0)
+    assert clob.limit_calls == [("up-token", pytest.approx(0.45), pytest.approx(ORDER_SIZE_SHARES))]
+
+
+def test_execution_boundary_blocks_order_on_already_larger_effective_side() -> None:
+    runner = _runner(positions=PositionState(spent_down=2.10, shares_down=5.0))
+    clob = _FakeClob()
+
+    sent = _execute_decision(
+        runner,
+        clob=clob,
+        decision=StrategyDecision("PLACE", "bad_stale_decision", [("DOWN", 0.39, ORDER_SIZE_SHARES)]),
+        now_ts=START + 5,
+    )
+
+    assert sent is False
+    assert clob.limit_calls == []
+    assert runner.local_pending_orders_by_side["DOWN"] == []

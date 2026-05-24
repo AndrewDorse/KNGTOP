@@ -379,9 +379,6 @@ def _parse_trade_history(runner: WindowRunner, rows_by_side: dict[str, list[dict
     seen: set[str] = set()
     for side, rows in rows_by_side.items():
         for row in rows:
-            raw_side = _extract_text(row, "side", "takerSide", "taker_side", "makerSide", "maker_side").upper()
-            if raw_side and raw_side not in {"BUY", "BID"}:
-                continue
             oid = _extract_text(row, "orderId", "orderID", "order_id", "id", "transactionHash", "transaction_hash")
             dedupe_key = f"{side}:{oid}" if oid else f"{side}:{row}"
             if dedupe_key in seen:
@@ -484,9 +481,6 @@ def _trade_history_fill_ids(rows_by_side: dict[str, list[dict[str, Any]]]) -> se
     out: set[str] = set()
     for side, rows in rows_by_side.items():
         for row in rows:
-            raw_side = _extract_text(row, "side", "takerSide", "taker_side", "makerSide", "maker_side").upper()
-            if raw_side and raw_side not in {"BUY", "BID"}:
-                continue
             oid = _extract_text(row, "orderId", "orderID", "order_id", "id", "transactionHash", "transaction_hash")
             if oid:
                 out.add(f"{side}:{oid}")
@@ -841,7 +835,33 @@ def _record_local_pending_order(
     return pending
 
 
-def _place_one_order(runner: WindowRunner, *, clob: KngtopClob | None, side: str, price: float, shares: float, now_ts: float, reason: str) -> None:
+def _hard_pre_send_guard(runner: WindowRunner, *, side: str, price: float, shares: float, now_ts: float) -> tuple[bool, str | None]:
+    del price, now_ts
+    other = _opposite_side(side)
+    side_effective = _effective_side_shares(runner, side)
+    other_effective = _effective_side_shares(runner, other)
+    if side_effective > other_effective + C_BALANCE_EPSILON:
+        return False, "side_already_larger_effective"
+    if side_effective + shares > MAX_SHARES_PER_SIDE + 1e-12:
+        return False, "max_shares_per_side"
+    if _pending_orders(runner, side):
+        return False, "side_local_pending_lock"
+    return True, None
+
+
+def _place_one_order(runner: WindowRunner, *, clob: KngtopClob | None, side: str, price: float, shares: float, now_ts: float, reason: str) -> bool:
+    ok, blocked_reason = _hard_pre_send_guard(runner, side=side, price=price, shares=shares, now_ts=now_ts)
+    if not ok:
+        _log_tag(
+            "DANGER_BLOCK",
+            market_id=runner.market_id(),
+            side=side,
+            price=f"{price:.2f}",
+            shares=f"{shares:.2f}",
+            reason=blocked_reason,
+            decision_reason=reason,
+        )
+        return False
     pending = _record_local_pending_order(runner, side=side, price=price, shares=shares, now_ts=now_ts)
     _log_tag(
         "PLACE",
@@ -854,15 +874,16 @@ def _place_one_order(runner: WindowRunner, *, clob: KngtopClob | None, side: str
     )
     if clob is None:
         pending.status = "OPEN_CONFIRMED"
-        return
+        return True
     try:
         payload = clob.limit_buy_shares(_token_for_side(runner, side), price=float(price), shares=float(shares), post_only=True)
     except Exception as exc:  # noqa: BLE001
         pending.status = "UNKNOWN"
         _log_tag("PLACE", market_id=runner.market_id(), side=side, status="UNKNOWN", error=str(exc), client_order_id=pending.client_order_id)
-        return
+        return True
     pending.exchange_order_id = _extract_order_id(payload)
     pending.status = "CONFIRMING"
+    return True
 
 
 def _cancel_one_order(runner: WindowRunner, *, clob: KngtopClob | None, order: OpenOrder, now_ts: float, reason: str) -> None:
@@ -901,14 +922,14 @@ def _execute_decision(runner: WindowRunner, *, clob: KngtopClob | None, decision
         return True
     if decision.action == "PLACE":
         side, price, shares = decision.orders[0]
-        _place_one_order(runner, clob=clob, side=side, price=price, shares=shares, now_ts=now_ts, reason=decision.reason)
-        return True
+        return _place_one_order(runner, clob=clob, side=side, price=price, shares=shares, now_ts=now_ts, reason=decision.reason)
     if decision.action == "BATCH":
         if decision.reason == "opening_gate_initial_batch":
             runner.initial_batch_sent = True
+        sent_any = False
         for side, price, shares in decision.orders:
-            _place_one_order(runner, clob=clob, side=side, price=price, shares=shares, now_ts=now_ts, reason=decision.reason)
-        return True
+            sent_any = _place_one_order(runner, clob=clob, side=side, price=price, shares=shares, now_ts=now_ts, reason=decision.reason) or sent_any
+        return sent_any
     return False
 
 
