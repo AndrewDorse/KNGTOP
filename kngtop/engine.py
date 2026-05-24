@@ -1075,7 +1075,7 @@ def main() -> None:
         state="boot",
         pair=TRADE_PAIR_KEY,
         window_minutes=str(TRADE_WINDOW_MINUTES),
-        strategy="disc06_exp30_cap95_b15",
+        strategy="binance_looser_10usd_13x",
         base_order_shares=f"{BASE_ORDER_SHARES:.0f}",
         boost_order_shares=f"{BOOST_ORDER_SHARES:.0f}",
         max_shares_per_side=f"{cfg.max_shares_per_side:.0f}",

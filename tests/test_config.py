@@ -108,9 +108,9 @@ def test_spike_pair_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
     cfg = KngtopConfig.from_env()
     assert cfg.spike_move_lookback_sec == 5
-    assert cfg.spike_move_threshold_usd == 20.0
+    assert cfg.spike_move_threshold_usd == 10.0
     assert cfg.spike_volume_lookback_sec == 20
-    assert cfg.spike_volume_ratio_min == 1.8
+    assert cfg.spike_volume_ratio_min == 1.3
     assert cfg.pair_cooldown_sec == 10.0
     assert cfg.pair_order_expiry_sec == 30.0
     assert cfg.opposite_side_discount == 0.06

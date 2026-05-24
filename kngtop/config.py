@@ -76,9 +76,9 @@ class KngtopConfig:
     repair_avg_sum_cap: float
     locked_profit_roi: float
     spike_move_lookback_sec: int = 5
-    spike_move_threshold_usd: float = 20.0
+    spike_move_threshold_usd: float = 10.0
     spike_volume_lookback_sec: int = 20
-    spike_volume_ratio_min: float = 1.8
+    spike_volume_ratio_min: float = 1.3
     pair_cooldown_sec: float = 10.0
     pair_order_expiry_sec: float = 30.0
     opposite_side_discount: float = 0.06
@@ -126,9 +126,9 @@ class KngtopConfig:
             repair_avg_sum_cap=max(0.0, float(os.environ.get("KNGTOP_REPAIR_AVG_SUM_CAP") or "0.95")),
             locked_profit_roi=max(0.0, float(os.environ.get("KNGTOP_LOCKED_PROFIT_ROI") or "0.10")),
             spike_move_lookback_sec=max(1, int(os.environ.get("KNGTOP_SPIKE_MOVE_LOOKBACK_SEC") or "5")),
-            spike_move_threshold_usd=max(0.0, float(os.environ.get("KNGTOP_SPIKE_MOVE_THRESHOLD_USD") or "20.0")),
+            spike_move_threshold_usd=max(0.0, float(os.environ.get("KNGTOP_SPIKE_MOVE_THRESHOLD_USD") or "10.0")),
             spike_volume_lookback_sec=max(1, int(os.environ.get("KNGTOP_SPIKE_VOLUME_LOOKBACK_SEC") or "20")),
-            spike_volume_ratio_min=max(0.0, float(os.environ.get("KNGTOP_SPIKE_VOLUME_RATIO_MIN") or "1.8")),
+            spike_volume_ratio_min=max(0.0, float(os.environ.get("KNGTOP_SPIKE_VOLUME_RATIO_MIN") or "1.3")),
             pair_cooldown_sec=max(0.0, float(os.environ.get("KNGTOP_PAIR_COOLDOWN_SEC") or "10.0")),
             pair_order_expiry_sec=max(1.0, float(os.environ.get("KNGTOP_PAIR_ORDER_EXPIRY_SEC") or "30.0")),
             opposite_side_discount=max(0.0, float(os.environ.get("KNGTOP_OPPOSITE_SIDE_DISCOUNT") or "0.06")),
