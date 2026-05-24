@@ -45,6 +45,9 @@ MAX_AVG_SUM_AFTER_BUY = 0.95
 ACTION_COOLDOWN_SECONDS = 1.0
 UNKNOWN_ORDER_TIMEOUT_SECONDS = 7.0
 RECENT_SENT_CACHE_SECONDS = 10.0
+SELF_FIX_CONFIRMATIONS = 2
+SELF_FIX_MIN_SECONDS = 2.0
+SELF_FIX_STALE_SECONDS = 6.0
 MAX_SPENT_PER_WINDOW = 20.0
 REPRICE_TOLERANCE = 0.005
 MIN_ORDER_USD = 1.05
@@ -154,6 +157,7 @@ class WindowRunner:
     last_action_time: float = 0.0
     action_lock_until: float = 0.0
     recent_sent_cache: dict[str, float] = field(default_factory=dict)
+    self_fix_observations: dict[str, dict[str, float]] = field(default_factory=dict)
     last_reconcile_summary: dict[str, Any] = field(default_factory=dict)
     stop_reason: str | None = None
 
@@ -275,6 +279,33 @@ def _prune_recent_sent_cache(runner: WindowRunner, now_ts: float) -> None:
     runner.recent_sent_cache = {
         key: sent_at for key, sent_at in runner.recent_sent_cache.items() if now_ts - float(sent_at) < RECENT_SENT_CACHE_SECONDS
     }
+
+
+def _observe_self_fix_condition(runner: WindowRunner, key: str, now_ts: float) -> bool:
+    observation = runner.self_fix_observations.get(key)
+    if observation is None or now_ts - float(observation.get("last_seen", 0.0)) > SELF_FIX_STALE_SECONDS:
+        observation = {"first_seen": now_ts, "last_seen": now_ts, "count": 1.0}
+    else:
+        observation["last_seen"] = now_ts
+        observation["count"] = float(observation.get("count", 0.0)) + 1.0
+    runner.self_fix_observations[key] = observation
+    confirmed = (
+        float(observation["count"]) >= SELF_FIX_CONFIRMATIONS
+        and now_ts - float(observation["first_seen"]) >= SELF_FIX_MIN_SECONDS
+    )
+    _log_tag(
+        "SELF_FIX",
+        market_id=runner.market_id(),
+        key=key,
+        count=str(int(observation["count"])),
+        age=f"{now_ts - float(observation['first_seen']):.1f}",
+        confirmed=str(int(confirmed)),
+    )
+    return confirmed
+
+
+def _forget_self_fix_condition(runner: WindowRunner, key: str) -> None:
+    runner.self_fix_observations.pop(key, None)
 
 
 def _extract_order_id(payload: object) -> str | None:
@@ -702,6 +733,13 @@ def _projected_pair_avg_sum(pos: PositionState, up_price: float, down_price: flo
     return up_avg + down_avg
 
 
+def _safe_side_price(runner: WindowRunner, side: str, target_price: float, ask_price: float | None) -> float:
+    del runner
+    if ask_price is None or ask_price <= 0.0:
+        return round(max(0.01, min(0.99, target_price)), 2)
+    return round(max(0.01, min(0.99, float(target_price), float(ask_price))), 2)
+
+
 def _can_send_order_intent(runner: WindowRunner, side: str, price: float, shares: float, now_ts: float) -> tuple[bool, str | None]:
     if _pending_cancel_count(runner) > 0:
         return False, "pending_cancel_lock"
@@ -762,6 +800,18 @@ def _build_next_decision(
     if state_type == "EMPTY":
         return StrategyDecision("NONE", "empty_outside_opening_gate")
 
+    for side in ("UP", "DOWN"):
+        bot_orders = [order for order in runner.open_orders.get(side, []) if order.bot_owned]
+        if len(bot_orders) > 1:
+            bot_orders.sort(key=lambda order: (-order.price, order.order_id))
+            order = bot_orders[0]
+            ids = ",".join(sorted(item.order_id for item in bot_orders))
+            key = f"duplicate_bot_orders:{side}:{ids}:{runner.positions.shares_up:.2f}:{runner.positions.shares_down:.2f}"
+            if not _observe_self_fix_condition(runner, key, now_ts):
+                return StrategyDecision("NONE", "self_fix_confirming_duplicate_bot_orders")
+            _forget_self_fix_condition(runner, key)
+            return StrategyDecision("CANCEL", "duplicate_bot_order_same_side", cancel_order=order)
+
     if state_type == "IMBALANCED":
         smaller = _smaller_side(runner.positions)
         larger = _opposite_side(smaller) if smaller else None
@@ -769,6 +819,10 @@ def _build_next_decision(
             larger_bot_orders = [order for order in runner.open_orders.get(larger, []) if order.bot_owned]
             if larger_bot_orders:
                 order = larger_bot_orders[0]
+                key = f"imbalanced_larger_bot_order:{larger}:{order.order_id}:{runner.positions.shares_up:.2f}:{runner.positions.shares_down:.2f}"
+                if not _observe_self_fix_condition(runner, key, now_ts):
+                    return StrategyDecision("NONE", "self_fix_confirming_larger_side_bot_order")
+                _forget_self_fix_condition(runner, key)
                 return StrategyDecision("CANCEL", "larger_side_bot_order_while_imbalanced", cancel_order=order)
         if smaller is None:
             return StrategyDecision("NONE", "imbalanced_no_smaller_side")
@@ -791,6 +845,30 @@ def _build_next_decision(
 
     if runner.positions.shares_up >= MAX_SHARES_PER_SIDE - 1e-12 and runner.positions.shares_down >= MAX_SHARES_PER_SIDE - 1e-12:
         return StrategyDecision("NONE", "max_shares_reached")
+    desired = _c_target_prices(runner, up_ask=up_ask, down_ask=down_ask, cfg=cfg)
+    live_up = _live_order_count(runner, "UP")
+    live_down = _live_order_count(runner, "DOWN")
+    if live_up + live_down == 1:
+        missing = "DOWN" if live_up == 1 else "UP"
+        existing_side = "UP" if live_up == 1 else "DOWN"
+        live_ids = ",".join(order.order_id for orders in runner.open_orders.values() for order in orders) or "pending"
+        key = f"balanced_one_sided_live:{existing_side}:missing_{missing}:{live_ids}:{runner.positions.shares_up:.2f}:{runner.positions.shares_down:.2f}"
+        if not _observe_self_fix_condition(runner, key, now_ts):
+            return StrategyDecision("NONE", "self_fix_confirming_balanced_one_sided_live")
+        target_price = desired[missing]
+        if target_price is None:
+            return StrategyDecision("NONE", "balanced_one_sided_live_no_valid_missing_price")
+        price = _safe_side_price(runner, missing, target_price, up_ask if missing == "UP" else down_ask)
+        if runner.positions.shares(missing) + _open_order_shares(runner, missing) + _pending_order_shares(runner, missing) + ORDER_SIZE_SHARES > MAX_SHARES_PER_SIDE + 1e-12:
+            return StrategyDecision("NONE", "balanced_missing_side_max_shares")
+        if _projected_avg_sum(runner.positions, missing, price) > MAX_AVG_SUM_AFTER_BUY + 1e-12:
+            return StrategyDecision("NONE", "balanced_missing_side_avg_sum_cap")
+        ok, reason = _can_send_order_intent(runner, missing, price, ORDER_SIZE_SHARES, now_ts)
+        if not ok:
+            _log_tag("DANGER_BLOCK", market_id=runner.market_id(), side=missing, reason=reason)
+            return StrategyDecision("NONE", str(reason))
+        _forget_self_fix_condition(runner, key)
+        return StrategyDecision("PLACE", f"balanced_one_sided_live_repair_{missing}", [(missing, price, ORDER_SIZE_SHARES)])
     if _live_order_count(runner) > 0:
         return StrategyDecision("NONE", "balanced_live_orders_exist")
     if runner.positions.shares_up + ORDER_SIZE_SHARES > MAX_SHARES_PER_SIDE + 1e-12:
@@ -798,7 +876,6 @@ def _build_next_decision(
     if runner.positions.shares_down + ORDER_SIZE_SHARES > MAX_SHARES_PER_SIDE + 1e-12:
         return StrategyDecision("NONE", "down_max_shares_after_pair")
 
-    desired = _c_target_prices(runner, up_ask=up_ask, down_ask=down_ask, cfg=cfg)
     up_price = desired["UP"]
     down_price = desired["DOWN"]
     if up_price is None or down_price is None:

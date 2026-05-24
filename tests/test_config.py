@@ -101,3 +101,36 @@ def test_request_timeout_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("KNGTOP_REQUEST_TIMEOUT_SECONDS", raising=False)
     cfg = KngtopConfig.from_env()
     assert cfg.request_timeout_sec == 5.0
+
+
+def test_spike_pair_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
+    cfg = KngtopConfig.from_env()
+    assert cfg.spike_move_lookback_sec == 5
+    assert cfg.spike_move_threshold_usd == 20.0
+    assert cfg.spike_volume_lookback_sec == 20
+    assert cfg.spike_volume_ratio_min == 1.8
+    assert cfg.pair_cooldown_sec == 10.0
+    assert cfg.pair_order_expiry_sec == 30.0
+    assert cfg.opposite_side_discount == 0.06
+
+
+def test_spike_pair_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "1" * 64)
+    monkeypatch.setenv("POLY_FUNDER", "0x" + "2" * 40)
+    monkeypatch.setenv("KNGTOP_SPIKE_MOVE_LOOKBACK_SEC", "7")
+    monkeypatch.setenv("KNGTOP_SPIKE_MOVE_THRESHOLD_USD", "24")
+    monkeypatch.setenv("KNGTOP_SPIKE_VOLUME_LOOKBACK_SEC", "25")
+    monkeypatch.setenv("KNGTOP_SPIKE_VOLUME_RATIO_MIN", "2.4")
+    monkeypatch.setenv("KNGTOP_PAIR_COOLDOWN_SEC", "12")
+    monkeypatch.setenv("KNGTOP_PAIR_ORDER_EXPIRY_SEC", "45")
+    monkeypatch.setenv("KNGTOP_OPPOSITE_SIDE_DISCOUNT", "0.08")
+    cfg = KngtopConfig.from_env()
+    assert cfg.spike_move_lookback_sec == 7
+    assert cfg.spike_move_threshold_usd == 24.0
+    assert cfg.spike_volume_lookback_sec == 25
+    assert cfg.spike_volume_ratio_min == 2.4
+    assert cfg.pair_cooldown_sec == 12.0
+    assert cfg.pair_order_expiry_sec == 45.0
+    assert cfg.opposite_side_discount == 0.08

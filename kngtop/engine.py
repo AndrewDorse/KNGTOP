@@ -1,4 +1,4 @@
-"""BTC 5m balanced two-sided maker driven by websocket updates plus 0.2s heartbeat."""
+"""BTC 5m Binance-spike paired resting-limit engine."""
 
 from __future__ import annotations
 
@@ -35,18 +35,23 @@ MIN_REMAINING_SEC = 30
 STOP_NEW_BUYS_ELAPSED_SEC = 220
 CANCEL_ALL_BUYS_ELAPSED_SEC = 240
 BASE_ORDER_SHARES = 5.0
-MAX_PAIRS_PER_SIDE = 2
+BOOST_ORDER_SHARES = 10.0
+MAX_PAIRS_PER_SIDE = 3
 PRICE_STEP = 0.01
 MIN_BUY_PRICE = 0.35
 MAX_BUY_PRICE = 0.65
-MAX_TOTAL_EXPOSURE_PER_WINDOW = 30.0
-MAX_ONE_SIDE_EXPOSURE = 20.0
+MAX_TOTAL_EXPOSURE_PER_WINDOW = 15.0
+MAX_ONE_SIDE_EXPOSURE = 15.0
 MAX_OPEN_BUY_ORDERS = MAX_PAIRS_PER_SIDE * 2
 MAX_OPEN_BUY_ORDERS_PER_SIDE = MAX_PAIRS_PER_SIDE
 MAX_IMBALANCE_SHARES = 5.0
-MIN_MAKER_EDGE = 0.015
-STRONG_MAKER_EDGE = 0.025
-SECOND_PAIR_MIN_REMAINING_SEC = 90
+SPIKE_MOVE_LOOKBACK_SEC = 5
+SPIKE_MOVE_THRESHOLD_USD = 20.0
+SPIKE_VOLUME_LOOKBACK_SEC = 20
+SPIKE_VOLUME_RATIO_MIN = 1.8
+PAIR_COOLDOWN_SEC = 10.0
+PAIR_ORDER_EXPIRY_SEC = 30.0
+OPPOSITE_SIDE_DISCOUNT = 0.06
 DISCOVERY_RETRY_SEC_WHEN_MISSING = 2.0
 RECONCILE_COOLDOWN_SEC = 2.0
 FAST_RECONCILE_AFTER_ACTION_SEC = 0.75
@@ -102,7 +107,7 @@ class WindowRunner:
     last_reconcile_monotonic: float = 0.0
     reconcile_after_action_monotonic: float = 0.0
     force_reconcile: bool = True
-    second_pair_gate_state: str | None = None
+    last_signal_monotonic: float = -10_000.0
     _exec_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def start_sec(self) -> int | None:
@@ -291,16 +296,87 @@ def _book_snapshot(*, best_bid: float | None, best_ask: float | None) -> BookSna
     )
 
 
-def _desired_sides(imbalance_shares: float) -> tuple[str, ...]:
-    if imbalance_shares > 0:
-        return ("DOWN",)
-    if imbalance_shares < 0:
-        return ("UP",)
-    return ("UP", "DOWN")
-
-
 def _max_side_shares() -> float:
     return float(MAX_PAIRS_PER_SIDE) * float(BASE_ORDER_SHARES)
+
+
+def _open_order_shares(runner: WindowRunner, side: str) -> float:
+    return sum(max(0.0, order.remaining_size) for order in runner.open_orders.get(side, []))
+
+
+def _pair_projected_avg_sum(
+    runner: WindowRunner,
+    *,
+    up_price: float,
+    up_shares: float,
+    down_price: float,
+    down_shares: float,
+) -> float:
+    next_up_shares = float(runner.filled_shares.get("UP", 0.0)) + up_shares
+    next_down_shares = float(runner.filled_shares.get("DOWN", 0.0)) + down_shares
+    next_up_cost = float(runner.filled_cost.get("UP", 0.0)) + (up_price * up_shares)
+    next_down_cost = float(runner.filled_cost.get("DOWN", 0.0)) + (down_price * down_shares)
+    up_avg = next_up_cost / next_up_shares if next_up_shares > 1e-12 else 0.0
+    down_avg = next_down_cost / next_down_shares if next_down_shares > 1e-12 else 0.0
+    return up_avg + down_avg
+
+
+def _spike_signal_side(
+    *,
+    runner: WindowRunner,
+    binance: BinanceCombinedTradeFeed,
+    cfg: KngtopConfig,
+) -> str | None:
+    px_pair = binance.price_then_now(
+        runner.binance_symbol,
+        lookback_sec=cfg.spike_move_lookback_sec,
+        max_age_sec=cfg.binance_max_age_sec,
+    )
+    volume_ratio = binance.current_volume_ratio(
+        runner.binance_symbol,
+        lookback_sec=cfg.spike_volume_lookback_sec,
+        max_age_sec=cfg.binance_max_age_sec,
+    )
+    if px_pair is None or volume_ratio is None:
+        return None
+    current_px, past_px = px_pair
+    move = float(current_px) - float(past_px)
+    if volume_ratio + 1e-12 < cfg.spike_volume_ratio_min:
+        return None
+    if move >= cfg.spike_move_threshold_usd - 1e-12:
+        return "UP"
+    if move <= -cfg.spike_move_threshold_usd + 1e-12:
+        return "DOWN"
+    return None
+
+
+def _pair_order_prices(
+    *,
+    trigger_side: str,
+    up_book: BookSnapshot,
+    down_book: BookSnapshot,
+    opposite_side_discount: float,
+) -> tuple[float, float] | None:
+    if up_book.ask is None or down_book.ask is None:
+        return None
+    if trigger_side == "UP":
+        up_price = round(max(MIN_BUY_PRICE, min(MAX_BUY_PRICE, float(up_book.ask))), 2)
+        down_price = round(max(MIN_BUY_PRICE, min(MAX_BUY_PRICE, float(down_book.ask) - opposite_side_discount)), 2)
+        return float(up_price), float(down_price)
+    down_price = round(max(MIN_BUY_PRICE, min(MAX_BUY_PRICE, float(down_book.ask))), 2)
+    up_price = round(max(MIN_BUY_PRICE, min(MAX_BUY_PRICE, float(up_book.ask) - opposite_side_discount)), 2)
+    return float(up_price), float(down_price)
+
+
+def _pair_order_sizes(runner: WindowRunner) -> tuple[float, float]:
+    up_shares = BASE_ORDER_SHARES
+    down_shares = BASE_ORDER_SHARES
+    imbalance = runner.imbalance_shares()
+    if imbalance > MAX_IMBALANCE_SHARES - 1e-12:
+        down_shares = BOOST_ORDER_SHARES
+    elif imbalance < -MAX_IMBALANCE_SHARES + 1e-12:
+        up_shares = BOOST_ORDER_SHARES
+    return up_shares, down_shares
 
 
 def _prune_sent_order_cache(runner: WindowRunner, now_monotonic: float) -> None:
@@ -600,22 +676,23 @@ def _place_limit_buy(
     token: TokenMarket,
     side: str,
     price: float,
+    shares: float = BASE_ORDER_SHARES,
 ) -> bool:
     if clob is None:
-        _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{BASE_ORDER_SHARES:.2f}", mode="dry_run")
+        _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{shares:.2f}", mode="dry_run")
         return False
     try:
-        payload = clob.limit_buy_shares(token, price=float(price), shares=float(BASE_ORDER_SHARES), post_only=True)
+        payload = clob.limit_buy_shares(token, price=float(price), shares=float(shares), post_only=True)
     except Exception as exc:  # noqa: BLE001
-        _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{BASE_ORDER_SHARES:.2f}", status="error", error=str(exc))
+        _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{shares:.2f}", status="error", error=str(exc))
         return False
     order_id = _extract_order_id(payload) or "unknown"
     now_monotonic = time.perf_counter()
     runner.last_place_monotonic[side] = now_monotonic
-    runner.sent_order_cache[f"{side}:{price:.2f}"] = now_monotonic
+    runner.sent_order_cache[f"{side}:{price:.2f}:{shares:.2f}"] = now_monotonic
     runner.force_reconcile = True
     runner.reconcile_after_action_monotonic = now_monotonic + FAST_RECONCILE_AFTER_ACTION_SEC
-    _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{BASE_ORDER_SHARES:.2f}", order_id=order_id)
+    _log_tag("LIMIT BUY", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{shares:.2f}", order_id=order_id)
     return True
 
 
@@ -642,18 +719,6 @@ def _maybe_cancel_orders(
             break
 
 
-def _avg_sum(runner: WindowRunner) -> float | None:
-    avg_up = runner.avg_price("UP")
-    avg_down = runner.avg_price("DOWN")
-    if avg_up is None or avg_down is None:
-        return None
-    return float(avg_up) + float(avg_down)
-
-
-def _expected_pair_pnl(avg_sum: float) -> float:
-    return 1.0 - float(avg_sum)
-
-
 def _book_for_side(runner: WindowRunner, side: str, poly: MarketWsFeed, cfg: KngtopConfig) -> tuple[float | None, float | None]:
     token_id = runner.contract.up.token_id if side == "UP" else runner.contract.down.token_id
     quote = poly.best_bid_ask_for(token_id, max_age_sec=cfg.poly_mid_max_age_sec)
@@ -665,111 +730,6 @@ def _book_for_side(runner: WindowRunner, side: str, poly: MarketWsFeed, cfg: Kng
 def _snapshot_for_side(runner: WindowRunner, side: str, poly: MarketWsFeed, cfg: KngtopConfig) -> BookSnapshot:
     bid, ask = _book_for_side(runner, side, poly, cfg)
     return _book_snapshot(best_bid=bid, best_ask=ask)
-
-
-def _book_beats_realized_avg(avg_price: float | None, book: BookSnapshot) -> bool:
-    return avg_price is not None and book.mid is not None and float(avg_price) < float(book.mid)
-
-
-def _maybe_place_side(
-    runner: WindowRunner,
-    *,
-    clob: KngtopClob | None,
-    side: str,
-    book: BookSnapshot,
-    now_monotonic: float,
-) -> None:
-    if runner.open_order_count() >= MAX_OPEN_BUY_ORDERS:
-        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="max_open_orders")
-        return
-    if runner.open_order_count(side) >= MAX_OPEN_BUY_ORDERS_PER_SIDE:
-        return
-    if (now_monotonic - runner.last_place_monotonic[side]) < SAME_SIDE_ORDER_COOLDOWN_SEC:
-        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="same_side_cooldown")
-        return
-    _log_tag(
-        "CANDIDATE",
-        slug=runner.contract.slug,
-        side=side,
-        bid="-" if book.bid is None else f"{book.bid:.2f}",
-        ask="-" if book.ask is None else f"{book.ask:.2f}",
-        mid="-" if book.mid is None else f"{book.mid:.2f}",
-        candidate="-" if book.candidate_buy is None else f"{book.candidate_buy:.2f}",
-        maker_edge="-" if book.maker_edge is None else f"{book.maker_edge:.3f}",
-    )
-    price = book.candidate_buy
-    if price is None:
-        _log_tag("SKIP NO EDGE", slug=runner.contract.slug, side=side, reason="invalid_book_price")
-        return
-    maker_edge = book.maker_edge
-    if maker_edge is None or maker_edge < MIN_MAKER_EDGE:
-        _log_tag(
-            "SKIP NO EDGE",
-            slug=runner.contract.slug,
-            side=side,
-            maker_edge="-" if maker_edge is None else f"{maker_edge:.3f}",
-            min_required=f"{MIN_MAKER_EDGE:.3f}",
-        )
-        return
-    cache_key = f"{side}:{price:.2f}"
-    if cache_key in runner.sent_order_cache:
-        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="duplicate_cooldown", price=f"{price:.2f}")
-        return
-    side_pending_shares = sum(max(0.0, order.remaining_size) for order in runner.open_orders.get(side, []))
-    side_total_shares_if_placed = float(runner.filled_shares.get(side, 0.0)) + side_pending_shares + BASE_ORDER_SHARES
-    if side_total_shares_if_placed > _max_side_shares():
-        _log_tag(
-            "SKIP BUY",
-            slug=runner.contract.slug,
-            side=side,
-            reason="max_pairs_per_side",
-            max_side_shares=f"{_max_side_shares():.2f}",
-        )
-        return
-    side_exposure_if_placed = runner.side_exposure(side) + (BASE_ORDER_SHARES * price)
-    total_exposure_if_placed = runner.total_exposure() + (BASE_ORDER_SHARES * price)
-    if side_exposure_if_placed > MAX_ONE_SIDE_EXPOSURE:
-        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="max_one_side_exposure")
-        return
-    if total_exposure_if_placed > MAX_TOTAL_EXPOSURE_PER_WINDOW:
-        _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="max_total_exposure")
-        return
-    token = runner.contract.up if side == "UP" else runner.contract.down
-    if _place_limit_buy(runner, clob=clob, token=token, side=side, price=price):
-        _log_tag(
-            "POST ONLY BUY",
-            slug=runner.contract.slug,
-            side=side,
-            price=f"{price:.2f}",
-            shares=f"{BASE_ORDER_SHARES:.2f}",
-            edge=f"{maker_edge:.3f}",
-        )
-
-
-def _maybe_replace_stale_order(
-    runner: WindowRunner,
-    *,
-    clob: KngtopClob | None,
-    side: str,
-    book: BookSnapshot,
-    now_monotonic: float,
-) -> None:
-    rows = runner.open_orders.get(side, [])
-    if len(rows) != 1:
-        return
-    order = rows[0]
-    target_price = book.candidate_buy
-    if target_price is None:
-        return
-    if book.maker_edge is None or book.maker_edge < MIN_MAKER_EDGE:
-        return
-    if abs(float(order.price) - float(target_price)) < PRICE_STEP:
-        return
-    if order.age_sec(now_monotonic) < CANCEL_REPLACE_COOLDOWN_SEC:
-        return
-    if (now_monotonic - runner.last_cancel_monotonic[side]) < CANCEL_REPLACE_COOLDOWN_SEC:
-        return
-    _cancel_order(runner, clob=clob, order=order, reason=f"stale_price->{target_price:.2f}")
 
 
 def _finalize_runner_window(
@@ -851,19 +811,6 @@ def _tick_runner(
             down_shares=f"{runner.filled_shares['DOWN']:.2f}",
             imbalance=f"{imbalance:.2f}",
         )
-        avg_sum = _avg_sum(runner)
-        balanced_pairs = runner.balanced_pair_count()
-        is_balanced = balanced_pairs > 0 and abs(imbalance) < 1e-9
-        if is_balanced:
-            gross_pair_result = _expected_pair_pnl(avg_sum) if avg_sum is not None else None
-            _log_tag(
-                "BALANCED POSITION",
-                slug=runner.contract.slug,
-                up_avg="-" if runner.avg_price("UP") is None else f"{runner.avg_price('UP'):.4f}",
-                down_avg="-" if runner.avg_price("DOWN") is None else f"{runner.avg_price('DOWN'):.4f}",
-                gross_pair_result="-" if gross_pair_result is None else f"{gross_pair_result:.4f}",
-                note="not_true_arbitrage",
-            )
         if remaining <= MIN_REMAINING_SEC:
             _log_tag("LATE WINDOW", slug=runner.contract.slug, remaining_sec=f"{remaining:.1f}")
             _cancel_all_buys(runner, clob=clob, reason="late_window", now_monotonic=now_monotonic)
@@ -872,113 +819,93 @@ def _tick_runner(
             _log_tag("LATE WINDOW", slug=runner.contract.slug, elapsed_sec=f"{elapsed:.1f}", reason="cancel_all_buys")
             _cancel_all_buys(runner, clob=clob, reason="late_window_cancel_all", now_monotonic=now_monotonic)
             return
-        if is_balanced and avg_sum is not None:
-            gross_pair_result = _expected_pair_pnl(avg_sum)
-            if gross_pair_result > 0:
-                _log_tag(
-                    "POSITIVE GROSS LOCK",
-                    slug=runner.contract.slug,
-                    up_avg=f"{runner.avg_price('UP'):.4f}",
-                    down_avg=f"{runner.avg_price('DOWN'):.4f}",
-                    gross_pair_result=f"{gross_pair_result:.4f}",
-                    action="stop_window",
-                )
-                _mark_window_done(runner, reason="positive_gross_lock")
-            elif balanced_pairs >= MAX_PAIRS_PER_SIDE:
-                _mark_window_done(runner, reason="max_pairs_reached")
-            elif balanced_pairs == 1:
-                second_pair_ok = (
-                    remaining > SECOND_PAIR_MIN_REMAINING_SEC
-                    and _book_beats_realized_avg(runner.avg_price("UP"), up_book)
-                    and _book_beats_realized_avg(runner.avg_price("DOWN"), down_book)
-                    and up_book.maker_edge is not None
-                    and up_book.maker_edge >= STRONG_MAKER_EDGE
-                    and down_book.maker_edge is not None
-                    and down_book.maker_edge >= STRONG_MAKER_EDGE
-                )
-                if second_pair_ok:
-                    runner.second_pair_gate_state = "allowed"
-                    _log_tag(
-                        "SECOND PAIR ALLOWED",
-                        slug=runner.contract.slug,
-                        up_avg=f"{runner.avg_price('UP'):.4f}",
-                        down_avg=f"{runner.avg_price('DOWN'):.4f}",
-                        up_mid=f"{up_book.mid:.4f}",
-                        down_mid=f"{down_book.mid:.4f}",
-                        up_edge=f"{up_book.maker_edge:.3f}",
-                        down_edge=f"{down_book.maker_edge:.3f}",
-                        action="ALLOW_REARM",
-                    )
-                else:
-                    runner.second_pair_gate_state = "blocked"
-                    _log_tag(
-                        "SECOND PAIR BLOCKED",
-                        slug=runner.contract.slug,
-                        up_avg="-" if runner.avg_price("UP") is None else f"{runner.avg_price('UP'):.4f}",
-                        down_avg="-" if runner.avg_price("DOWN") is None else f"{runner.avg_price('DOWN'):.4f}",
-                        up_mid="-" if up_book.mid is None else f"{up_book.mid:.4f}",
-                        down_mid="-" if down_book.mid is None else f"{down_book.mid:.4f}",
-                        up_edge="-" if up_book.maker_edge is None else f"{up_book.maker_edge:.3f}",
-                        down_edge="-" if down_book.maker_edge is None else f"{down_book.maker_edge:.3f}",
-                        remaining_sec=f"{remaining:.1f}",
-                        reason="second_pair_rules_failed",
-                    )
-                    _mark_window_done(runner, reason="second_pair_blocked")
         if runner.stopped:
             _cancel_all_buys(runner, clob=clob, reason=runner.stop_reason or "window_stop", now_monotonic=now_monotonic)
             return
         if elapsed >= STOP_NEW_BUYS_ELAPSED_SEC:
             _log_tag("LATE WINDOW", slug=runner.contract.slug, elapsed_sec=f"{elapsed:.1f}", reason="no_new_buys")
             return
-        allowed_sides = set(_desired_sides(imbalance))
-        if abs(imbalance) > MAX_IMBALANCE_SHARES:
-            _log_tag("IMBALANCE", slug=runner.contract.slug, status="over_limit", max_allowed=f"{MAX_IMBALANCE_SHARES:.2f}")
         for side in ("UP", "DOWN"):
-            keep = 1 if side in allowed_sides else 0
-            reason = "forbidden_side" if keep == 0 else "extra_orders"
-            _maybe_cancel_orders(
-                runner,
-                clob=clob,
-                side=side,
-                keep=keep,
-                reason=reason,
-                now_monotonic=now_monotonic,
-            )
-        if runner.open_order_count() > MAX_OPEN_BUY_ORDERS:
-            for side in ("UP", "DOWN"):
-                _maybe_cancel_orders(
-                    runner,
-                    clob=clob,
-                    side=side,
-                    keep=0 if side not in allowed_sides else 1,
-                    reason="max_open_orders",
-                    now_monotonic=now_monotonic,
-                )
+            for order in list(runner.open_orders.get(side, [])):
+                if order.age_sec(now_monotonic) >= cfg.pair_order_expiry_sec:
+                    _cancel_order(runner, clob=clob, order=order, reason="pair_expiry")
+                    return
+
+        signal_side = _spike_signal_side(runner=runner, binance=binance, cfg=cfg)
+        if signal_side is None:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="no_spike_signal")
             return
-        if balanced_pairs >= 1 and runner.second_pair_gate_state != "allowed":
-            allowed_sides.clear()
-        for side in tuple(allowed_sides):
-            _maybe_replace_stale_order(
-                runner,
-                clob=clob,
-                side=side,
-                book=up_book if side == "UP" else down_book,
-                now_monotonic=now_monotonic,
-            )
-        for side in ("UP", "DOWN"):
-            if side not in allowed_sides:
-                continue
-            if runner.open_order_count(side) > 0:
-                continue
-            if abs(imbalance) > MAX_IMBALANCE_SHARES and side not in _desired_sides(imbalance):
-                _log_tag("SKIP BUY", slug=runner.contract.slug, side=side, reason="imbalance_guard")
-                continue
-            _maybe_place_side(
-                runner,
-                clob=clob,
-                side=side,
-                book=up_book if side == "UP" else down_book,
-                now_monotonic=now_monotonic,
+        if (now_monotonic - runner.last_signal_monotonic) < cfg.pair_cooldown_sec:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="pair_cooldown")
+            return
+        if runner.open_order_count() > 0:
+            side_order = runner.open_orders.get("UP", []) + runner.open_orders.get("DOWN", [])
+            oldest = min(side_order, key=lambda order: order.first_seen_monotonic)
+            _cancel_order(runner, clob=clob, order=oldest, reason="new_signal_replace")
+            return
+
+        prices = _pair_order_prices(
+            trigger_side=signal_side,
+            up_book=up_book,
+            down_book=down_book,
+            opposite_side_discount=cfg.opposite_side_discount,
+        )
+        if prices is None:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="invalid_pair_prices")
+            return
+        up_price, down_price = prices
+        up_shares, down_shares = _pair_order_sizes(runner)
+        if _pair_projected_avg_sum(
+            runner,
+            up_price=up_price,
+            up_shares=up_shares,
+            down_price=down_price,
+            down_shares=down_shares,
+        ) > cfg.repair_avg_sum_cap + 1e-12:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="pair_avg_sum_cap")
+            return
+        if runner.total_exposure() + (up_price * up_shares) + (down_price * down_shares) > MAX_TOTAL_EXPOSURE_PER_WINDOW + 1e-12:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, reason="max_total_exposure")
+            return
+        if runner.side_exposure("UP") + (up_price * up_shares) > MAX_ONE_SIDE_EXPOSURE + 1e-12:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, side="UP", reason="max_one_side_exposure")
+            return
+        if runner.side_exposure("DOWN") + (down_price * down_shares) > MAX_ONE_SIDE_EXPOSURE + 1e-12:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, side="DOWN", reason="max_one_side_exposure")
+            return
+        if float(runner.filled_shares["UP"]) + _open_order_shares(runner, "UP") + up_shares > _max_side_shares() + 1e-12:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, side="UP", reason="max_side_shares")
+            return
+        if float(runner.filled_shares["DOWN"]) + _open_order_shares(runner, "DOWN") + down_shares > _max_side_shares() + 1e-12:
+            _log_tag("SKIP BUY", slug=runner.contract.slug, side="DOWN", reason="max_side_shares")
+            return
+
+        sent_up = _place_limit_buy(
+            runner,
+            clob=clob,
+            token=runner.contract.up,
+            side="UP",
+            price=up_price,
+            shares=up_shares,
+        )
+        sent_down = _place_limit_buy(
+            runner,
+            clob=clob,
+            token=runner.contract.down,
+            side="DOWN",
+            price=down_price,
+            shares=down_shares,
+        )
+        if sent_up or sent_down:
+            runner.last_signal_monotonic = now_monotonic
+            _log_tag(
+                "PAIR STAGED",
+                slug=runner.contract.slug,
+                signal_side=signal_side,
+                up_price=f"{up_price:.2f}",
+                down_price=f"{down_price:.2f}",
+                up_shares=f"{up_shares:.2f}",
+                down_shares=f"{down_shares:.2f}",
             )
 
 
@@ -1148,6 +1075,17 @@ def main() -> None:
         state="boot",
         pair=TRADE_PAIR_KEY,
         window_minutes=str(TRADE_WINDOW_MINUTES),
+        strategy="disc06_exp30_cap95_b15",
+        base_order_shares=f"{BASE_ORDER_SHARES:.0f}",
+        boost_order_shares=f"{BOOST_ORDER_SHARES:.0f}",
+        max_shares_per_side=f"{cfg.max_shares_per_side:.0f}",
+        max_total_exposure=f"{MAX_TOTAL_EXPOSURE_PER_WINDOW:.2f}",
+        avg_sum_cap=f"{cfg.repair_avg_sum_cap:.2f}",
+        spike_move_usd=f"{cfg.spike_move_threshold_usd:.2f}",
+        spike_volume_ratio=f"{cfg.spike_volume_ratio_min:.2f}",
+        pair_cooldown_sec=f"{cfg.pair_cooldown_sec:.1f}",
+        pair_expiry_sec=f"{cfg.pair_order_expiry_sec:.1f}",
+        opposite_discount=f"{cfg.opposite_side_discount:.2f}",
         heartbeat_sec=str(cfg.poll_interval_sec),
         ws_rest_poll=str(cfg.ws_rest_poll_enabled).lower(),
     )

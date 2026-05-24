@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# KNGTOP - Docker image for the BTC 5m two-sided limit-order live bot.
+# KNGTOP - Docker image for the BTC 5m Binance-spike paired resting-limit live bot.
 FROM python:3.12-slim-bookworm
 
 WORKDIR /app

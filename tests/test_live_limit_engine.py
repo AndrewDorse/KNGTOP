@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import patch
 
 import pytest
 
@@ -17,8 +16,8 @@ from kngtop.live_limit_engine import (
     WindowRunner,
     _c_target_prices,
     _execute_decision,
-    _tick_runner,
 )
+from kngtop.live_limit_replay import DOWN_TOKEN_ID, UP_TOKEN_ID, ReplayClob, ReplayPoly, open_order_row, run_live_engine_tick
 
 
 START = 1_700_000_000
@@ -62,8 +61,8 @@ def _runner(start: int = START, *, positions: PositionState | None = None) -> Wi
             slug=f"btc-updown-5m-{start}",
             question="",
             end_time=datetime.fromtimestamp(start + 300, timezone.utc),
-            up=TokenMarket(token_id="up-token", outcome="UP", minimum_tick_size="0.01", neg_risk=False),
-            down=TokenMarket(token_id="down-token", outcome="DOWN", minimum_tick_size="0.01", neg_risk=False),
+            up=TokenMarket(token_id=UP_TOKEN_ID, outcome="UP", minimum_tick_size="0.01", neg_risk=False),
+            down=TokenMarket(token_id=DOWN_TOKEN_ID, outcome="DOWN", minimum_tick_size="0.01", neg_risk=False),
         ),
         window_minutes=5,
         window_open_px=100_000.0,
@@ -71,65 +70,12 @@ def _runner(start: int = START, *, positions: PositionState | None = None) -> Wi
     )
 
 
-class _FakePoly:
-    def __init__(self, *, up: float, down: float) -> None:
-        self.up = up
-        self.down = down
-
-    def best_bid_ask_for(self, asset_id: str, max_age_sec: float = 5.0):  # noqa: ANN201
-        del max_age_sec
-        ask = self.up if asset_id == "up-token" else self.down
-        return max(0.01, ask - 0.01), ask
-
-
-class _FakeClob:
-    def __init__(self) -> None:
-        self.open_orders: list[dict[str, object]] = []
-        self.recent_trades: dict[str, list[dict[str, object]]] = {"up-token": [], "down-token": []}
-        self.limit_calls: list[tuple[str, float, float]] = []
-        self.cancelled: list[str] = []
-        self.fail_next_place = False
-        self._next_id = 1
-
-    def limit_buy_shares(self, token: TokenMarket, *, price: float, shares: float, post_only: bool = True):  # noqa: ANN201
-        assert post_only is True
-        self.limit_calls.append((token.token_id, price, shares))
-        if self.fail_next_place:
-            self.fail_next_place = False
-            raise TimeoutError("place timeout")
-        order_id = f"ord-{self._next_id}"
-        self._next_id += 1
-        self.open_orders.append(
-            {
-                "id": order_id,
-                "asset_id": token.token_id,
-                "side": "BUY",
-                "price": price,
-                "original_size": shares,
-                "size_left": shares,
-            }
-        )
-        return {"ok": True, "orderID": order_id}
-
-    def cancel_order_by_id(self, order_id: str):  # noqa: ANN201
-        self.cancelled.append(order_id)
-        self.open_orders = [row for row in self.open_orders if str(row.get("id")) != str(order_id)]
-        return {"ok": True}
-
-    def get_open_orders(self) -> list[dict[str, object]]:
-        return [dict(row) for row in self.open_orders]
-
-    def get_recent_trades(self, token: TokenMarket, *, after_ts: int) -> list[dict[str, object]]:
-        del after_ts
-        return [dict(row) for row in self.recent_trades.get(token.token_id, [])]
-
-
 def _positions_row(*, outcome: str, token_id: str, size: float, avg_price: float) -> dict[str, object]:
     return {"slug": f"btc-updown-5m-{START}", "outcome": outcome, "asset": token_id, "size": size, "avgPrice": avg_price}
 
 
 def _open_order(*, order_id: str, token_id: str, price: float, size_left: float = 5.0) -> dict[str, object]:
-    return {"id": order_id, "asset_id": token_id, "side": "BUY", "price": price, "original_size": 5.0, "size_left": size_left}
+    return open_order_row(order_id=order_id, token_id=token_id, price=price, size_left=size_left)
 
 
 def _tick(
@@ -138,23 +84,22 @@ def _tick(
     elapsed: float,
     up: float = 0.47,
     down: float = 0.47,
-    clob: _FakeClob | None = None,
+    clob: ReplayClob | None = None,
     positions: list[dict[str, object]] | None = None,
     runtime_extra: dict[str, object] | None = None,
-) -> _FakeClob:
-    fake_clob = clob or _FakeClob()
+) -> ReplayClob:
+    fake_clob = clob or ReplayClob()
     runtime_state: dict[str, object] = {"reconcile_positions": positions or [], "reconcile_open_orders": fake_clob.get_open_orders()}
     if runtime_extra:
         runtime_state.update(runtime_extra)
-    with patch("kngtop.live_limit_engine.datetime") as fake_dt:
-        fake_dt.now.return_value = datetime.fromtimestamp(START + elapsed, timezone.utc)
-        _tick_runner(
-            runner,
-            poly=_FakePoly(up=up, down=down),
-            clob=fake_clob,
-            cfg=_cfg(),
-            runtime_state=runtime_state,
-        )
+    run_live_engine_tick(
+        runner,
+        poly=ReplayPoly(up=up, down=down),
+        clob=fake_clob,
+        cfg=_cfg(),
+        elapsed=elapsed,
+        runtime_state=runtime_state,
+    )
     return fake_clob
 
 
@@ -180,8 +125,8 @@ def test_initial_gate_sends_exactly_up_and_down_batch() -> None:
     clob = _tick(runner, elapsed=-10)
 
     assert clob.limit_calls == [
-        ("up-token", pytest.approx(INITIAL_PRICE), pytest.approx(ORDER_SIZE_SHARES)),
-        ("down-token", pytest.approx(INITIAL_PRICE), pytest.approx(ORDER_SIZE_SHARES)),
+        (UP_TOKEN_ID, pytest.approx(INITIAL_PRICE), pytest.approx(ORDER_SIZE_SHARES)),
+        (DOWN_TOKEN_ID, pytest.approx(INITIAL_PRICE), pytest.approx(ORDER_SIZE_SHARES)),
     ]
     assert runner.initial_batch_sent is True
     assert len(runner.local_pending_orders_by_side["UP"]) == 1
@@ -198,9 +143,9 @@ def test_initial_gate_missed_does_not_enter_midwindow_at_market_prices() -> None
 
 def test_up_initial_fills_down_initial_remains_open_no_duplicates() -> None:
     runner = _runner()
-    clob = _FakeClob()
-    clob.open_orders = [_open_order(order_id="manual-down", token_id="down-token", price=INITIAL_PRICE)]
-    positions = [_positions_row(outcome="UP", token_id="up-token", size=5.0, avg_price=INITIAL_PRICE)]
+    clob = ReplayClob()
+    clob.open_orders = [_open_order(order_id="manual-down", token_id=DOWN_TOKEN_ID, price=INITIAL_PRICE)]
+    positions = [_positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=INITIAL_PRICE)]
 
     _tick(runner, elapsed=5, clob=clob, positions=positions)
 
@@ -210,22 +155,22 @@ def test_up_initial_fills_down_initial_remains_open_no_duplicates() -> None:
 
 def test_up_fills_down_order_missing_creates_one_down_capped_at_70c() -> None:
     runner = _runner()
-    positions = [_positions_row(outcome="UP", token_id="up-token", size=5.0, avg_price=0.47)]
+    positions = [_positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=0.47)]
 
     clob = _tick(runner, elapsed=5, up=0.80, down=0.91, positions=positions)
 
     assert len(clob.limit_calls) == 1
     token_id, price, shares = clob.limit_calls[0]
-    assert token_id == "down-token"
+    assert token_id == DOWN_TOKEN_ID
     assert price <= MAX_HEDGE_PRICE
     assert shares == pytest.approx(ORDER_SIZE_SHARES)
 
 
 def test_manual_down_order_covers_imbalance_without_duplicate_or_cancel() -> None:
     runner = _runner()
-    clob = _FakeClob()
-    clob.open_orders = [_open_order(order_id="manual-down", token_id="down-token", price=0.25)]
-    positions = [_positions_row(outcome="UP", token_id="up-token", size=5.0, avg_price=0.47)]
+    clob = ReplayClob()
+    clob.open_orders = [_open_order(order_id="manual-down", token_id=DOWN_TOKEN_ID, price=0.25)]
+    positions = [_positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=0.47)]
 
     _tick(runner, elapsed=5, clob=clob, positions=positions)
 
@@ -236,21 +181,21 @@ def test_manual_down_order_covers_imbalance_without_duplicate_or_cancel() -> Non
 def test_balanced_next_pair_only_when_avg_sum_after_buy_is_safe() -> None:
     runner = _runner()
     positions = [
-        _positions_row(outcome="UP", token_id="up-token", size=5.0, avg_price=0.40),
-        _positions_row(outcome="DOWN", token_id="down-token", size=5.0, avg_price=0.40),
+        _positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=0.40),
+        _positions_row(outcome="DOWN", token_id=DOWN_TOKEN_ID, size=5.0, avg_price=0.40),
     ]
 
     clob = _tick(runner, elapsed=5, up=0.46, down=0.46, positions=positions)
 
     assert clob.limit_calls == [
-        ("up-token", pytest.approx(0.38), pytest.approx(ORDER_SIZE_SHARES)),
-        ("down-token", pytest.approx(0.38), pytest.approx(ORDER_SIZE_SHARES)),
+        (UP_TOKEN_ID, pytest.approx(0.38), pytest.approx(ORDER_SIZE_SHARES)),
+        (DOWN_TOKEN_ID, pytest.approx(0.38), pytest.approx(ORDER_SIZE_SHARES)),
     ]
 
     blocked = _runner()
     blocked_positions = [
-        _positions_row(outcome="UP", token_id="up-token", size=5.0, avg_price=0.90),
-        _positions_row(outcome="DOWN", token_id="down-token", size=5.0, avg_price=0.90),
+        _positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=0.90),
+        _positions_row(outcome="DOWN", token_id=DOWN_TOKEN_ID, size=5.0, avg_price=0.90),
     ]
     blocked_clob = _tick(blocked, elapsed=5, up=0.60, down=0.60, positions=blocked_positions)
 
@@ -260,19 +205,19 @@ def test_balanced_next_pair_only_when_avg_sum_after_buy_is_safe() -> None:
 def test_imbalanced_up10_down5_allows_only_down_order() -> None:
     runner = _runner()
     positions = [
-        _positions_row(outcome="UP", token_id="up-token", size=10.0, avg_price=0.47),
-        _positions_row(outcome="DOWN", token_id="down-token", size=5.0, avg_price=0.47),
+        _positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=10.0, avg_price=0.47),
+        _positions_row(outcome="DOWN", token_id=DOWN_TOKEN_ID, size=5.0, avg_price=0.47),
     ]
 
     clob = _tick(runner, elapsed=5, up=0.20, down=0.45, positions=positions)
 
-    assert clob.limit_calls == [("down-token", pytest.approx(0.45), pytest.approx(ORDER_SIZE_SHARES))]
+    assert clob.limit_calls == [(DOWN_TOKEN_ID, pytest.approx(0.45), pytest.approx(ORDER_SIZE_SHARES))]
 
 
 def test_empty_open_orders_delay_with_local_pending_sends_nothing() -> None:
     runner = _runner()
     _tick(runner, elapsed=-10)
-    clob = _FakeClob()
+    clob = ReplayClob()
 
     _tick(runner, elapsed=-9, clob=clob, runtime_extra={"reconcile_open_orders": []})
 
@@ -281,12 +226,12 @@ def test_empty_open_orders_delay_with_local_pending_sends_nothing() -> None:
 
 def test_place_timeout_marks_unknown_and_blocks_duplicate_until_reconciled() -> None:
     runner = _runner()
-    clob = _FakeClob()
+    clob = ReplayClob()
     clob.fail_next_place = True
-    positions = [_positions_row(outcome="UP", token_id="up-token", size=5.0, avg_price=0.47)]
+    positions = [_positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=0.47)]
 
     _tick(runner, elapsed=5, clob=clob, positions=positions)
-    assert clob.limit_calls == [("down-token", pytest.approx(0.47), pytest.approx(ORDER_SIZE_SHARES))]
+    assert clob.limit_calls == [(DOWN_TOKEN_ID, pytest.approx(0.47), pytest.approx(ORDER_SIZE_SHARES))]
     assert runner.local_pending_orders_by_side["DOWN"][0].status == "UNKNOWN"
 
     _tick(runner, elapsed=6.1, clob=clob, positions=positions)
@@ -296,14 +241,14 @@ def test_place_timeout_marks_unknown_and_blocks_duplicate_until_reconciled() -> 
 
 def test_cancel_replacement_waits_for_confirmed_cancel_before_next_place() -> None:
     runner = _runner()
-    clob = _FakeClob()
-    bot_order = _open_order(order_id="bot-up", token_id="up-token", price=0.47)
+    clob = ReplayClob()
+    bot_order = _open_order(order_id="bot-up", token_id=UP_TOKEN_ID, price=0.47)
     clob.open_orders = [bot_order]
     runner.local_pending_orders_by_side["UP"].append(
         LocalPendingOrder(
             client_order_id="kngtop-c47-test-up",
             side="UP",
-            token_id="up-token",
+            token_id=UP_TOKEN_ID,
             price=0.47,
             shares=5.0,
             sent_at=START - 10,
@@ -312,23 +257,28 @@ def test_cancel_replacement_waits_for_confirmed_cancel_before_next_place() -> No
             status="OPEN_CONFIRMED",
         )
     )
-    positions = [_positions_row(outcome="UP", token_id="up-token", size=5.0, avg_price=0.47)]
+    positions = [_positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=0.47)]
 
     _tick(runner, elapsed=5, clob=clob, positions=positions)
+
+    assert clob.cancelled == []
+    assert clob.limit_calls == []
+
+    _tick(runner, elapsed=7.1, clob=clob, positions=positions)
 
     assert clob.cancelled == ["bot-up"]
     assert clob.limit_calls == []
 
-    _tick(runner, elapsed=6.1, clob=clob, positions=positions)
+    _tick(runner, elapsed=8.2, clob=clob, positions=positions)
 
-    assert clob.limit_calls == [("down-token", pytest.approx(0.47), pytest.approx(ORDER_SIZE_SHARES))]
+    assert clob.limit_calls == [(DOWN_TOKEN_ID, pytest.approx(0.47), pytest.approx(ORDER_SIZE_SHARES))]
 
 
 def test_cheap_useful_smaller_side_order_is_not_cancelled_or_replaced() -> None:
     runner = _runner()
-    clob = _FakeClob()
-    clob.open_orders = [_open_order(order_id="cheap-down", token_id="down-token", price=0.25)]
-    positions = [_positions_row(outcome="UP", token_id="up-token", size=5.0, avg_price=0.47)]
+    clob = ReplayClob()
+    clob.open_orders = [_open_order(order_id="cheap-down", token_id=DOWN_TOKEN_ID, price=0.25)]
+    positions = [_positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=0.47)]
 
     _tick(runner, elapsed=5, clob=clob, positions=positions)
 
@@ -338,11 +288,11 @@ def test_cheap_useful_smaller_side_order_is_not_cancelled_or_replaced() -> None:
 
 def test_partial_fill_updates_shares_remaining_order_counts_live_no_duplicate() -> None:
     runner = _runner()
-    clob = _FakeClob()
-    clob.open_orders = [_open_order(order_id="partial-down", token_id="down-token", price=0.47, size_left=2.0)]
+    clob = ReplayClob()
+    clob.open_orders = [_open_order(order_id="partial-down", token_id=DOWN_TOKEN_ID, price=0.47, size_left=2.0)]
     positions = [
-        _positions_row(outcome="UP", token_id="up-token", size=5.0, avg_price=0.47),
-        _positions_row(outcome="DOWN", token_id="down-token", size=3.0, avg_price=0.47),
+        _positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=0.47),
+        _positions_row(outcome="DOWN", token_id=DOWN_TOKEN_ID, size=3.0, avg_price=0.47),
     ]
 
     _tick(runner, elapsed=5, clob=clob, positions=positions)
@@ -355,8 +305,8 @@ def test_partial_fill_updates_shares_remaining_order_counts_live_no_duplicate() 
 def test_max_shares_reached_sends_no_more_orders() -> None:
     runner = _runner()
     positions = [
-        _positions_row(outcome="UP", token_id="up-token", size=15.0, avg_price=0.47),
-        _positions_row(outcome="DOWN", token_id="down-token", size=15.0, avg_price=0.47),
+        _positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=15.0, avg_price=0.47),
+        _positions_row(outcome="DOWN", token_id=DOWN_TOKEN_ID, size=15.0, avg_price=0.47),
     ]
 
     clob = _tick(runner, elapsed=5, positions=positions)
@@ -366,13 +316,13 @@ def test_max_shares_reached_sends_no_more_orders() -> None:
 
 def test_imbalanced_larger_side_bot_order_cancel_is_one_action_only() -> None:
     runner = _runner()
-    clob = _FakeClob()
-    clob.open_orders = [_open_order(order_id="bot-up", token_id="up-token", price=0.47)]
+    clob = ReplayClob()
+    clob.open_orders = [_open_order(order_id="bot-up", token_id=UP_TOKEN_ID, price=0.47)]
     runner.local_pending_orders_by_side["UP"].append(
         LocalPendingOrder(
             client_order_id="kngtop-c47-test-up",
             side="UP",
-            token_id="up-token",
+            token_id=UP_TOKEN_ID,
             price=0.47,
             shares=5.0,
             sent_at=START - 10,
@@ -381,9 +331,14 @@ def test_imbalanced_larger_side_bot_order_cancel_is_one_action_only() -> None:
             status="OPEN_CONFIRMED",
         )
     )
-    positions = [_positions_row(outcome="UP", token_id="up-token", size=5.0, avg_price=0.47)]
+    positions = [_positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=0.47)]
 
     _tick(runner, elapsed=5, clob=clob, positions=positions)
+
+    assert clob.cancelled == []
+    assert clob.limit_calls == []
+
+    _tick(runner, elapsed=7.1, clob=clob, positions=positions)
 
     assert clob.cancelled == ["bot-up"]
     assert clob.limit_calls == []
@@ -391,9 +346,9 @@ def test_imbalanced_larger_side_bot_order_cancel_is_one_action_only() -> None:
 
 def test_manual_larger_side_order_is_not_cancelled_and_blocks_larger_side_creation() -> None:
     runner = _runner()
-    clob = _FakeClob()
-    clob.open_orders = [_open_order(order_id="manual-up", token_id="up-token", price=0.47)]
-    positions = [_positions_row(outcome="DOWN", token_id="down-token", size=5.0, avg_price=0.47)]
+    clob = ReplayClob()
+    clob.open_orders = [_open_order(order_id="manual-up", token_id=UP_TOKEN_ID, price=0.47)]
+    positions = [_positions_row(outcome="DOWN", token_id=DOWN_TOKEN_ID, size=5.0, avg_price=0.47)]
 
     _tick(runner, elapsed=5, clob=clob, positions=positions)
 
@@ -401,20 +356,75 @@ def test_manual_larger_side_order_is_not_cancelled_and_blocks_larger_side_creati
     assert clob.limit_calls == []
 
 
+def test_balanced_with_one_live_down_order_repairs_by_placing_up_only() -> None:
+    runner = _runner()
+    clob = ReplayClob()
+    clob.open_orders = [_open_order(order_id="down-live", token_id=DOWN_TOKEN_ID, price=0.37)]
+    positions = [
+        _positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=0.47),
+        _positions_row(outcome="DOWN", token_id=DOWN_TOKEN_ID, size=5.0, avg_price=0.47),
+    ]
+
+    _tick(runner, elapsed=5, clob=clob, up=0.27, down=0.74, positions=positions)
+
+    assert clob.limit_calls == []
+    assert clob.cancelled == []
+
+    _tick(runner, elapsed=7.1, clob=clob, up=0.27, down=0.74, positions=positions)
+
+    assert clob.limit_calls == [(UP_TOKEN_ID, pytest.approx(0.27), pytest.approx(ORDER_SIZE_SHARES))]
+    assert clob.cancelled == []
+
+
+def test_duplicate_bot_orders_self_fix_after_repeated_confirmation() -> None:
+    runner = _runner()
+    clob = ReplayClob()
+    clob.open_orders = [
+        _open_order(order_id="bot-down-high", token_id=DOWN_TOKEN_ID, price=0.47),
+        _open_order(order_id="bot-down-low", token_id=DOWN_TOKEN_ID, price=0.37),
+    ]
+    for order_id, price in (("bot-down-high", 0.47), ("bot-down-low", 0.37)):
+        runner.local_pending_orders_by_side["DOWN"].append(
+            LocalPendingOrder(
+                client_order_id=f"kngtop-c47-test-{order_id}",
+                side="DOWN",
+                token_id=DOWN_TOKEN_ID,
+                price=price,
+                shares=5.0,
+                sent_at=START - 10,
+                exchange_order_id=order_id,
+                resolved=True,
+                status="OPEN_CONFIRMED",
+            )
+        )
+    positions = [
+        _positions_row(outcome="UP", token_id=UP_TOKEN_ID, size=5.0, avg_price=0.47),
+        _positions_row(outcome="DOWN", token_id=DOWN_TOKEN_ID, size=5.0, avg_price=0.47),
+    ]
+
+    _tick(runner, elapsed=5, clob=clob, positions=positions)
+    assert clob.cancelled == []
+
+    _tick(runner, elapsed=7.1, clob=clob, positions=positions)
+
+    assert clob.cancelled == ["bot-down-high"]
+    assert clob.limit_calls == []
+
+
 def test_trade_history_counts_resting_fill_even_when_side_field_is_sell() -> None:
     runner = _runner()
-    clob = _FakeClob()
-    clob.recent_trades["down-token"] = [{"side": "SELL", "price": 0.47, "size": 5.0, "id": "down-fill"}]
+    clob = ReplayClob()
+    clob.recent_trades[DOWN_TOKEN_ID] = [{"side": "SELL", "price": 0.47, "size": 5.0, "id": "down-fill"}]
 
     _tick(runner, elapsed=5, clob=clob, up=0.45, down=0.39, positions=[])
 
     assert runner.positions.shares_down == pytest.approx(5.0)
-    assert clob.limit_calls == [("up-token", pytest.approx(0.45), pytest.approx(ORDER_SIZE_SHARES))]
+    assert clob.limit_calls == [(UP_TOKEN_ID, pytest.approx(0.45), pytest.approx(ORDER_SIZE_SHARES))]
 
 
 def test_execution_boundary_blocks_order_on_already_larger_effective_side() -> None:
     runner = _runner(positions=PositionState(spent_down=2.10, shares_down=5.0))
-    clob = _FakeClob()
+    clob = ReplayClob()
 
     sent = _execute_decision(
         runner,
