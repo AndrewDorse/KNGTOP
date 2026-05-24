@@ -1,25 +1,22 @@
-"""Clean BTC 5m two-sided limit-order engine.
+"""BTC 5m balance-first fixed-limit-order engine.
 
 Rule shape:
 - Trade fixed 5-share limit buys.
-- Use the C_weak_cap045_high_guard060 rules:
+- Use the C Strategy / Balanced Fixed 47c Strategy:
   - start with one UP and one DOWN limit buy at 0.47 during the prestart/opening gate;
-  - buy the missing hedge side up to 0.70;
-  - after both sides exist, repair only cheap/weak or guarded-improving buys;
-  - avg_sum_after_buy must stay <= 0.95.
-- Keep at most one buy order per side while that side has room.
-- Never keep two buy orders on the same side.
-- For buys, a lower resting limit is better; replace only orders that are too expensive.
+  - recover imbalance only on the smaller-share side;
+  - keep local pending orders and pending cancels as hard duplicate locks;
+  - cap hedge price at 0.70 and avg_sum_after_buy at 0.95.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from kngtop.binance_multi_ws import BinanceCombinedTradeFeed
 from kngtop.binance_rest import fetch_binance_window_open_px
@@ -40,6 +37,14 @@ PRESTART_SEC = 20
 OPENING_GRACE_SEC = 2
 INITIAL_PAIR_PRICE = 0.47
 ORDER_SHARES = 5.0
+ORDER_SIZE_SHARES = ORDER_SHARES
+MAX_SHARES_PER_SIDE = 15.0
+INITIAL_PRICE = INITIAL_PAIR_PRICE
+MAX_HEDGE_PRICE = 0.70
+MAX_AVG_SUM_AFTER_BUY = 0.95
+ACTION_COOLDOWN_SECONDS = 1.0
+UNKNOWN_ORDER_TIMEOUT_SECONDS = 7.0
+RECENT_SENT_CACHE_SECONDS = 10.0
 MAX_SPENT_PER_WINDOW = 20.0
 REPRICE_TOLERANCE = 0.005
 MIN_ORDER_USD = 1.05
@@ -49,8 +54,6 @@ C_MISSING_HEDGE_CAP = 0.70
 C_WEAK_CAP = 0.45
 C_HIGH_GUARD = 0.60
 C_BALANCE_EPSILON = 1e-9
-REPLACE_COOLDOWN_SEC = 2.0
-ACTION_COOLDOWN_SEC = 2.0
 TRADE_HISTORY_LOOKBACK_SEC = 600
 
 
@@ -94,15 +97,42 @@ class OpenOrder:
     side: str
     price: float
     remaining_shares: float
+    client_order_id: str | None = None
+    bot_owned: bool = False
 
 
 @dataclass(slots=True)
-class SentOrder:
-    order_id: str | None
+class LocalPendingOrder:
+    client_order_id: str
+    side: str
+    token_id: str
+    price: float
+    shares: float
+    sent_at: float
+    position_shares_at_send: float = 0.0
+    status: str = "SENT_LOCAL"
+    exchange_order_id: str | None = None
+    resolved: bool = False
+    observed_refreshes: int = 0
+
+
+@dataclass(slots=True)
+class LocalPendingCancel:
+    order_id: str
     side: str
     price: float
     shares: float
-    created_ts: float
+    sent_at: float
+    status: str = "SENT_LOCAL"
+    resolved: bool = False
+
+
+@dataclass(slots=True)
+class StrategyDecision:
+    action: str
+    reason: str
+    orders: list[tuple[str, float, float]] = field(default_factory=list)
+    cancel_order: OpenOrder | None = None
 
 
 @dataclass(slots=True)
@@ -114,17 +144,27 @@ class WindowRunner:
     window_open_px: float | None = None
     positions: PositionState = field(default_factory=PositionState)
     open_orders: dict[str, list[OpenOrder]] = field(default_factory=lambda: {"UP": [], "DOWN": []})
-    last_replace_ts: dict[str, float] = field(default_factory=lambda: {"UP": 0.0, "DOWN": 0.0})
-    sent_shares: dict[str, float] = field(default_factory=lambda: {"UP": 0.0, "DOWN": 0.0})
-    sent_cost: dict[str, float] = field(default_factory=lambda: {"UP": 0.0, "DOWN": 0.0})
-    sent_orders: list[SentOrder] = field(default_factory=list)
     trade_history_positions: PositionState = field(default_factory=PositionState)
     last_trade_history_fetch_ts: float = 0.0
-    last_action_ts: float = -1_000_000.0
+    local_pending_orders_by_side: dict[str, list[LocalPendingOrder]] = field(default_factory=lambda: {"UP": [], "DOWN": []})
+    local_pending_cancels_by_order_id: dict[str, LocalPendingCancel] = field(default_factory=dict)
+    fill_history_seen_ids: set[str] = field(default_factory=set)
+    initial_batch_sent: bool = False
+    initial_batch_resolved: bool = False
+    last_action_time: float = 0.0
+    action_lock_until: float = 0.0
+    recent_sent_cache: dict[str, float] = field(default_factory=dict)
+    last_reconcile_summary: dict[str, Any] = field(default_factory=dict)
     stop_reason: str | None = None
 
     def start_sec(self) -> int | None:
         return window_start_ts_from_slug(self.contract.slug)
+
+    def market_id(self) -> str:
+        return self.contract.slug
+
+    def condition_id(self) -> str:
+        return self.contract.slug
 
 
 def _setup_logging(level: str) -> None:
@@ -166,10 +206,89 @@ def _token_for_side(runner: WindowRunner, side: str) -> TokenMarket:
     return runner.contract.up if side == "UP" else runner.contract.down
 
 
+def _opposite_side(side: str) -> str:
+    return "DOWN" if side == "UP" else "UP"
+
+
+def _bot_client_order_id(runner: WindowRunner, side: str) -> str:
+    return f"kngtop-c47-{runner.contract.slug}-{side.lower()}-{uuid4().hex[:12]}"
+
+
+def _pending_orders(runner: WindowRunner, side: str | None = None, *, unresolved_only: bool = True) -> list[LocalPendingOrder]:
+    sides = ("UP", "DOWN") if side is None else (side,)
+    out: list[LocalPendingOrder] = []
+    for item_side in sides:
+        for order in runner.local_pending_orders_by_side.get(item_side, []):
+            if unresolved_only and order.resolved:
+                continue
+            out.append(order)
+    return out
+
+
+def _pending_order_shares(runner: WindowRunner, side: str) -> float:
+    return sum(max(0.0, order.shares) for order in _pending_orders(runner, side))
+
+
+def _pending_cancel_count(runner: WindowRunner) -> int:
+    return sum(1 for cancel in runner.local_pending_cancels_by_order_id.values() if not cancel.resolved)
+
+
+def _has_unresolved_local_action(runner: WindowRunner) -> bool:
+    return bool(_pending_orders(runner)) or _pending_cancel_count(runner) > 0
+
+
+def _open_order_count(runner: WindowRunner, side: str | None = None) -> int:
+    if side is not None:
+        return len(runner.open_orders.get(side, []))
+    return sum(len(orders) for orders in runner.open_orders.values())
+
+
+def _live_order_count(runner: WindowRunner, side: str | None = None) -> int:
+    return _open_order_count(runner, side) + len(_pending_orders(runner, side))
+
+
+def _effective_side_shares(runner: WindowRunner, side: str) -> float:
+    return runner.positions.shares(side) + _open_order_shares(runner, side) + _pending_order_shares(runner, side)
+
+
+def _state_type(pos: PositionState) -> str:
+    if pos.shares_up <= C_BALANCE_EPSILON and pos.shares_down <= C_BALANCE_EPSILON:
+        return "EMPTY"
+    if abs(pos.shares_up - pos.shares_down) <= C_BALANCE_EPSILON:
+        return "BALANCED"
+    return "IMBALANCED"
+
+
+def _smaller_side(pos: PositionState) -> str | None:
+    if pos.shares_up < pos.shares_down - C_BALANCE_EPSILON:
+        return "UP"
+    if pos.shares_down < pos.shares_up - C_BALANCE_EPSILON:
+        return "DOWN"
+    return None
+
+
+def _sent_cache_key(runner: WindowRunner, side: str, price: float, shares: float) -> str:
+    return f"{runner.contract.slug}:{side}:{price:.2f}:{shares:.2f}"
+
+
+def _prune_recent_sent_cache(runner: WindowRunner, now_ts: float) -> None:
+    runner.recent_sent_cache = {
+        key: sent_at for key, sent_at in runner.recent_sent_cache.items() if now_ts - float(sent_at) < RECENT_SENT_CACHE_SECONDS
+    }
+
+
 def _extract_order_id(payload: object) -> str | None:
     if not isinstance(payload, dict):
         return None
     for key in ("orderID", "orderId", "id"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _extract_client_order_id(payload: dict[str, object]) -> str | None:
+    for key in ("client_order_id", "clientOrderId", "clientOrderID"):
         value = payload.get(key)
         if value:
             return str(value)
@@ -249,10 +368,7 @@ def _refresh_positions(runner: WindowRunner, *, cfg: KngtopConfig, rows: list[di
             pos.shares_down += size
             pos.spent_down += cost
     merged = _merge_position_sources(pos, runner.trade_history_positions)
-    for side in ("UP", "DOWN"):
-        reflected_shares = max(0.0, merged.shares(side) - previous.shares(side))
-        if reflected_shares > 1e-12:
-            _remove_local_sent_exposure(runner, side, reflected_shares, merged.avg(side))
+    del previous
     runner.positions = merged
     return merged
 
@@ -308,8 +424,20 @@ def _refresh_trade_history(
                 _log_tag("TRADE HISTORY", slug=runner.contract.slug, side=side, status="error", error=str(exc))
                 rows_by_side[side] = []
         runner.last_trade_history_fetch_ts = now
+    runner.fill_history_seen_ids.update(_trade_history_fill_ids(rows_by_side))
     runner.trade_history_positions = _parse_trade_history(runner, rows_by_side, cfg=cfg)
     return runner.trade_history_positions
+
+
+def _is_bot_owned_open_order(runner: WindowRunner, order_id: str, client_order_id: str | None) -> bool:
+    if client_order_id and client_order_id.startswith("kngtop-c47-"):
+        return True
+    for pending in _pending_orders(runner, unresolved_only=False):
+        if pending.exchange_order_id and pending.exchange_order_id == order_id:
+            return True
+        if client_order_id and pending.client_order_id == client_order_id:
+            return True
+    return False
 
 
 def _parse_open_orders(runner: WindowRunner, rows: list[dict[str, Any]]) -> dict[str, list[OpenOrder]]:
@@ -324,9 +452,23 @@ def _parse_open_orders(runner: WindowRunner, rows: list[dict[str, Any]]) -> dict
             continue
         oid = _extract_order_id(row)
         price = _extract_numeric(row, "price") or 0.0
-        remaining = _extract_numeric(row, "size_left", "remaining", "original_size", "size") or 0.0
+        remaining = _extract_numeric(row, "size_left", "remaining")
+        if remaining is None:
+            original = _extract_numeric(row, "original_size", "size") or 0.0
+            matched = _extract_numeric(row, "size_matched", "matched_size", "filled_size") or 0.0
+            remaining = max(0.0, original - matched) if matched > 0.0 else original
+        client_order_id = _extract_client_order_id(row)
         if oid and price > 0.0 and remaining > 1e-12:
-            out[side].append(OpenOrder(order_id=oid, side=side, price=price, remaining_shares=remaining))
+            out[side].append(
+                OpenOrder(
+                    order_id=oid,
+                    side=side,
+                    price=price,
+                    remaining_shares=remaining,
+                    client_order_id=client_order_id,
+                    bot_owned=_is_bot_owned_open_order(runner, oid, client_order_id),
+                )
+            )
     return out
 
 
@@ -336,6 +478,106 @@ def _sync_open_orders(runner: WindowRunner, *, clob: KngtopClob | None, rows: li
     open_rows = rows if rows is not None else (clob.get_open_orders() if clob is not None else [])
     runner.open_orders = _parse_open_orders(runner, list(open_rows))
     return runner.open_orders
+
+
+def _trade_history_fill_ids(rows_by_side: dict[str, list[dict[str, Any]]]) -> set[str]:
+    out: set[str] = set()
+    for side, rows in rows_by_side.items():
+        for row in rows:
+            raw_side = _extract_text(row, "side", "takerSide", "taker_side", "makerSide", "maker_side").upper()
+            if raw_side and raw_side not in {"BUY", "BID"}:
+                continue
+            oid = _extract_text(row, "orderId", "orderID", "order_id", "id", "transactionHash", "transaction_hash")
+            if oid:
+                out.add(f"{side}:{oid}")
+    return out
+
+
+def _order_matches_pending(open_order: OpenOrder, pending: LocalPendingOrder) -> bool:
+    if pending.exchange_order_id and open_order.order_id == pending.exchange_order_id:
+        return True
+    if open_order.client_order_id and open_order.client_order_id == pending.client_order_id:
+        return True
+    return (
+        open_order.side == pending.side
+        and abs(float(open_order.price) - float(pending.price)) <= REPRICE_TOLERANCE
+        and open_order.remaining_shares <= pending.shares + 1e-9
+    )
+
+
+def _trade_history_confirms_pending(runner: WindowRunner, pending: LocalPendingOrder) -> bool:
+    keys = {f"{pending.side}:{pending.client_order_id}"}
+    if pending.exchange_order_id:
+        keys.add(f"{pending.side}:{pending.exchange_order_id}")
+    return bool(keys & runner.fill_history_seen_ids)
+
+
+def _position_confirms_pending_fill(runner: WindowRunner, pending: LocalPendingOrder) -> bool:
+    return runner.positions.shares(pending.side) >= pending.position_shares_at_send + pending.shares - 1e-9
+
+
+def _reconcile_local_state(runner: WindowRunner, *, now_ts: float) -> None:
+    detected_open_orders = 0
+    resolved_pending = 0
+    unknown_pending = 0
+    detected_fills = 0
+    open_by_id = {order.order_id: order for orders in runner.open_orders.values() for order in orders}
+
+    for side in ("UP", "DOWN"):
+        for pending in runner.local_pending_orders_by_side.get(side, []):
+            if pending.resolved:
+                continue
+            pending.observed_refreshes += 1
+            matching_open = next((order for order in runner.open_orders.get(side, []) if _order_matches_pending(order, pending)), None)
+            fill_confirmed = _trade_history_confirms_pending(runner, pending) or _position_confirms_pending_fill(runner, pending)
+            if matching_open is not None:
+                pending.exchange_order_id = matching_open.order_id
+                pending.status = "OPEN_CONFIRMED"
+                matching_open.bot_owned = True
+                detected_open_orders += 1
+                continue
+            if fill_confirmed:
+                pending.status = "FILL_CONFIRMED"
+                pending.resolved = True
+                resolved_pending += 1
+                detected_fills += 1
+                continue
+            pending.status = "UNKNOWN" if pending.status in {"SENT_LOCAL", "UNKNOWN"} else pending.status
+            unknown_pending += 1
+            if now_ts - pending.sent_at >= UNKNOWN_ORDER_TIMEOUT_SECONDS and pending.observed_refreshes >= 2:
+                pending.status = "FAILED"
+                pending.resolved = True
+                resolved_pending += 1
+                unknown_pending -= 1
+
+    for order_id, cancel in list(runner.local_pending_cancels_by_order_id.items()):
+        if cancel.resolved:
+            continue
+        if order_id not in open_by_id:
+            cancel.status = "CANCEL_CONFIRMED"
+            cancel.resolved = True
+            resolved_pending += 1
+        else:
+            cancel.status = "UNKNOWN" if now_ts - cancel.sent_at >= ACTION_COOLDOWN_SECONDS else "SENT_LOCAL"
+            unknown_pending += 1
+
+    if runner.initial_batch_sent:
+        runner.initial_batch_resolved = not _pending_orders(runner)
+
+    runner.last_reconcile_summary = {
+        "detected_fills": detected_fills,
+        "detected_open_orders": detected_open_orders,
+        "resolved_pending": resolved_pending,
+        "unknown_pending": max(0, unknown_pending),
+    }
+    _log_tag(
+        "RECONCILE",
+        market_id=runner.market_id(),
+        detected_fills=str(detected_fills),
+        detected_open_orders=str(detected_open_orders),
+        resolved_pending=str(resolved_pending),
+        unknown_pending=str(max(0, unknown_pending)),
+    )
 
 
 def _projected_avg_sum(pos: PositionState, side: str, price: float) -> float:
@@ -363,49 +605,8 @@ def _open_order_shares(runner: WindowRunner, side: str) -> float:
     return sum(max(0.0, order.remaining_shares) for order in runner.open_orders.get(side, []))
 
 
-def _local_sent_shares(runner: WindowRunner, side: str) -> float:
-    return max(0.0, float(runner.sent_shares.get(side, 0.0)))
-
-
 def _effective_side_exposure(runner: WindowRunner, side: str) -> float:
-    return runner.positions.shares(side) + max(_open_order_shares(runner, side), _local_sent_shares(runner, side))
-
-
-def _local_sent_total_cost(runner: WindowRunner) -> float:
-    return max(0.0, float(runner.sent_cost.get("UP", 0.0))) + max(0.0, float(runner.sent_cost.get("DOWN", 0.0)))
-
-
-def _remove_local_sent_exposure(runner: WindowRunner, side: str, shares: float, price: float) -> None:
-    qty = max(0.0, float(shares))
-    px = max(0.0, float(price))
-    if qty <= 1e-12:
-        return
-    runner.sent_shares[side] = max(0.0, _local_sent_shares(runner, side) - qty)
-    runner.sent_cost[side] = max(0.0, float(runner.sent_cost.get(side, 0.0)) - qty * px)
-    remaining = qty
-    kept: list[SentOrder] = []
-    for sent in runner.sent_orders:
-        if sent.side != side or remaining <= 1e-12:
-            kept.append(sent)
-            continue
-        consume = min(remaining, sent.shares)
-        remaining -= consume
-        left = sent.shares - consume
-        if left > 1e-12:
-            kept.append(SentOrder(order_id=sent.order_id, side=sent.side, price=sent.price, shares=left, created_ts=sent.created_ts))
-    runner.sent_orders = kept
-
-
-def _has_unresolved_sent_order(runner: WindowRunner, side: str) -> bool:
-    return any(sent.side == side and sent.shares > 1e-12 for sent in runner.sent_orders)
-
-
-def _action_ready(runner: WindowRunner, now_ts: float) -> bool:
-    return now_ts - runner.last_action_ts >= ACTION_COOLDOWN_SEC
-
-
-def _mark_action(runner: WindowRunner, now_ts: float) -> None:
-    runner.last_action_ts = now_ts
+    return runner.positions.shares(side) + _open_order_shares(runner, side) + _pending_order_shares(runner, side)
 
 
 def _avg_sum_max_price(pos: PositionState, side: str) -> float:
@@ -422,7 +623,7 @@ def _can_place_side_order(runner: WindowRunner, side: str, price: float, cfg: Kn
     pos = runner.positions
     if _effective_side_exposure(runner, side) + ORDER_SHARES > float(cfg.max_shares_per_side) + 1e-12:
         return False
-    if pos.spent_total() + _local_sent_total_cost(runner) + price * ORDER_SHARES > MAX_SPENT_PER_WINDOW + 1e-12:
+    if pos.spent_total() + price * ORDER_SHARES > MAX_SPENT_PER_WINDOW + 1e-12:
         return False
     if price * ORDER_SHARES + 1e-12 < MIN_ORDER_USD:
         return False
@@ -495,137 +696,218 @@ def _c_target_prices(runner: WindowRunner, *, up_ask: float | None, down_ask: fl
     return targets
 
 
-def _cancel_order(runner: WindowRunner, *, clob: KngtopClob | None, order: OpenOrder, reason: str) -> bool:
-    if clob is None:
-        _remove_local_sent_exposure(runner, order.side, order.remaining_shares, order.price)
-        return True
-    try:
-        clob.cancel_order_by_id(order.order_id)
-    except Exception as exc:  # noqa: BLE001
-        _log_tag("CANCEL FAILED", slug=runner.contract.slug, side=order.side, order_id=order.order_id, reason=reason, error=str(exc))
-        return False
-    _remove_local_sent_exposure(runner, order.side, order.remaining_shares, order.price)
-    _log_tag("CANCEL", slug=runner.contract.slug, side=order.side, order_id=order.order_id, price=f"{order.price:.2f}", reason=reason)
-    return True
+def _inside_opening_gate(elapsed: float) -> bool:
+    return -PRESTART_SEC - 1e-12 <= elapsed <= OPENING_GRACE_SEC + 1e-12
 
 
-def _post_order(runner: WindowRunner, *, clob: KngtopClob | None, side: str, price: float, cfg: KngtopConfig) -> bool:
-    del cfg
-    if clob is None:
-        _log_tag("DRY ORDER", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{ORDER_SHARES:.2f}")
-        runner.sent_shares[side] = _local_sent_shares(runner, side) + ORDER_SHARES
-        runner.sent_cost[side] = max(0.0, float(runner.sent_cost.get(side, 0.0))) + ORDER_SHARES * price
-        runner.sent_orders.append(SentOrder(order_id=None, side=side, price=price, shares=ORDER_SHARES, created_ts=time.time()))
-        return True
-    try:
-        payload = clob.limit_buy_shares(_token_for_side(runner, side), price=price, shares=ORDER_SHARES, post_only=False)
-    except Exception as exc:  # noqa: BLE001
-        if "not enough balance" in str(exc).lower() or "allowance" in str(exc).lower():
-            runner.stop_reason = "balance_or_allowance"
-        _log_tag("ORDER FAILED", slug=runner.contract.slug, side=side, price=f"{price:.2f}", error=str(exc))
-        return False
-    order_id = _extract_order_id(payload)
-    runner.sent_shares[side] = _local_sent_shares(runner, side) + ORDER_SHARES
-    runner.sent_cost[side] = max(0.0, float(runner.sent_cost.get(side, 0.0))) + ORDER_SHARES * price
-    runner.sent_orders.append(SentOrder(order_id=order_id, side=side, price=price, shares=ORDER_SHARES, created_ts=time.time()))
-    _log_tag("ORDER SENT", slug=runner.contract.slug, side=side, price=f"{price:.2f}", shares=f"{ORDER_SHARES:.2f}", order_id=order_id)
-    return True
+def _projected_pair_avg_sum(pos: PositionState, up_price: float, down_price: float) -> float:
+    up_shares = pos.shares_up + ORDER_SIZE_SHARES
+    down_shares = pos.shares_down + ORDER_SIZE_SHARES
+    up_avg = (pos.spent_up + ORDER_SIZE_SHARES * up_price) / up_shares if up_shares > 1e-12 else 0.0
+    down_avg = (pos.spent_down + ORDER_SIZE_SHARES * down_price) / down_shares if down_shares > 1e-12 else 0.0
+    return up_avg + down_avg
 
 
-def _maintain_side_order(
+def _can_send_order_intent(runner: WindowRunner, side: str, price: float, shares: float, now_ts: float) -> tuple[bool, str | None]:
+    if _pending_cancel_count(runner) > 0:
+        return False, "pending_cancel_lock"
+    if _pending_orders(runner, side):
+        return False, "side_local_pending_lock"
+    cache_key = _sent_cache_key(runner, side, price, shares)
+    if cache_key in runner.recent_sent_cache:
+        return False, "recent_sent_cache"
+    state_type = _state_type(runner.positions)
+    smaller = _smaller_side(runner.positions)
+    if state_type == "IMBALANCED":
+        if side != smaller:
+            return False, "larger_side_while_imbalanced"
+        if _live_order_count(runner) > 0:
+            return False, "imbalanced_live_order_exists"
+    if runner.positions.shares(side) + _open_order_shares(runner, side) + _pending_order_shares(runner, side) + shares > MAX_SHARES_PER_SIDE + 1e-12:
+        return False, "max_shares_per_side"
+    del now_ts
+    return True, None
+
+
+def _build_next_decision(
+    runner: WindowRunner,
+    *,
+    elapsed: float,
+    up_ask: float | None,
+    down_ask: float | None,
+    now_ts: float,
+    cfg: KngtopConfig,
+) -> StrategyDecision:
+    state_type = _state_type(runner.positions)
+    _log_tag(
+        "STATE",
+        market_id=runner.market_id(),
+        up_shares=f"{runner.positions.shares_up:.2f}",
+        up_avg=f"{runner.positions.avg('UP'):.4f}",
+        down_shares=f"{runner.positions.shares_down:.2f}",
+        down_avg=f"{runner.positions.avg('DOWN'):.4f}",
+        open_up_orders=str(_open_order_count(runner, "UP")),
+        open_down_orders=str(_open_order_count(runner, "DOWN")),
+        pending_up_orders=str(len(_pending_orders(runner, "UP"))),
+        pending_down_orders=str(len(_pending_orders(runner, "DOWN"))),
+        pending_cancels=str(_pending_cancel_count(runner)),
+    )
+
+    if not runner.initial_batch_sent and _inside_opening_gate(elapsed):
+        for side in ("UP", "DOWN"):
+            ok, reason = _can_send_order_intent(runner, side, INITIAL_PRICE, ORDER_SIZE_SHARES, now_ts)
+            if not ok:
+                _log_tag("DANGER_BLOCK", market_id=runner.market_id(), side=side, reason=reason)
+                return StrategyDecision("NONE", f"initial_blocked:{reason}")
+        return StrategyDecision(
+            "BATCH",
+            "opening_gate_initial_batch",
+            [("UP", INITIAL_PRICE, ORDER_SIZE_SHARES), ("DOWN", INITIAL_PRICE, ORDER_SIZE_SHARES)],
+        )
+
+    if state_type == "EMPTY":
+        return StrategyDecision("NONE", "empty_outside_opening_gate")
+
+    if state_type == "IMBALANCED":
+        smaller = _smaller_side(runner.positions)
+        larger = _opposite_side(smaller) if smaller else None
+        if larger is not None:
+            larger_bot_orders = [order for order in runner.open_orders.get(larger, []) if order.bot_owned]
+            if larger_bot_orders:
+                order = larger_bot_orders[0]
+                return StrategyDecision("CANCEL", "larger_side_bot_order_while_imbalanced", cancel_order=order)
+        if smaller is None:
+            return StrategyDecision("NONE", "imbalanced_no_smaller_side")
+        if _live_order_count(runner, smaller) > 0:
+            return StrategyDecision("NONE", f"smaller_side_{smaller}_already_covered")
+        if _live_order_count(runner) > 0:
+            return StrategyDecision("NONE", "imbalanced_live_order_exists")
+        raw_price = up_ask if smaller == "UP" else down_ask
+        avg_sum_cap_price = _avg_sum_max_price(runner.positions, smaller)
+        price = round(min(float(raw_price) if raw_price and raw_price > 0.0 else MAX_HEDGE_PRICE, MAX_HEDGE_PRICE, avg_sum_cap_price), 2)
+        if price <= 0.0:
+            return StrategyDecision("NONE", "hedge_avg_sum_cap")
+        if _projected_avg_sum(runner.positions, smaller, price) > MAX_AVG_SUM_AFTER_BUY + 1e-12:
+            return StrategyDecision("NONE", "hedge_avg_sum_cap")
+        ok, reason = _can_send_order_intent(runner, smaller, price, ORDER_SIZE_SHARES, now_ts)
+        if not ok:
+            _log_tag("DANGER_BLOCK", market_id=runner.market_id(), side=smaller, reason=reason)
+            return StrategyDecision("NONE", str(reason))
+        return StrategyDecision("PLACE", f"imbalance_recovery_{smaller}", [(smaller, price, ORDER_SIZE_SHARES)])
+
+    if runner.positions.shares_up >= MAX_SHARES_PER_SIDE - 1e-12 and runner.positions.shares_down >= MAX_SHARES_PER_SIDE - 1e-12:
+        return StrategyDecision("NONE", "max_shares_reached")
+    if _live_order_count(runner) > 0:
+        return StrategyDecision("NONE", "balanced_live_orders_exist")
+    if runner.positions.shares_up + ORDER_SIZE_SHARES > MAX_SHARES_PER_SIDE + 1e-12:
+        return StrategyDecision("NONE", "up_max_shares_after_pair")
+    if runner.positions.shares_down + ORDER_SIZE_SHARES > MAX_SHARES_PER_SIDE + 1e-12:
+        return StrategyDecision("NONE", "down_max_shares_after_pair")
+
+    desired = _c_target_prices(runner, up_ask=up_ask, down_ask=down_ask, cfg=cfg)
+    up_price = desired["UP"]
+    down_price = desired["DOWN"]
+    if up_price is None or down_price is None:
+        return StrategyDecision("NONE", "balanced_pair_no_valid_c_price")
+    if _projected_pair_avg_sum(runner.positions, up_price, down_price) > MAX_AVG_SUM_AFTER_BUY + 1e-12:
+        return StrategyDecision("NONE", "pair_avg_sum_cap")
+    for side, price in (("UP", up_price), ("DOWN", down_price)):
+        ok, reason = _can_send_order_intent(runner, side, price, ORDER_SIZE_SHARES, now_ts)
+        if not ok:
+            _log_tag("DANGER_BLOCK", market_id=runner.market_id(), side=side, reason=reason)
+            return StrategyDecision("NONE", str(reason))
+    return StrategyDecision("BATCH", "balanced_next_pair", [("UP", up_price, ORDER_SIZE_SHARES), ("DOWN", down_price, ORDER_SIZE_SHARES)])
+
+
+def _record_local_pending_order(
     runner: WindowRunner,
     *,
     side: str,
-    desired_price: float | None,
-    clob: KngtopClob | None,
-    cfg: KngtopConfig,
+    price: float,
+    shares: float,
     now_ts: float,
-) -> bool:
-    rows = list(runner.open_orders.get(side, []))
-    for extra in rows[1:]:
-        _cancel_order(runner, clob=clob, order=extra, reason="duplicate_side_order")
-        _mark_action(runner, now_ts)
-        return True
-    rows = rows[:1]
-    if desired_price is None:
-        if rows and _keep_existing_without_target(runner, side, cfg):
-            return False
-        for order in rows:
-            _cancel_order(runner, clob=clob, order=order, reason="side_complete_or_blocked")
-            _mark_action(runner, now_ts)
-            return True
-        return False
-    if not rows and _has_unresolved_sent_order(runner, side):
-        _log_tag("WAIT SENT", slug=runner.contract.slug, side=side, reason="unresolved_order")
-        return False
-    if rows:
-        order = rows[0]
-        aggressive_reprice = _side_needs_aggressive_reprice(runner, side)
-        if not aggressive_reprice and order.price <= desired_price + REPRICE_TOLERANCE:
-            return False
-        if aggressive_reprice and abs(order.price - desired_price) <= REPRICE_TOLERANCE:
-            return False
-        if now_ts - runner.last_replace_ts[side] < REPLACE_COOLDOWN_SEC:
-            return False
-        if not _cancel_order(runner, clob=clob, order=order, reason=f"reprice->{desired_price:.2f}"):
-            return False
-        runner.last_replace_ts[side] = now_ts
-        _mark_action(runner, now_ts)
-        return True
-    _post_order(runner, clob=clob, side=side, price=desired_price, cfg=cfg)
-    _mark_action(runner, now_ts)
-    return False
-
-
-def _side_needs_aggressive_reprice(runner: WindowRunner, side: str) -> bool:
-    pos = runner.positions
-    side_shares = pos.shares(side)
-    other_shares = pos.shares("DOWN" if side == "UP" else "UP")
-    return side_shares + C_BALANCE_EPSILON < other_shares
-
-
-def _keep_existing_without_target(runner: WindowRunner, side: str, cfg: KngtopConfig) -> bool:
-    pos = runner.positions
-    rows = list(runner.open_orders.get(side, []))
-    if not rows:
-        return False
-    order = rows[0]
-    if pos.shares(side) + order.remaining_shares > float(cfg.max_shares_per_side) + 1e-12:
-        return False
-    pending_without_this = max(0.0, _local_sent_total_cost(runner) - order.remaining_shares * order.price)
-    if pos.spent_total() + pending_without_this + order.remaining_shares * order.price > MAX_SPENT_PER_WINDOW + 1e-12:
-        return False
-    return True
-
-
-def _can_send_initial_pair(runner: WindowRunner, cfg: KngtopConfig) -> bool:
-    if runner.positions.has_side("UP") or runner.positions.has_side("DOWN"):
-        return False
-    if runner.open_orders.get("UP") or runner.open_orders.get("DOWN"):
-        return False
-    if _has_unresolved_sent_order(runner, "UP") or _has_unresolved_sent_order(runner, "DOWN"):
-        return False
-    return _can_place_side_order(runner, "UP", INITIAL_PAIR_PRICE, cfg) and _can_place_side_order(runner, "DOWN", INITIAL_PAIR_PRICE, cfg)
-
-
-def _flat_without_orders(runner: WindowRunner) -> bool:
-    return (
-        not runner.positions.has_side("UP")
-        and not runner.positions.has_side("DOWN")
-        and not runner.open_orders.get("UP")
-        and not runner.open_orders.get("DOWN")
-        and not _has_unresolved_sent_order(runner, "UP")
-        and not _has_unresolved_sent_order(runner, "DOWN")
+) -> LocalPendingOrder:
+    pending = LocalPendingOrder(
+        client_order_id=_bot_client_order_id(runner, side),
+        side=side,
+        token_id=_token_for_side(runner, side).token_id,
+        price=float(price),
+        shares=float(shares),
+        sent_at=float(now_ts),
+        position_shares_at_send=runner.positions.shares(side),
     )
+    runner.local_pending_orders_by_side[side].append(pending)
+    runner.recent_sent_cache[_sent_cache_key(runner, side, price, shares)] = now_ts
+    return pending
 
 
-def _post_initial_pair(runner: WindowRunner, *, clob: KngtopClob | None, cfg: KngtopConfig, now_ts: float) -> bool:
-    if not _can_send_initial_pair(runner, cfg):
+def _place_one_order(runner: WindowRunner, *, clob: KngtopClob | None, side: str, price: float, shares: float, now_ts: float, reason: str) -> None:
+    pending = _record_local_pending_order(runner, side=side, price=price, shares=shares, now_ts=now_ts)
+    _log_tag(
+        "PLACE",
+        market_id=runner.market_id(),
+        side=side,
+        price=f"{price:.2f}",
+        shares=f"{shares:.2f}",
+        reason=reason,
+        client_order_id=pending.client_order_id,
+    )
+    if clob is None:
+        pending.status = "OPEN_CONFIRMED"
+        return
+    try:
+        payload = clob.limit_buy_shares(_token_for_side(runner, side), price=float(price), shares=float(shares), post_only=True)
+    except Exception as exc:  # noqa: BLE001
+        pending.status = "UNKNOWN"
+        _log_tag("PLACE", market_id=runner.market_id(), side=side, status="UNKNOWN", error=str(exc), client_order_id=pending.client_order_id)
+        return
+    pending.exchange_order_id = _extract_order_id(payload)
+    pending.status = "CONFIRMING"
+
+
+def _cancel_one_order(runner: WindowRunner, *, clob: KngtopClob | None, order: OpenOrder, now_ts: float, reason: str) -> None:
+    runner.local_pending_cancels_by_order_id[order.order_id] = LocalPendingCancel(
+        order_id=order.order_id,
+        side=order.side,
+        price=order.price,
+        shares=order.remaining_shares,
+        sent_at=now_ts,
+    )
+    _log_tag(
+        "CANCEL",
+        market_id=runner.market_id(),
+        order_id=order.order_id,
+        side=order.side,
+        price=f"{order.price:.2f}",
+        shares=f"{order.remaining_shares:.2f}",
+        reason=reason,
+    )
+    if clob is None:
+        return
+    try:
+        clob.cancel_order_by_id(order.order_id)
+    except Exception as exc:  # noqa: BLE001
+        pending = runner.local_pending_cancels_by_order_id[order.order_id]
+        pending.status = "UNKNOWN"
+        _log_tag("CANCEL", market_id=runner.market_id(), order_id=order.order_id, status="UNKNOWN", error=str(exc))
+
+
+def _execute_decision(runner: WindowRunner, *, clob: KngtopClob | None, decision: StrategyDecision, now_ts: float) -> bool:
+    if decision.action == "NONE":
+        _log_tag("SKIP", market_id=runner.market_id(), reason=decision.reason)
         return False
-    first = _post_order(runner, clob=clob, side="UP", price=INITIAL_PAIR_PRICE, cfg=cfg)
-    second = _post_order(runner, clob=clob, side="DOWN", price=INITIAL_PAIR_PRICE, cfg=cfg)
-    if first or second:
-        _mark_action(runner, now_ts)
+    if decision.action == "CANCEL" and decision.cancel_order is not None:
+        _cancel_one_order(runner, clob=clob, order=decision.cancel_order, now_ts=now_ts, reason=decision.reason)
+        return True
+    if decision.action == "PLACE":
+        side, price, shares = decision.orders[0]
+        _place_one_order(runner, clob=clob, side=side, price=price, shares=shares, now_ts=now_ts, reason=decision.reason)
+        return True
+    if decision.action == "BATCH":
+        if decision.reason == "opening_gate_initial_batch":
+            runner.initial_batch_sent = True
+        for side, price, shares in decision.orders:
+            _place_one_order(runner, clob=clob, side=side, price=price, shares=shares, now_ts=now_ts, reason=decision.reason)
         return True
     return False
 
@@ -641,48 +923,91 @@ def _tick_runner(
     if runner.stop_reason is not None:
         return
     now_ts = datetime.now(timezone.utc).timestamp()
+    _prune_recent_sent_cache(runner, now_ts)
     elapsed, remaining = _window_elapsed_remaining(runner, now_ts)
     if elapsed is None or remaining is None:
         return
     if remaining <= 0:
         return
+    _log_tag(
+        "WINDOW",
+        market_id=runner.market_id(),
+        start_time=str(runner.start_sec()),
+        now=f"{now_ts:.3f}",
+        elapsed=f"{elapsed:.1f}",
+        remaining=f"{remaining:.1f}",
+    )
     state = runtime_state if runtime_state is not None else {}
-    history_rows = state.get("reconcile_trade_history")
-    if isinstance(history_rows, dict):
-        _refresh_trade_history(runner, clob=clob, cfg=cfg, rows_by_side={str(k): list(v) for k, v in history_rows.items() if isinstance(v, list)}, now_ts=now_ts)
-    elif clob is not None:
-        _refresh_trade_history(runner, clob=clob, cfg=cfg, now_ts=now_ts)
-    rows = state.get("reconcile_positions")
-    _refresh_positions(runner, cfg=cfg, rows=list(rows) if isinstance(rows, list) else None)
-    if clob is not None:
-        _sync_open_orders(runner, clob=clob)
-    else:
-        open_rows = state.get("reconcile_open_orders")
-        _sync_open_orders(runner, clob=clob, rows=list(open_rows) if isinstance(open_rows, list) else None)
+    api_errors: list[str] = []
+    try:
+        if state.get("trade_history_error"):
+            raise RuntimeError(str(state.get("trade_history_error")))
+        history_rows = state.get("reconcile_trade_history")
+        if isinstance(history_rows, dict):
+            _refresh_trade_history(runner, clob=clob, cfg=cfg, rows_by_side={str(k): list(v) for k, v in history_rows.items() if isinstance(v, list)}, now_ts=now_ts)
+        elif clob is not None:
+            _refresh_trade_history(runner, clob=clob, cfg=cfg, now_ts=now_ts)
+    except Exception as exc:  # noqa: BLE001
+        api_errors.append("trade_history")
+        _log_tag("RECONCILE", market_id=runner.market_id(), source="trade_history", status="error", error=str(exc))
+    try:
+        if state.get("positions_error"):
+            raise RuntimeError(str(state.get("positions_error")))
+        rows = state.get("reconcile_positions")
+        _refresh_positions(runner, cfg=cfg, rows=list(rows) if isinstance(rows, list) else None)
+    except Exception as exc:  # noqa: BLE001
+        api_errors.append("positions")
+        _log_tag("RECONCILE", market_id=runner.market_id(), source="positions", status="error", error=str(exc))
+    try:
+        if state.get("open_orders_error"):
+            raise RuntimeError(str(state.get("open_orders_error")))
+        if clob is not None:
+            _sync_open_orders(runner, clob=clob)
+        else:
+            open_rows = state.get("reconcile_open_orders")
+            _sync_open_orders(runner, clob=clob, rows=list(open_rows) if isinstance(open_rows, list) else None)
+    except Exception as exc:  # noqa: BLE001
+        api_errors.append("open_orders")
+        _log_tag("RECONCILE", market_id=runner.market_id(), source="open_orders", status="error", error=str(exc))
+    _reconcile_local_state(runner, now_ts=now_ts)
     if elapsed < -PRESTART_SEC - 1e-12:
-        return
-    if _flat_without_orders(runner) and elapsed > OPENING_GRACE_SEC + 1e-12:
-        runner.stop_reason = "missed_initial_pair_gate"
-        _log_tag("SKIP WINDOW", slug=runner.contract.slug, reason=runner.stop_reason, elapsed=f"{elapsed:.1f}")
-        return
-    if not _action_ready(runner, now_ts):
-        return
-    if _post_initial_pair(runner, clob=clob, cfg=cfg, now_ts=now_ts):
+        _log_tag("SKIP", market_id=runner.market_id(), reason="before_opening_gate")
         return
     up_quote = poly.best_bid_ask_for(runner.contract.up.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
     down_quote = poly.best_bid_ask_for(runner.contract.down.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
-    desired = _c_target_prices(
+    state_type = _state_type(runner.positions)
+    if api_errors:
+        _log_tag("DANGER_BLOCK", market_id=runner.market_id(), reason="api_uncertainty", sources=",".join(api_errors))
+        _log_tag("DECISION", market_id=runner.market_id(), state_type=state_type, allowed_action="NONE", blocked_reason="api_uncertainty")
+        return
+    if now_ts < runner.action_lock_until:
+        _log_tag("DECISION", market_id=runner.market_id(), state_type=state_type, allowed_action="NONE", blocked_reason="action_lock")
+        return
+    if _has_unresolved_local_action(runner):
+        _log_tag("DECISION", market_id=runner.market_id(), state_type=state_type, allowed_action="NONE", blocked_reason="local_pending_lock")
+        return
+    if now_ts < runner.last_action_time + ACTION_COOLDOWN_SECONDS:
+        _log_tag("DECISION", market_id=runner.market_id(), state_type=state_type, allowed_action="NONE", blocked_reason="action_cooldown")
+        return
+    decision = _build_next_decision(
         runner,
+        elapsed=elapsed,
         up_ask=up_quote[1] if up_quote else None,
         down_ask=down_quote[1] if down_quote else None,
+        now_ts=now_ts,
         cfg=cfg,
     )
-    if _maintain_side_order(runner, side="UP", desired_price=desired["UP"], clob=clob, cfg=cfg, now_ts=now_ts):
-        return
-    if not _action_ready(runner, now_ts):
-        return
-    _sync_open_orders(runner, clob=clob)
-    _maintain_side_order(runner, side="DOWN", desired_price=desired["DOWN"], clob=clob, cfg=cfg, now_ts=now_ts)
+    _log_tag(
+        "DECISION",
+        market_id=runner.market_id(),
+        state_type=state_type,
+        reason=decision.reason,
+        allowed_action=decision.action,
+        blocked_reason=decision.reason if decision.action == "NONE" else None,
+    )
+    if _execute_decision(runner, clob=clob, decision=decision, now_ts=now_ts):
+        runner.last_action_time = now_ts
+        runner.action_lock_until = now_ts + ACTION_COOLDOWN_SECONDS
 
 
 def _discover_target_windows(cfg: KngtopConfig, *, runners: dict[int, WindowRunner], binance_symbol: str) -> None:
@@ -710,7 +1035,7 @@ def _discover_target_windows(cfg: KngtopConfig, *, runners: dict[int, WindowRunn
                 timeout=cfg.request_timeout_sec,
             ),
         )
-        _log_tag("INIT", slug=contract.slug, start_sec=str(start_sec), strategy="two_sided_limit_engine")
+        _log_tag("INIT", slug=contract.slug, start_sec=str(start_sec), strategy="balanced_fixed_47c")
 
 
 def _refresh_subscriptions(*, runners: dict[int, WindowRunner], poly: MarketWsFeed) -> None:
@@ -804,7 +1129,7 @@ def main() -> None:
         "INIT",
         pair=TRADE_PAIR_KEY,
         window_minutes=str(TRADE_WINDOW_MINUTES),
-        strategy="C_weak_cap045_high_guard060_limit5",
+        strategy="C_Strategy_Balanced_Fixed_47c",
         order_shares=f"{ORDER_SHARES:.2f}",
         max_shares_per_side=f"{cfg.max_shares_per_side:.2f}",
     )
