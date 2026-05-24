@@ -285,6 +285,64 @@ def test_missing_side_too_passive_order_is_raised_with_cooldown() -> None:
     assert clob.calls == [("down-token", 0.30, 5.0)]
 
 
+def test_initial_sibling_cancel_reposts_replacement_after_confirmed_cancel_and_delay() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob()
+
+    _tick(runner, elapsed=-10, up=0.54, down=0.48, clob=clob)
+    assert clob.calls == [("up-token", 0.47, 5.0), ("down-token", 0.47, 5.0)]
+
+    positions = [
+        _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.47),
+    ]
+    clob.open_orders = [
+        row for row in clob.open_orders if row["asset_id"] == "down-token"
+    ]
+
+    _tick(runner, elapsed=0, up=0.65, down=0.35, clob=clob, positions=positions)
+    assert clob.cancelled == ["ord-2"]
+    assert clob.calls == [("up-token", 0.47, 5.0), ("down-token", 0.47, 5.0)]
+
+    _tick(runner, elapsed=1, up=0.65, down=0.35, clob=clob, positions=positions)
+    assert clob.calls == [("up-token", 0.47, 5.0), ("down-token", 0.47, 5.0)]
+
+    _tick(runner, elapsed=2, up=0.65, down=0.35, clob=clob, positions=positions)
+    assert clob.calls == [("up-token", 0.47, 5.0), ("down-token", 0.47, 5.0), ("down-token", 0.35, 5.0)]
+
+
+def test_initial_sibling_cancel_does_not_repost_while_cancel_still_visible_open() -> None:
+    runner = _runner(1_700_000_000)
+    clob = _FakeClob()
+
+    _tick(runner, elapsed=-10, up=0.54, down=0.48, clob=clob)
+    positions = [
+        _positions_row(slug=runner.contract.slug, outcome="UP", token_id="up-token", size=5.0, avg_price=0.47),
+    ]
+    down_order = [row for row in clob.open_orders if row["asset_id"] == "down-token"][0]
+    clob.open_orders = [dict(down_order)]
+
+    original_cancel = clob.cancel_order_by_id
+
+    def delayed_cancel(order_id: str):  # noqa: ANN202
+        clob.cancelled.append(str(order_id))
+        return {"success": True}
+
+    clob.cancel_order_by_id = delayed_cancel  # type: ignore[method-assign]
+    _tick(runner, elapsed=0, up=0.65, down=0.35, clob=clob, positions=positions)
+    assert clob.cancelled == ["ord-2"]
+
+    _tick(runner, elapsed=2, up=0.65, down=0.35, clob=clob, positions=positions)
+    assert clob.calls == [("up-token", 0.47, 5.0), ("down-token", 0.47, 5.0)]
+
+    clob.cancel_order_by_id = original_cancel  # type: ignore[method-assign]
+    clob.open_orders = []
+    _tick(runner, elapsed=3, up=0.65, down=0.35, clob=clob, positions=positions)
+    assert clob.calls == [("up-token", 0.47, 5.0), ("down-token", 0.47, 5.0)]
+
+    _tick(runner, elapsed=4, up=0.65, down=0.35, clob=clob, positions=positions)
+    assert clob.calls == [("up-token", 0.47, 5.0), ("down-token", 0.47, 5.0), ("down-token", 0.35, 5.0)]
+
+
 def test_guarded_weak_repair_order_is_posted_when_it_improves_floor() -> None:
     runner = _runner(1_700_000_000)
     positions = [
