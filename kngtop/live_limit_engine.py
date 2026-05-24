@@ -50,7 +50,6 @@ C_HIGH_GUARD = 0.60
 C_BALANCE_EPSILON = 1e-9
 REPLACE_COOLDOWN_SEC = 2.0
 TRADE_HISTORY_LOOKBACK_SEC = 600
-UNKNOWN_SENT_ORDER_TTL_SEC = 20.0
 
 
 @dataclass(slots=True)
@@ -394,31 +393,8 @@ def _remove_local_sent_exposure(runner: WindowRunner, side: str, shares: float, 
     runner.sent_orders = kept
 
 
-def _release_stale_unknown_sent_orders(runner: WindowRunner, *, now_ts: float) -> None:
-    open_ids = {
-        order.order_id
-        for rows in runner.open_orders.values()
-        for order in rows
-        if order.order_id
-    }
-    stale: list[SentOrder] = []
-    for sent in runner.sent_orders:
-        if sent.order_id and sent.order_id in open_ids:
-            continue
-        if now_ts - sent.created_ts < UNKNOWN_SENT_ORDER_TTL_SEC:
-            continue
-        stale.append(sent)
-    for sent in stale:
-        _remove_local_sent_exposure(runner, sent.side, sent.shares, sent.price)
-        _log_tag(
-            "SENT RELEASE",
-            slug=runner.contract.slug,
-            side=sent.side,
-            order_id=sent.order_id,
-            price=f"{sent.price:.2f}",
-            shares=f"{sent.shares:.2f}",
-            reason="not_open_not_confirmed",
-        )
+def _has_unresolved_sent_order(runner: WindowRunner, side: str) -> bool:
+    return any(sent.side == side and sent.shares > 1e-12 for sent in runner.sent_orders)
 
 
 def _avg_sum_max_price(pos: PositionState, side: str) -> float:
@@ -553,28 +529,35 @@ def _maintain_side_order(
     clob: KngtopClob | None,
     cfg: KngtopConfig,
     now_monotonic: float,
-) -> None:
+) -> bool:
     rows = list(runner.open_orders.get(side, []))
     for extra in rows[1:]:
         _cancel_order(runner, clob=clob, order=extra, reason="duplicate_side_order")
+        return True
     rows = rows[:1]
     if desired_price is None:
         for order in rows:
             _cancel_order(runner, clob=clob, order=order, reason="side_complete_or_blocked")
-        return
+            return True
+        return False
+    if not rows and _has_unresolved_sent_order(runner, side):
+        _log_tag("WAIT SENT", slug=runner.contract.slug, side=side, reason="unresolved_order")
+        return False
     if rows:
         order = rows[0]
         aggressive_reprice = _side_needs_aggressive_reprice(runner, side)
         if not aggressive_reprice and order.price <= desired_price + REPRICE_TOLERANCE:
-            return
+            return False
         if aggressive_reprice and abs(order.price - desired_price) <= REPRICE_TOLERANCE:
-            return
+            return False
         if now_monotonic - runner.last_replace_ts[side] < REPLACE_COOLDOWN_SEC:
-            return
+            return False
         if not _cancel_order(runner, clob=clob, order=order, reason=f"reprice->{desired_price:.2f}"):
-            return
+            return False
         runner.last_replace_ts[side] = now_monotonic
+        return True
     _post_order(runner, clob=clob, side=side, price=desired_price, cfg=cfg)
+    return False
 
 
 def _side_needs_aggressive_reprice(runner: WindowRunner, side: str) -> bool:
@@ -613,7 +596,6 @@ def _tick_runner(
     else:
         open_rows = state.get("reconcile_open_orders")
         _sync_open_orders(runner, clob=clob, rows=list(open_rows) if isinstance(open_rows, list) else None)
-    _release_stale_unknown_sent_orders(runner, now_ts=now_ts)
     if elapsed < -PRESTART_SEC - 1e-12:
         return
     up_quote = poly.best_bid_ask_for(runner.contract.up.token_id, max_age_sec=cfg.poly_mid_max_age_sec)
@@ -625,7 +607,8 @@ def _tick_runner(
         cfg=cfg,
     )
     now_monotonic = time.monotonic()
-    _maintain_side_order(runner, side="UP", desired_price=desired["UP"], clob=clob, cfg=cfg, now_monotonic=now_monotonic)
+    if _maintain_side_order(runner, side="UP", desired_price=desired["UP"], clob=clob, cfg=cfg, now_monotonic=now_monotonic):
+        return
     _sync_open_orders(runner, clob=clob)
     _maintain_side_order(runner, side="DOWN", desired_price=desired["DOWN"], clob=clob, cfg=cfg, now_monotonic=now_monotonic)
 
